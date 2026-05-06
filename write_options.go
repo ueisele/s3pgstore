@@ -49,6 +49,16 @@ func WithIdempotencyTokenOf[T any](fn func([]T) (string, error)) WriteOption {
 //
 // expected>0 requires the partition row to exist at that
 // version; "no row yet" fails with ErrVersionConflict.
+//
+// Don't mix OCC with LockPartition for the same partition. They
+// are alternative concurrency strategies, not composable
+// per-call. Advisory locks serialize only between holders, so a
+// concurrent LockPartition writer's prep is invisible to OCC's
+// CAS — both writes land in the catalog (files are never deleted
+// in v2.0), but a delta-computation race between an OCC writer
+// and a LockPartition writer silently loses one writer's intent.
+// Pick one strategy per partition and apply it to every writer
+// of that partition.
 func WithExpectedVersion(expected int64) WriteOption {
 	return expectedVersionOpt{version: expected}
 }

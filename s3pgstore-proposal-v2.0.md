@@ -456,6 +456,23 @@ partition key) across all callers; otherwise two transactions
 locking A→B and B→A deadlock. PostgreSQL detects and aborts one
 with a deadlock error, but it's avoidable.
 
+**Cooperative-protocol caveat — pick one per partition.** OCC and
+`LockPartition` are alternative concurrency strategies, not
+composable per-call. Pick one for a given partition's write
+protocol and apply it to every writer of that partition. If
+writer A holds `LockPartition` and writer B uses
+`WithExpectedVersion`, A's lock doesn't block B (advisory locks
+serialize only between holders) and B's CAS doesn't observe A's
+in-flight prep. Both writes land in the catalog (no data loss —
+files are never deleted in v2.0), but the writer doing
+read-modify-write commits a delta against a stale read. This is
+the same family of mistake as a writer that forgets OCC entirely;
+the cooperative protocol is no weaker than what a row-level lock
+would provide against a writer that simply skips the read step.
+Mixing OCC and `LockPartition` for the same partition silently
+weakens both — like mixing two mutex disciplines on the same data
+in Go.
+
 | Pattern | When |
 |---|---|
 | **OCC** (`Read` + `Write` with `WithExpectedVersion`) | Low contention, retries are cheap. Compute is fast, conflicts are rare. |

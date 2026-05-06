@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -104,7 +105,7 @@ func (e *poolExecutor) Run(ctx context.Context, fn func(DBTX) error) error {
 	return fn(conn)
 }
 
-func (e *poolExecutor) RunInTx(ctx context.Context, fn func(DBTX) error) error {
+func (e *poolExecutor) RunInTx(ctx context.Context, fn func(DBTX) error) (err error) {
 	if tx := txFromContext(ctx); tx != nil {
 		return fn(tx)
 	}
@@ -115,15 +116,36 @@ func (e *poolExecutor) RunInTx(ctx context.Context, fn func(DBTX) error) error {
 	if err != nil {
 		return fmt.Errorf("s3pgstore: begin tx: %w", err)
 	}
+	// Cleanup runs in three modes, distinguished by the named
+	// return err and recover():
+	//   - panic: roll back resources, then re-panic so the
+	//     caller's stack trace is preserved.
+	//   - err != nil after fn / Commit: roll back, log if the
+	//     rollback itself fails (the caller already has an
+	//     error to return; a rollback failure is operationally
+	//     interesting but mustn't replace the original error).
+	//   - err == nil: Commit succeeded; nothing to roll back.
+	//
+	// Rollback runs against context.WithoutCancel so a
+	// cancelled caller-ctx doesn't also cancel the rollback —
+	// otherwise a cancelled write would leak the tx until
+	// PostgreSQL's idle-in-transaction timeout kicks in.
 	defer func() {
-		// Best-effort rollback on early return / panic. Rollback
-		// after Commit returns ErrTxClosed which is harmless.
-		_ = tx.Rollback(ctx)
+		if p := recover(); p != nil {
+			_ = tx.Rollback(context.WithoutCancel(ctx))
+			panic(p)
+		}
+		if err != nil {
+			if rbErr := tx.Rollback(context.WithoutCancel(ctx)); rbErr != nil {
+				slog.Warn("s3pgstore: rollback after error failed",
+					"err", rbErr)
+			}
+		}
 	}()
-	if err := fn(tx); err != nil {
+	if err = fn(tx); err != nil {
 		return err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err = tx.Commit(ctx); err != nil {
 		return fmt.Errorf("s3pgstore: commit tx: %w", err)
 	}
 	return nil

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 )
 
 // PartitionResult is a per-partition read result. Records are
@@ -105,43 +104,63 @@ func (s *Store[T]) Read(
 	}
 	groups = append(groups, current)
 
+	// Outer fan-out across partitions — each worker decodes
+	// one partition (and internally fan-outs across that
+	// partition's files via fetchAndDecode). Slot-indexed
+	// writes preserve lex order of partition keys regardless
+	// of completion order. Concurrency caps at the s3target's
+	// effective concurrency: extra partition workers would
+	// just queue on the inner semaphore.
+	//
+	// Memory note: with N outer × N inner workers, N²
+	// goroutines may exist concurrently. Most park on the
+	// inner s3target semaphore so the actual S3 fan-out
+	// stays bounded. Decode buffers are the real memory
+	// pressure — Read is already a buffered API ("everything
+	// in RAM"), so the trade is acceptable. Streaming
+	// callers needing per-partition memory bounds should use
+	// ReadPartitionIter (Phase 12).
 	out := make([]PartitionResult[T], len(groups))
-	for i, g := range groups {
-		records, err := s.fetchAndDecode(ctx, g.files)
-		if err != nil {
-			return nil, fmt.Errorf("s3pgstore: read partition %q: %w",
-				g.key, err)
-		}
-
-		var version int64
-		exts := make([]FileExtensions, 0, len(g.files))
-		for _, f := range g.files {
-			if f.writtenAtVersion > version {
-				version = f.writtenAtVersion
+	if err := fanOut(ctx, groups, s.target.effectiveConcurrency(), nil,
+		func(ctx context.Context, i int, g group) error {
+			records, err := s.fetchAndDecode(ctx, g.files)
+			if err != nil {
+				return fmt.Errorf("read partition %q: %w", g.key, err)
 			}
-			extMap := make(map[string]any,
-				len(s.resolved.ExtensionColumns))
-			for i, c := range s.resolved.ExtensionColumns {
-				if i < len(f.extValues) && f.extValues[i] != nil {
-					extMap[c.Name] = f.extValues[i]
+
+			var version int64
+			exts := make([]FileExtensions, 0, len(g.files))
+			for _, f := range g.files {
+				if f.writtenAtVersion > version {
+					version = f.writtenAtVersion
 				}
+				extMap := make(map[string]any,
+					len(s.resolved.ExtensionColumns))
+				for j, c := range s.resolved.ExtensionColumns {
+					if j < len(f.extValues) && f.extValues[j] != nil {
+						extMap[c.Name] = f.extValues[j]
+					}
+				}
+				exts = append(exts, FileExtensions{
+					FileID:     f.fileID,
+					Extensions: extMap,
+				})
 			}
-			exts = append(exts, FileExtensions{
-				FileID:     f.fileID,
-				Extensions: extMap,
-			})
-		}
 
-		records = sortAndDedup(records,
-			s.resolved.EntityKeyOf, s.resolved.VersionOf,
-			o.includeHistory)
+			records = sortAndDedup(records,
+				s.resolved.EntityKeyOf, s.resolved.VersionOf,
+				o.includeHistory)
 
-		out[i] = PartitionResult[T]{
-			PartitionKey:   g.key,
-			Records:        records,
-			Version:        version,
-			FileExtensions: exts,
-		}
+			out[i] = PartitionResult[T]{
+				PartitionKey:   g.key,
+				Records:        records,
+				Version:        version,
+				FileExtensions: exts,
+			}
+			return nil
+		},
+	); err != nil {
+		return nil, fmt.Errorf("s3pgstore: %w", err)
 	}
 	return out, nil
 }
@@ -228,50 +247,46 @@ func (s *Store[T]) selectFileRows(
 }
 
 // fetchAndDecode pulls every parquet file in files from S3 in
-// parallel (capped by the target's MaxInflightRequests
-// semaphore — the s3target.get acquire/release wrap takes
-// care of that), decodes each into []T, and concatenates
-// the partition's records in s3_key lex order.
+// parallel (capped by the s3target's MaxInflightRequests
+// semaphore plus fanOut's worker pool), decodes each into
+// []T, and concatenates the partition's records in s3_key lex
+// order.
 //
 // Lex ordering matters for dedup tie-break (last wins on
 // equal max version, per CLAUDE.md). The caller pre-sorted
-// files by s3_key in the SELECT, so this method preserves
-// that order while parallelising the GETs.
+// files by s3_key in the SELECT; per-index result slots
+// preserve that order while parallelising the GETs.
+//
+// Concurrency is bounded by the s3target's effective
+// MaxInflightRequests so worker count matches the parallelism
+// the target itself would tolerate — beyond that, extra
+// goroutines just queue on the target's semaphore. fanOut's
+// shared-cancel ctx propagates first-error-wins through the
+// target's retry loop, so a failing GET unwinds in-flight
+// siblings instead of running them to completion.
 func (s *Store[T]) fetchAndDecode(
 	ctx context.Context, files []fileRow,
 ) ([]T, error) {
 	if len(files) == 0 {
 		return nil, nil
 	}
-	// Per-index slot so parallel decodes write into a fixed
-	// position — preserves the lex order set by the SELECT.
 	bodies := make([][]T, len(files))
-	errs := make([]error, len(files))
 
-	var wg sync.WaitGroup
-	wg.Add(len(files))
-	for i, f := range files {
-		go func(i int, f fileRow) {
-			defer wg.Done()
+	if err := fanOut(ctx, files, s.target.effectiveConcurrency(), nil,
+		func(ctx context.Context, i int, f fileRow) error {
 			data, err := s.target.get(ctx, f.s3Key)
 			if err != nil {
-				errs[i] = fmt.Errorf("GET %s: %w", f.s3Key, err)
-				return
+				return fmt.Errorf("GET %s: %w", f.s3Key, err)
 			}
 			recs, err := decodeParquet[T](data)
 			if err != nil {
-				errs[i] = fmt.Errorf("decode %s: %w", f.s3Key, err)
-				return
+				return fmt.Errorf("decode %s: %w", f.s3Key, err)
 			}
 			bodies[i] = recs
-		}(i, f)
-	}
-	wg.Wait()
-
-	for _, e := range errs {
-		if e != nil {
-			return nil, e
-		}
+			return nil
+		},
+	); err != nil {
+		return nil, err
 	}
 
 	total := 0

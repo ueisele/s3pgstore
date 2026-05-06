@@ -123,14 +123,26 @@ func newParquetEncoder[T any](
 // worker writing many files reuses the writer's column buffers
 // / dictionary builders / compression scratch.
 //
-// The pooled-encoder byte-equivalence test (see
-// parquet_pool_determinism_test.go) verifies that this method
-// produces byte-identical output to encodeParquetUnpooled —
-// load-bearing for WithIdempotencyToken correctness per
-// CLAUDE.md.
+// The pooled-encoder byte-equivalence test
+// (TestEncodeParquet_PooledMatchesFresh) verifies that this
+// method produces byte-identical output to
+// encodeParquetUnpooled — load-bearing for
+// WithIdempotencyToken correctness per CLAUDE.md.
+//
+// Cleanup contract:
+//   - Buffer always returnable: contents reset on next Get;
+//     oversized buffers (Cap above bufCap) are dropped and
+//     onBufDropped is fired.
+//   - Writer only returnable on a clean (no-error, no-panic)
+//     exit. parquet-go doesn't document writer state after a
+//     failed Write/Close, so the safer choice is to drop it
+//     and let the next Get allocate a fresh one — the alloc
+//     cost is one-shot per error, not cumulative.
+//   - Panics are recovered to run cleanup, then re-panic so
+//     the caller's stack trace is preserved.
 func (e *parquetEncoder[T]) encode(
 	ctx context.Context, records []T,
-) ([]byte, error) {
+) (out []byte, err error) {
 	buf, _ := e.encodeBufPool.Get().(*bytes.Buffer)
 	if buf == nil {
 		buf = &bytes.Buffer{}
@@ -146,22 +158,32 @@ func (e *parquetEncoder[T]) encode(
 		pw.Reset(buf)
 	}
 
-	if _, err := pw.Write(records); err != nil {
+	defer func() {
+		p := recover()
+		// Buffer is safe to return regardless of error / panic
+		// — its contents are reset on next Get. Honour the cap
+		// to keep the pool's steady-state footprint bounded.
+		if buf.Cap() <= e.bufCap {
+			e.encodeBufPool.Put(buf)
+		} else if e.onBufDropped != nil {
+			e.onBufDropped(ctx)
+		}
+		// Writer only returnable on clean exit.
+		if err == nil && p == nil {
+			e.pqWriterPool.Put(pw)
+		}
+		if p != nil {
+			panic(p)
+		}
+	}()
+
+	if _, err = pw.Write(records); err != nil {
 		return nil, err
 	}
-	if err := pw.Close(); err != nil {
+	if err = pw.Close(); err != nil {
 		return nil, err
 	}
-
-	out := append([]byte(nil), buf.Bytes()...)
-
-	e.pqWriterPool.Put(pw)
-	if buf.Cap() <= e.bufCap {
-		e.encodeBufPool.Put(buf)
-	} else if e.onBufDropped != nil {
-		e.onBufDropped(ctx)
-	}
-	return out, nil
+	return append([]byte(nil), buf.Bytes()...), nil
 }
 
 // decodeParquet reads all rows of a parquet file into []T. T

@@ -94,3 +94,28 @@ func TestPoolExecutor_RunInTx_PropagatesError(t *testing.T) {
 		t.Fatalf("RunInTx: want %v, got %v", want, got)
 	}
 }
+
+// TestPoolExecutor_RunInTx_PanicPropagatesViaCtxTx confirms
+// that a panic inside fn propagates out of RunInTx (after the
+// defer's recover + re-panic). The caller-injected tx path
+// doesn't allocate a real tx, so we only verify the panic
+// behavior here; the integration suite covers the
+// rollback-on-panic path against a live pool.
+func TestPoolExecutor_RunInTx_PanicPropagatesViaCtxTx(t *testing.T) {
+	tx := fakeTx{}
+	ctx := WithTx(context.Background(), tx)
+	e := NewPoolExecutor(nil)
+
+	defer func() {
+		p := recover()
+		if p == nil {
+			t.Fatal("want panic to propagate, got nil")
+		}
+		if p != "kaboom" {
+			t.Fatalf("panic value: want %q, got %v", "kaboom", p)
+		}
+	}()
+	_ = e.RunInTx(ctx, func(DBTX) error {
+		panic("kaboom")
+	})
+}

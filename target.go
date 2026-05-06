@@ -191,6 +191,17 @@ func newS3Target(cfg s3TargetConfig) (*s3target, error) {
 	}, nil
 }
 
+// effectiveConcurrency returns the resolved
+// MaxInflightRequests cap as configured at construction
+// (defaultMaxInflightRequests when not overridden). Used by
+// callers that fan out work over the target — beyond this
+// many parallel goroutines, each extra worker just queues on
+// the acquire semaphore, so this is the natural worker-pool
+// upper bound.
+func (t *s3target) effectiveConcurrency() int {
+	return cap(t.sem)
+}
+
 // acquire blocks until a semaphore slot is available or ctx is
 // cancelled. Paired with release in defer.
 func (t *s3target) acquire(ctx context.Context) error {

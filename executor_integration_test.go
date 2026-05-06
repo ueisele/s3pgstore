@@ -154,6 +154,91 @@ func TestPoolExecutor_ParticipatesInCallerTx(t *testing.T) {
 	}
 }
 
+// TestPoolExecutor_RunInTx_PanicRollsBack confirms that a
+// panic inside fn rolls back resources before the panic
+// propagates. Verified by checking that an INSERT inside the
+// panicking fn never lands in the table.
+func TestPoolExecutor_RunInTx_PanicRollsBack(t *testing.T) {
+	f := newFixture(t)
+	e := s3pgstore.NewPoolExecutor(f.Pool)
+
+	if _, err := f.Pool.Exec(t.Context(),
+		`CREATE TABLE `+qualified(f.Schema, "executor_panic")+
+			` (id int PRIMARY KEY)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected panic to propagate")
+			}
+		}()
+		_ = e.RunInTx(t.Context(), func(d s3pgstore.DBTX) error {
+			if _, err := d.Exec(t.Context(),
+				`INSERT INTO `+qualified(f.Schema, "executor_panic")+
+					` VALUES (1)`); err != nil {
+				t.Fatalf("INSERT: %v", err)
+			}
+			panic("kaboom")
+		})
+	}()
+
+	var n int
+	if err := f.Pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM `+
+			qualified(f.Schema, "executor_panic")).Scan(&n); err != nil {
+		t.Fatalf("post-panic count: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("rows after panic: want 0 (rollback happened), got %d", n)
+	}
+}
+
+// TestPoolExecutor_RunInTx_CancelledCtxStillRollsBack confirms
+// that when fn returns an error AND the ctx is cancelled, the
+// rollback still runs. Without context.WithoutCancel on the
+// rollback, the rollback would be no-op'd by the cancelled
+// ctx and the row would leak until PostgreSQL's
+// idle-in-transaction timeout fires.
+func TestPoolExecutor_RunInTx_CancelledCtxStillRollsBack(t *testing.T) {
+	f := newFixture(t)
+	e := s3pgstore.NewPoolExecutor(f.Pool)
+
+	if _, err := f.Pool.Exec(t.Context(),
+		`CREATE TABLE `+qualified(f.Schema, "executor_cancel")+
+			` (id int PRIMARY KEY)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	wantErr := errors.New("cancel-then-fail")
+	got := e.RunInTx(ctx, func(d s3pgstore.DBTX) error {
+		if _, err := d.Exec(ctx,
+			`INSERT INTO `+qualified(f.Schema, "executor_cancel")+
+				` VALUES (1)`); err != nil {
+			t.Fatalf("INSERT: %v", err)
+		}
+		// Cancel the caller's ctx, then return an error so the
+		// defer's rollback path runs against the cancelled ctx.
+		cancel()
+		return wantErr
+	})
+	if !errors.Is(got, wantErr) {
+		t.Fatalf("RunInTx: want %v, got %v", wantErr, got)
+	}
+
+	var n int
+	if err := f.Pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM `+
+			qualified(f.Schema, "executor_cancel")).Scan(&n); err != nil {
+		t.Fatalf("post-rollback count: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("rows after cancelled-ctx rollback: want 0, got %d", n)
+	}
+}
+
 func qualified(schema, table string) string {
 	return `"` + schema + `"."` + table + `"`
 }

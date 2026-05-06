@@ -98,13 +98,34 @@ func (s *Store[T]) Write(
 	}
 	sort.Strings(keys)
 
-	out := make([]WriteResult, 0, len(keys))
-	for _, key := range keys {
-		res, err := s.writePartition(ctx, key, keyValues[key], groups[key], o)
-		if err != nil {
-			return out, err
-		}
-		out = append(out, res)
+	// Multi-partition fan-out: one worker per partition, slot-
+	// indexed results preserve lex order regardless of completion
+	// order. Concurrency caps at the s3target's effective
+	// concurrency — extra partition workers would just queue on
+	// the inner S3 semaphore.
+	//
+	// Partial-failure semantics: on first error fanOut cancels
+	// in-flight siblings, but partitions whose catalog tx already
+	// committed before cancel reaches them stay committed. The
+	// returned slice has length len(keys); failed partitions
+	// carry the zero WriteResult (FileID == 0). Callers that
+	// retry should rely on WithIdempotencyToken — the
+	// partial-UNIQUE short-circuit collapses retries to the
+	// canonical row regardless of which partitions committed
+	// first.
+	out := make([]WriteResult, len(keys))
+	if err := fanOut(ctx, keys, s.target.effectiveConcurrency(), nil,
+		func(ctx context.Context, i int, key string) error {
+			res, err := s.writePartition(ctx, key,
+				keyValues[key], groups[key], o)
+			if err != nil {
+				return err
+			}
+			out[i] = res
+			return nil
+		},
+	); err != nil {
+		return out, err
 	}
 	return out, nil
 }

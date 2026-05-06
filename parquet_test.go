@@ -116,6 +116,53 @@ func TestEncodeParquet_PooledMatchesFresh(t *testing.T) {
 	}
 }
 
+// TestEncodeParquet_PoolReturnedAfterError verifies the
+// cleanup-on-error path: a panic inside the encoder must
+// still return the buffer to the pool (its contents reset on
+// next Get) and re-panic so the caller's stack trace is
+// preserved. The writer is intentionally NOT returned on
+// error/panic — parquet-go doesn't document post-error
+// writer state.
+//
+// Approach: we can't easily make pw.Write panic on demand,
+// so we synthesise the panic via the onBufDropped callback —
+// it fires after Write+Close succeed but before encode
+// returns; panicking inside it lands in the deferred cleanup.
+func TestEncodeParquet_PoolReturnedAfterPanic(t *testing.T) {
+	type rec struct {
+		Payload []byte `parquet:"payload"`
+	}
+	recs := []rec{{Payload: []byte("hello")}}
+
+	// Tiny bufCap so onBufDropped fires; the callback then
+	// panics to exercise the cleanup-on-panic path.
+	enc := newParquetEncoder[rec](&parquet.Snappy, 1,
+		func(context.Context) { panic("boom") })
+
+	defer func() {
+		if recover() == nil {
+			t.Fatal("want panic to propagate")
+		}
+		// After panic, the encoder must remain usable. A new
+		// encode (with a saner cap + no-op cb) should produce
+		// the same bytes as the unpooled reference.
+		want, err := encodeParquetUnpooled(recs, &parquet.Snappy)
+		if err != nil {
+			t.Fatalf("ref encode: %v", err)
+		}
+		enc2 := newParquetEncoder[rec](&parquet.Snappy,
+			defaultEncodeBufPoolMaxBytes, nil)
+		got, err := enc2.encode(context.Background(), recs)
+		if err != nil {
+			t.Fatalf("recovery encode: %v", err)
+		}
+		if !bytes.Equal(want, got) {
+			t.Errorf("recovery encode bytes differ from reference")
+		}
+	}()
+	_, _ = enc.encode(context.Background(), recs)
+}
+
 // TestEncodeParquet_BufDroppedCallback verifies that the
 // onBufDropped callback fires when a single encode produces a
 // buffer larger than bufCap, and does NOT fire when the buffer

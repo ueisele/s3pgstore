@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // DDLPart describes the partition-key column set for DDL
@@ -201,14 +203,16 @@ func renderMV(sb *strings.Builder, names Names, mv DDLMV) {
 
 	lines := make([]string, 0, len(mv.KeyColumns)+len(mv.ValueColumns)+1)
 	for _, kc := range mv.KeyColumns {
-		lines = append(lines, fmt.Sprintf("    %q TEXT NOT NULL", kc))
+		lines = append(lines, fmt.Sprintf("    %s TEXT NOT NULL",
+			pgx.Identifier{kc}.Sanitize()))
 	}
 	for _, vc := range mv.ValueColumns {
-		lines = append(lines, fmt.Sprintf("    %q TEXT", vc))
+		lines = append(lines, fmt.Sprintf("    %s TEXT",
+			pgx.Identifier{vc}.Sanitize()))
 	}
 	quoted := make([]string, len(mv.KeyColumns))
 	for i, kc := range mv.KeyColumns {
-		quoted[i] = fmt.Sprintf("%q", kc)
+		quoted[i] = pgx.Identifier{kc}.Sanitize()
 	}
 	lines = append(lines,
 		fmt.Sprintf("    PRIMARY KEY (%s)", strings.Join(quoted, ", ")))

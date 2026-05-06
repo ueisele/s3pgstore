@@ -10,7 +10,7 @@
 // happens in exactly one place.
 package catalog
 
-import "fmt"
+import "github.com/jackc/pgx/v5"
 
 // Bare table-name suffixes appended to the configured
 // TablePrefix. These are the only suffixes the library knows
@@ -54,10 +54,13 @@ func NewNames(schema, prefix string) Names {
 }
 
 // Qualify returns "schema"."table" with both identifiers
-// double-quoted. Used for every table reference the library
-// emits.
+// quoted via pgx.Identifier — PostgreSQL-correct escaping
+// (embedded `"` becomes `""`, no backslash-escape semantics).
+// The Config validator already rejects identifiers that would
+// need escaping, so this is belt-and-suspenders against future
+// changes.
 func (n Names) Qualify(table string) string {
-	return fmt.Sprintf("%q.%q", n.Schema, table)
+	return pgx.Identifier{n.Schema, table}.Sanitize()
 }
 
 // Files returns the fully-qualified s3pgstore_files table name.

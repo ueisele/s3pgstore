@@ -94,7 +94,7 @@ func (m *SchemaManager[T]) Create(ctx context.Context) error {
 	}
 	return m.cfg.Executor.Run(ctx, func(d DBTX) error {
 		if _, err := d.Exec(ctx, ddl); err != nil {
-			return fmt.Errorf("s3pgstore: create schema: %w", err)
+			return fmt.Errorf("create schema: %w", err)
 		}
 		return nil
 	})
@@ -129,7 +129,7 @@ func (m *SchemaManager[T]) Drop(ctx context.Context) error {
 			if _, err := d.Exec(ctx,
 				fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE", t),
 			); err != nil {
-				return fmt.Errorf("s3pgstore: drop %s: %w", t, err)
+				return fmt.Errorf("drop %s: %w", t, err)
 			}
 		}
 		return nil
@@ -193,7 +193,7 @@ type SchemaValidationError struct {
 }
 
 func (e *SchemaValidationError) Error() string {
-	return fmt.Sprintf("s3pgstore: schema validation failed: missing %s",
+	return fmt.Sprintf("schema validation failed: missing %s",
 		strings.Join(e.Missing, ", "))
 }
 

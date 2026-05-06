@@ -48,8 +48,8 @@ func (s *Store[T]) resolveWriteOpts(opts ...WriteOption) (writeOpts, error) {
 		opt.applyWrite(&o)
 	}
 	if o.idempotencyToken != nil && o.idempotencyTokenOfFn != nil {
-		return writeOpts{}, fmt.Errorf(
-			"s3pgstore: WithIdempotencyToken and " +
+		return writeOpts{}, errors.New(
+			"WithIdempotencyToken and " +
 				"WithIdempotencyTokenOf are mutually exclusive")
 	}
 	if err := validateMetadata(o.metadata,
@@ -145,8 +145,8 @@ func (s *Store[T]) WriteWithKey(
 	opts ...WriteOption,
 ) (WriteResult, error) {
 	if len(records) == 0 {
-		return WriteResult{}, fmt.Errorf(
-			"s3pgstore: WriteWithKey: records is empty")
+		return WriteResult{}, errors.New(
+			"WriteWithKey: records is empty")
 	}
 	values, err := partitionKeyValues(partitionKey, s.resolved.PartitionKeyParts)
 	if err != nil {
@@ -207,7 +207,7 @@ func (s *Store[T]) writePartition(
 		if existing, ok, err := s.lookupTokenWriteResult(
 			ctx, partitionKey, token); err != nil {
 			return WriteResult{}, fmt.Errorf(
-				"s3pgstore: lookup token: %w", err)
+				"lookup token: %w", err)
 		} else if ok {
 			return existing, nil
 		}
@@ -215,12 +215,12 @@ func (s *Store[T]) writePartition(
 
 	body, err := s.encoder.encode(ctx, records)
 	if err != nil {
-		return WriteResult{}, fmt.Errorf("s3pgstore: encode parquet: %w", err)
+		return WriteResult{}, fmt.Errorf("encode parquet: %w", err)
 	}
 
 	id, err := uuid.NewV7()
 	if err != nil {
-		return WriteResult{}, fmt.Errorf("s3pgstore: generate UUIDv7: %w", err)
+		return WriteResult{}, fmt.Errorf("generate UUIDv7: %w", err)
 	}
 	s3Key := s.dataKey(partitionKey, id.String())
 
@@ -234,12 +234,12 @@ func (s *Store[T]) writePartition(
 		).Scan(&pendingID)
 	}); err != nil {
 		return WriteResult{}, fmt.Errorf(
-			"s3pgstore: insert pending_writes: %w", err)
+			"insert pending_writes: %w", err)
 	}
 
 	// Step 4 — S3 PUT.
 	if err := s.target.put(ctx, s3Key, body, "application/vnd.apache.parquet"); err != nil {
-		return WriteResult{}, fmt.Errorf("s3pgstore: S3 PUT: %w", err)
+		return WriteResult{}, fmt.Errorf("S3 PUT: %w", err)
 	}
 
 	// Step 5 — single transaction containing the partition
@@ -350,15 +350,15 @@ func (s *Store[T]) writePartition(
 				ctx, partitionKey, token)
 			if lookupErr != nil {
 				return WriteResult{}, fmt.Errorf(
-					"s3pgstore: token-race re-lookup: %w", lookupErr)
+					"token-race re-lookup: %w", lookupErr)
 			}
 			if !ok {
 				// Lost the race but the row vanished — the
 				// other writer must have rolled back too.
 				// Surface the original error so the caller
 				// can retry.
-				return WriteResult{}, fmt.Errorf(
-					"s3pgstore: token UNIQUE conflict but lookup " +
+				return WriteResult{}, errors.New(
+					"token UNIQUE conflict but lookup " +
 						"found no row (concurrent rollback)")
 			}
 			return existing, nil
@@ -366,7 +366,7 @@ func (s *Store[T]) writePartition(
 		if errors.Is(err, ErrVersionConflict) {
 			return WriteResult{}, ErrVersionConflict
 		}
-		return WriteResult{}, fmt.Errorf("s3pgstore: catalog tx: %w", err)
+		return WriteResult{}, fmt.Errorf("catalog tx: %w", err)
 	}
 
 	return WriteResult{

@@ -160,7 +160,7 @@ func (s *Store[T]) Read(
 			return nil
 		},
 	); err != nil {
-		return nil, fmt.Errorf("s3pgstore: %w", err)
+		return nil, err
 	}
 	return out, nil
 }
@@ -241,7 +241,7 @@ func (s *Store[T]) selectFileRows(
 		return rows.Err()
 	})
 	if err != nil {
-		return nil, fmt.Errorf("s3pgstore: SELECT files: %w", err)
+		return nil, fmt.Errorf("SELECT files: %w", err)
 	}
 	return out, nil
 }

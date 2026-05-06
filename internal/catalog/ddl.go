@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -55,7 +56,7 @@ type DDLInput struct {
 // caller can checksum it for migration tracking.
 func RenderAll(in DDLInput) (string, error) {
 	if err := validateDDLInput(in); err != nil {
-		return "", fmt.Errorf("catalog.RenderAll: %w", err)
+		return "", fmt.Errorf("RenderAll: %w", err)
 	}
 
 	var sb strings.Builder
@@ -77,13 +78,13 @@ func RenderAll(in DDLInput) (string, error) {
 
 func validateDDLInput(in DDLInput) error {
 	if in.Names.Schema == "" {
-		return fmt.Errorf("names.Schema is empty")
+		return errors.New("names.Schema is empty")
 	}
 	if in.Names.Prefix == "" {
-		return fmt.Errorf("names.Prefix is empty")
+		return errors.New("names.Prefix is empty")
 	}
 	if len(in.Parts) == 0 {
-		return fmt.Errorf("parts must be non-empty")
+		return errors.New("parts must be non-empty")
 	}
 	return nil
 }

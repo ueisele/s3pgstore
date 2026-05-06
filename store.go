@@ -110,7 +110,7 @@ func (s *Store[T]) validatePartitionKey(rec T) (string, []string, error) {
 	key := s.resolved.PartitionKeyOf(rec)
 	values, err := partitionKeyValues(key, s.resolved.PartitionKeyParts)
 	if err != nil {
-		return "", nil, fmt.Errorf("s3pgstore: PartitionKeyOf: %w", err)
+		return "", nil, fmt.Errorf("PartitionKeyOf: %w", err)
 	}
 	return key, values, nil
 }

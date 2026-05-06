@@ -1,6 +1,7 @@
 package s3pgstore
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -22,12 +23,12 @@ import (
 // fresh allocation; callers may mutate it.
 func partitionKeyValues(key string, parts []string) ([]string, error) {
 	if key == "" {
-		return nil, fmt.Errorf("s3pgstore: partition key is empty")
+		return nil, errors.New("partition key is empty")
 	}
 	segs := strings.Split(key, "/")
 	if len(segs) != len(parts) {
 		return nil, fmt.Errorf(
-			"s3pgstore: partition key %q has %d segments, "+
+			"partition key %q has %d segments, "+
 				"PartitionKeyParts has %d entries",
 			key, len(segs), len(parts))
 	}
@@ -36,19 +37,19 @@ func partitionKeyValues(key string, parts []string) ([]string, error) {
 		eq := strings.IndexByte(seg, '=')
 		if eq <= 0 {
 			return nil, fmt.Errorf(
-				"s3pgstore: partition key %q segment %d (%q): "+
+				"partition key %q segment %d (%q): "+
 					"expected <name>=<value>", key, i, seg)
 		}
 		name, value := seg[:eq], seg[eq+1:]
 		if name != parts[i] {
 			return nil, fmt.Errorf(
-				"s3pgstore: partition key %q segment %d: "+
+				"partition key %q segment %d: "+
 					"name %q != PartitionKeyParts[%d] %q",
 				key, i, name, i, parts[i])
 		}
 		if value == "" {
 			return nil, fmt.Errorf(
-				"s3pgstore: partition key %q segment %d (%q): "+
+				"partition key %q segment %d (%q): "+
 					"empty value not allowed", key, i, seg)
 		}
 		out[i] = value

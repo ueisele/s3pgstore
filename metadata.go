@@ -54,7 +54,7 @@ func validateMetadata(m map[string]any, cols []ExtensionColumn) error {
 		sqlType, ok := declared[k]
 		if !ok {
 			return fmt.Errorf(
-				"s3pgstore: WithMetadata: unknown key %q "+
+				"WithMetadata: unknown key %q "+
 					"(declared keys: %s)",
 				k, declaredKeysList(declared))
 		}
@@ -111,7 +111,7 @@ func checkGoTypeMatchesSQL(name, sqlType string, v any) error {
 	}
 	mismatch := func(want string) error {
 		return fmt.Errorf(
-			"s3pgstore: WithMetadata: key %q declared as %s, "+
+			"WithMetadata: key %q declared as %s, "+
 				"got Go value of type %T (want %s)",
 			name, sqlType, v, want)
 	}
@@ -154,7 +154,7 @@ func checkGoTypeMatchesSQL(name, sqlType string, v any) error {
 		}
 	default:
 		return fmt.Errorf(
-			"s3pgstore: unrecognized SQL type %q for key %q",
+			"unrecognized SQL type %q for key %q",
 			sqlType, name)
 	}
 	return nil

@@ -78,7 +78,7 @@ func Or(filters ...PartitionFilter) PartitionFilter {
 func validatePart(p string, parts []string) error {
 	if !slices.Contains(parts, p) {
 		return fmt.Errorf(
-			"s3pgstore: filter references unknown part %q "+
+			"filter references unknown part %q "+
 				"(declared parts: %v)", p, parts)
 	}
 	return nil
@@ -120,7 +120,7 @@ func (f betweenFilter) translate(parts []string, b *strings.Builder, args *[]any
 	}
 	if f.from >= f.to {
 		return fmt.Errorf(
-			"s3pgstore: Between(%q, %q, %q): from must be lex-less than to",
+			"Between(%q, %q, %q): from must be lex-less than to",
 			f.part, f.from, f.to)
 	}
 	col := catalog.PartColumnPrefix + f.part

@@ -233,7 +233,7 @@ func (c Config[T]) validate() error {
 	}
 
 	if len(errs) > 0 {
-		return fmt.Errorf("s3pgstore: invalid Config: %s",
+		return fmt.Errorf("invalid Config: %s",
 			strings.Join(errs, "; "))
 	}
 	return nil

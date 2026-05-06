@@ -173,13 +173,13 @@ type s3target struct {
 // Validates only: no S3 round-trips at construction time.
 func newS3Target(cfg s3TargetConfig) (*s3target, error) {
 	if cfg.S3Client == nil {
-		return nil, fmt.Errorf("s3pgstore: s3target: S3Client required")
+		return nil, errors.New("s3target: S3Client required")
 	}
 	if cfg.Bucket == "" {
-		return nil, fmt.Errorf("s3pgstore: s3target: Bucket required")
+		return nil, errors.New("s3target: Bucket required")
 	}
 	if cfg.MaxInflightRequests < 0 {
-		return nil, fmt.Errorf("s3pgstore: s3target: MaxInflightRequests must be >= 0")
+		return nil, errors.New("s3target: MaxInflightRequests must be >= 0")
 	}
 	cap := cfg.MaxInflightRequests
 	if cap == 0 {

@@ -52,7 +52,7 @@ func resolveCompression(c CompressionCodec) (compress.Codec, error) {
 		return &parquet.Uncompressed, nil
 	}
 	return nil, fmt.Errorf(
-		"s3pgstore: unknown Compression %d (want default, snappy, "+
+		"unknown Compression %d (want default, snappy, "+
 			"zstd, gzip, or uncompressed)", c)
 }
 

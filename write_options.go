@@ -5,7 +5,7 @@ import "errors"
 // ErrVersionConflict is returned by Write when
 // WithExpectedVersion is set and the partition's actual
 // version doesn't match. Callers compose with errors.Is.
-var ErrVersionConflict = errors.New("s3pgstore: version conflict")
+var ErrVersionConflict = errors.New("version conflict")
 
 // WithIdempotencyToken returns a WriteOption that tags the
 // write with token for retry-safe idempotency. Retries with
@@ -103,4 +103,4 @@ func (o expectedVersionOpt) applyWrite(opts *writeOpts) {
 //
 //nolint:gochecknoglobals // sentinel
 var errMixedTypeIdempotencyTokenOf = errors.New(
-	"s3pgstore: WithIdempotencyTokenOf type mismatch")
+	"WithIdempotencyTokenOf type mismatch")

@@ -145,7 +145,7 @@ func runOneRecover[I any](
 				"panic", fmt.Sprint(p),
 				"stack", string(stack))
 			err = fmt.Errorf(
-				"s3pgstore: fanOut worker [%d] panicked: %v", i, p)
+				"fanOut worker [%d] panicked: %v", i, p)
 		}
 	}()
 	return work(ctx, i, item)

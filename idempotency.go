@@ -16,7 +16,7 @@ import (
 //
 //nolint:gochecknoglobals // sentinel
 var errTokenRaceLost = errors.New(
-	"s3pgstore: token UNIQUE conflict — another writer landed first")
+	"token UNIQUE conflict — another writer landed first")
 
 // resolveTokenForPartition returns the idempotency token for a
 // partition's records, or "" when no idempotency option was
@@ -39,7 +39,7 @@ func (s *Store[T]) resolveTokenForPartition(
 		token, err := o.idempotencyTokenOfFn(records)
 		if err != nil {
 			return "", fmt.Errorf(
-				"s3pgstore: WithIdempotencyTokenOf: %w", err)
+				"WithIdempotencyTokenOf: %w", err)
 		}
 		return token, nil
 	}
@@ -92,12 +92,12 @@ func (s *Store[T]) LookupByToken(
 	ctx context.Context, partitionKey, token string,
 ) (WriteResult, bool, error) {
 	if partitionKey == "" {
-		return WriteResult{}, false, fmt.Errorf(
-			"s3pgstore: LookupByToken: partitionKey is empty")
+		return WriteResult{}, false, errors.New(
+			"LookupByToken: partitionKey is empty")
 	}
 	if token == "" {
-		return WriteResult{}, false, fmt.Errorf(
-			"s3pgstore: LookupByToken: token is empty")
+		return WriteResult{}, false, errors.New(
+			"LookupByToken: token is empty")
 	}
 	if _, err := partitionKeyValues(partitionKey,
 		s.resolved.PartitionKeyParts); err != nil {

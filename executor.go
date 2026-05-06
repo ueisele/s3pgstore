@@ -88,7 +88,7 @@ func NewPoolExecutor(pool *pgxpool.Pool) Executor {
 
 // ErrNilPool is returned by NewPoolExecutor's executor when it
 // was constructed with a nil pool.
-var ErrNilPool = errors.New("s3pgstore: pgxpool.Pool is nil")
+var ErrNilPool = errors.New("pgxpool.Pool is nil")
 
 func (e *poolExecutor) Run(ctx context.Context, fn func(DBTX) error) error {
 	if tx := txFromContext(ctx); tx != nil {
@@ -99,7 +99,7 @@ func (e *poolExecutor) Run(ctx context.Context, fn func(DBTX) error) error {
 	}
 	conn, err := e.pool.Acquire(ctx)
 	if err != nil {
-		return fmt.Errorf("s3pgstore: acquire pool conn: %w", err)
+		return fmt.Errorf("acquire pool conn: %w", err)
 	}
 	defer conn.Release()
 	return fn(conn)
@@ -114,7 +114,7 @@ func (e *poolExecutor) RunInTx(ctx context.Context, fn func(DBTX) error) (err er
 	}
 	tx, err := e.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return fmt.Errorf("s3pgstore: begin tx: %w", err)
+		return fmt.Errorf("begin tx: %w", err)
 	}
 	// Cleanup runs in three modes, distinguished by the named
 	// return err and recover():
@@ -146,7 +146,7 @@ func (e *poolExecutor) RunInTx(ctx context.Context, fn func(DBTX) error) (err er
 		return err
 	}
 	if err = tx.Commit(ctx); err != nil {
-		return fmt.Errorf("s3pgstore: commit tx: %w", err)
+		return fmt.Errorf("commit tx: %w", err)
 	}
 	return nil
 }

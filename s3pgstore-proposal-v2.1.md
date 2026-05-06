@@ -131,9 +131,9 @@ func (s *Store[T]) Compact(
 For each partition matched by `filters`:
 
 1. Acquire a partition-level **compaction advisory lock** (a
-   different key from `LockPartition`'s row lock — compaction must
-   not block regular writers, only other compactions on the same
-   partition).
+   distinct `pg_advisory_xact_lock` key from `LockPartition`'s —
+   compaction must not block regular writers, only other
+   compactions on the same partition).
 2. SELECT live files: `WHERE partition_key = $key AND superseded_at
    IS NULL ORDER BY feed_seq LIMIT MaxInputFiles`. Stop earlier if
    accumulated `file_size` exceeds `OutputMaxBytes`.
@@ -162,7 +162,7 @@ For each partition matched by `filters`:
 |---|---|
 | Compaction × compaction (same partition) | Serialized by compaction advisory lock. |
 | Compaction × regular write | Brief contention on partition row UPDATE in step 7; PostgreSQL row-locking serializes. Both bump version. |
-| Compaction × `LockPartition` | Compaction also takes the row lock briefly in step 7 — blocks until LockPartition's transaction releases. |
+| Compaction × `LockPartition` | Cooperative — compaction must opt in to `LockPartition`'s advisory key before step 2 to serialize with held locks. Open design question for v2.1 implementation: see TODO below. |
 | Compaction × Read | Atomic from reader's perspective: snapshot before compaction commits sees inputs as live; after, sees output as live. Never partial. |
 
 ### What compaction does and doesn't
@@ -385,7 +385,7 @@ Each has its own semantics and cleanup sequencing.
        (replicated earlier in feed_seq order). UPDATE those
        rows' `superseded_*` columns from the row's data.
      - INSERT/UPDATE the partition row: bump version, update
-       last_write_at / last_compact_at.
+       last_compact_at.
    - Update checkpoint after the transaction commits.
 5. Loop.
 

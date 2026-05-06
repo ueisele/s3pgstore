@@ -417,18 +417,35 @@ Version; s3store's dedup correctness inherited verbatim.
 
 ### Phase 9 — LockPartition
 
-- `LockPartition(ctx, partitionKey, opts...)`:
-  - Requires active transaction in `ctx` (errors otherwise).
-  - INSERT `s3pgstore_partitions` row at version 0 if missing
-    (idempotent: `ON CONFLICT DO NOTHING`).
-  - `SELECT … FOR UPDATE` on the partition row.
-- `WithLockTimeout(d)` — emits `SET LOCAL lock_timeout = '<d>ms'`
-  before the SELECT.
-- Integration tests: blocks concurrent writer; allows concurrent
-  reader; deadlock detection (two transactions locking A→B and
-  B→A); lock timeout returns clean error.
+`LockPartition` uses `pg_advisory_xact_lock` keyed by a stable
+hash of the partition key — not a row-level `SELECT … FOR UPDATE`
+on `s3pgstore_partitions`. Trade-offs: no version=0 stub rows in
+the partitions table, no schema clutter for partitions that are
+locked but never written, lock auto-releases on tx end (commit or
+rollback). Cooperative semantics — a writer that doesn't call
+`LockPartition` doesn't block on a holder; document this.
 
-**Milestone:** pessimistic locking pattern verified end-to-end.
+- `LockPartition(ctx, partitionKey, opts...)`:
+  - Requires active transaction in `ctx` (errors otherwise —
+    advisory-xact locks release on autocommit, defeating the
+    purpose).
+  - Computes a deterministic int64 key from `partitionKey`
+    (e.g. `hash/fnv` 64-bit). Same key, same lock, every time.
+  - Issues `SELECT pg_advisory_xact_lock($1)` with the hashed
+    key. Blocks until other holders of the same key release
+    their tx, or until `lock_timeout` fires.
+- `WithLockTimeout(d)` — emits `SET LOCAL lock_timeout = '<d>ms'`
+  before the lock acquisition. Applies to advisory locks the
+  same way it applies to row locks.
+- Integration tests: blocks concurrent locker on the same key;
+  allows concurrent locker on a different key; allows concurrent
+  reader (advisory locks don't block plain SELECT); deadlock
+  detection (two transactions locking A→B and B→A); lock timeout
+  returns clean error; cooperative-skip path (a Write without
+  LockPartition is not blocked by a holder, by design).
+
+**Milestone:** pessimistic-lock pattern verified end-to-end via
+`pg_advisory_xact_lock`.
 
 ### Phase 10 — Sequencer
 

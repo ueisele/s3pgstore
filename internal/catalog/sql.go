@@ -45,9 +45,9 @@ func (n Names) IdempotencyLookupSQL() string {
 
 // PartitionUpsertSQL returns the upsert SQL for the partition
 // row. Keeps version monotonic by 1 per call:
-// first INSERT lands at version=1, file_count=1, last_write_at=now();
-// every subsequent call bumps version by 1, increments
-// file_count, and refreshes the timestamps.
+// first INSERT lands at version=1, file_count=1; every
+// subsequent call bumps version by 1, increments file_count,
+// and refreshes updated_at.
 //
 // parts is the list of part_<n> column names ("part_charge_period",
 // ...). They appear in the INSERT column list and the VALUES
@@ -55,11 +55,13 @@ func (n Names) IdempotencyLookupSQL() string {
 // ($1=partition_key, $2=part_1, $3=part_2, ..., $N=part_N) and
 // the returning new version comes back in the same statement.
 //
-// expectVersionZero=true weaves a CAS on version=0 into the
-// conflict branch — used by WithExpectedVersion(0) which
-// asserts "no writes yet" (satisfied either by an absent row
-// or a row at version=0, e.g. after LockPartition). Both
-// states upsert into version=1 successfully.
+// expectVersionZero=true gates the conflict branch on
+// version=0 — used by WithExpectedVersion(0) which asserts
+// "no writes yet." In v2.0 the only state matching is "row
+// absent" (LockPartition uses pg_advisory_xact_lock and never
+// touches the row), but the WHERE filter is kept for forward
+// compatibility with future paths that might leave version=0
+// rows.
 //
 // For WithExpectedVersion(N>0) callers go through
 // PartitionUpdateOCCSQL instead — that's a pure UPDATE WHERE
@@ -69,23 +71,20 @@ func (n Names) PartitionUpsertSQL(parts []string, expectVersionZero bool) string
 	for _, p := range parts {
 		cols = append(cols, PartColumnPrefix+p)
 	}
-	cols = append(cols, "version", "file_count", "last_write_at")
+	cols = append(cols, "version", "file_count")
 
 	placeholders := make([]string, len(cols))
-	for i := range len(cols) - 3 {
+	for i := range len(cols) - 2 {
 		placeholders[i] = fmt.Sprintf("$%d", i+1)
 	}
-	// version=1 / file_count=1 / last_write_at=now() are
-	// constants on the first-insert path. ON CONFLICT swaps
-	// them in for the bump form below.
-	placeholders[len(cols)-3] = "1"
+	// version=1 / file_count=1 are constants on the first-insert
+	// path. ON CONFLICT swaps them in for the bump form below.
 	placeholders[len(cols)-2] = "1"
-	placeholders[len(cols)-1] = "now()"
+	placeholders[len(cols)-1] = "1"
 
 	conflict := `ON CONFLICT (partition_key) DO UPDATE SET
         version = ` + n.Partitions() + `.version + 1,
         file_count = ` + n.Partitions() + `.file_count + 1,
-        last_write_at = now(),
         updated_at = now()`
 
 	if expectVersionZero {
@@ -120,7 +119,6 @@ func (n Names) PartitionUpdateOCCSQL() string {
 		`UPDATE %s SET
         version = version + 1,
         file_count = file_count + 1,
-        last_write_at = now(),
         updated_at = now()
         WHERE partition_key = $1 AND version = $2
         RETURNING version`,

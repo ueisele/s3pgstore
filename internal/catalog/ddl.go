@@ -165,7 +165,6 @@ func renderPartitions(sb *strings.Builder, in DDLInput) error {
 	}
 	sb.WriteString("    version         BIGINT NOT NULL DEFAULT 0,\n")
 	sb.WriteString("    file_count      INT NOT NULL DEFAULT 0,\n")
-	sb.WriteString("    last_write_at   TIMESTAMPTZ,\n")
 	sb.WriteString("    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()\n")
 	sb.WriteString(");\n")
 

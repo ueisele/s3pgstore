@@ -254,9 +254,9 @@ detect or test for them at runtime.
 
 - **PostgreSQL is the only supported database.** The library uses
   partial indexes, `INSERT ... ON CONFLICT DO UPDATE`, `RETURNING`,
-  advisory locks (`pg_advisory_xact_lock`), row-level locks
-  (`SELECT ... FOR UPDATE`), and `LISTEN/NOTIFY` (optional). Each
-  is load-bearing. PostgreSQL-protocol-compatible databases
+  advisory locks (`pg_advisory_xact_lock`, used by both the
+  sequencer and `LockPartition`), and `LISTEN/NOTIFY` (optional).
+  Each is load-bearing. PostgreSQL-protocol-compatible databases
   (Aurora PostgreSQL, AlloyDB, CockroachDB, YugabyteDB) are likely
   to work but aren't tested.
 - **Statement-level snapshots under READ COMMITTED.** Each SELECT
@@ -267,14 +267,12 @@ detect or test for them at runtime.
 - **`pg_advisory_xact_lock` is transaction-scoped exclusive on
   the configured key.** Only one holder at a time across the
   entire database; release on transaction end (commit or
-  rollback). The sequencer uses a fixed key; if another process
-  or operator holds the same key, the sequencer blocks rather
-  than proceeding in parallel.
-- **`SELECT ... FOR UPDATE` blocks UPDATE/DELETE/SELECT FOR UPDATE
-  on the same row, not plain SELECT.** `LockPartition` uses this
-  to serialize concurrent writers to the same partition while
-  letting read-only callers continue to see committed state
-  without blocking.
+  rollback). Advisory locks don't block plain SQL operations on
+  tables — only other holders of the same key block. The
+  sequencer uses a fixed key; `LockPartition` uses a key derived
+  from a hash of the partition key (cooperative serialization
+  between participants who all call `LockPartition`; non-callers
+  proceed without blocking).
 - **S3 GET-after-PUT on new keys is consistent.** The runtime
   path PUTs new UUID keys (never overwrites) and GETs them by key
   (never LISTs). The catalog tells the reader exactly which key

@@ -411,10 +411,13 @@ COMMITTED, Write opens its own transaction internally for the CAS.
 **Pessimistic locking.** Suits high-contention workloads, or
 read-modify-write cycles where re-running the modify is expensive
 (slow compute, external API calls, large payloads).
-`LockPartition(ctx, partitionKey)` acquires an exclusive row lock
-on `s3pgstore_partitions` for the duration of the caller's
-transaction. Other writers to the same partition block on the row
-lock until the lock-holding transaction commits or rolls back.
+`LockPartition(ctx, partitionKey)` acquires a transaction-scoped
+PostgreSQL advisory lock (`pg_advisory_xact_lock`) keyed by a
+hash of `partitionKey`. Other callers of `LockPartition` on the
+same partition block until the lock-holding transaction commits
+or rolls back. Cooperative — writers that skip `LockPartition`
+proceed without blocking on a holder; the pattern is "all
+participants take the lock, or none."
 
 ```go
 err := executor.RunInTx(ctx, func(ctx context.Context) error {
@@ -433,19 +436,19 @@ err := executor.RunInTx(ctx, func(ctx context.Context) error {
 })
 ```
 
-The lock guarantees no concurrent writer can bump the partition
-version between our `Read` and `Write`, so `WithExpectedVersion` is
-redundant (passing it is harmless — the CAS will always succeed).
-Read-only callers without a lock continue to see committed state
-concurrently; row-level `SELECT ... FOR UPDATE` blocks other
-`UPDATE` and `SELECT FOR UPDATE` on the same row, not plain
-`SELECT`.
+The lock guarantees no concurrent `LockPartition` holder can
+interleave a Write between our `Read` and `Write`, so
+`WithExpectedVersion` is redundant under the cooperative protocol
+(passing it is harmless — the CAS will always succeed). Read-only
+callers without a lock continue to see committed state
+concurrently; advisory locks don't block plain SQL operations on
+tables, only other holders of the same advisory key.
 
-`LockPartition` requires an active transaction in `ctx` (otherwise
-the row lock would be released immediately on autocommit) and
-creates the partition row at version 0 if it didn't exist, so the
-lock works uniformly for first-write and subsequent-write
-scenarios.
+`LockPartition` requires an active transaction in `ctx` —
+advisory-transaction locks release on autocommit, defeating the
+purpose. The lock is taken on a hash of `partitionKey`, so it
+works uniformly for first-write and subsequent-write scenarios
+without touching the partitions table.
 
 **Lock ordering caveat.** Transactions that lock multiple
 partitions must lock them in a deterministic order (e.g., sorted by
@@ -646,9 +649,12 @@ depends on the caller's options:
 | `WithExpectedVersion(N>0)` | `UPDATE WHERE version=N` | Zero rows updated → `ErrVersionConflict` | UPDATE succeeds if version=N; else `ErrVersionConflict` |
 
 The semantics of `WithExpectedVersion(0)`: "I expect this partition
-to have had no writes yet." Two states satisfy this — the partition
-row doesn't exist, or it exists at version 0 (e.g., from
-`LockPartition`). The library's SQL handles both with one upsert.
+to have had no writes yet." In v2.0 the only state matching is
+"partition row absent" — `LockPartition` uses
+`pg_advisory_xact_lock` and never touches the row. The conflict
+branch retains a `WHERE version = 0` filter for forward
+compatibility with hypothetical future paths that might leave
+version=0 rows; in v2.0 it's defensive code that never fires.
 
 All three SQL shapes are single round-trips. No version is read
 before the write; the UPDATE/INSERT increments and `RETURNING` gives
@@ -751,12 +757,12 @@ type PartitionResult[T any] struct {
 }
 ```
 
-`Read` returns only partitions that have at least one file row. A
-partition created by `LockPartition` with no subsequent writes does
-not appear (its existence is implied by holding the lock; callers
-hold the partition key already). Callers who want OCC on a
-brand-new partition use `WithExpectedVersion(0)` on the Write — no
-Read needed first.
+`Read` returns only partitions that have at least one file row.
+`LockPartition` doesn't materialize a partition row (it takes an
+advisory lock keyed by hash), so a held lock with no subsequent
+writes is invisible to `Read` — by design; callers already hold
+the partition key. Callers who want OCC on a brand-new partition
+use `WithExpectedVersion(0)` on the Write — no Read needed first.
 
 #### Single-query design
 
@@ -1285,13 +1291,14 @@ PostgreSQL-specific features:
 - **`INSERT ... ON CONFLICT DO UPDATE`** for the atomic
   partition-row upsert.
 - **`RETURNING` clauses** for single-round-trip writes.
-- **Advisory locks** (`pg_advisory_xact_lock`) for the sequencer's
-  serialization.
-- **Row-level `SELECT ... FOR UPDATE`** for `LockPartition`'s
-  pessimistic locking. PostgreSQL's row-level locks block other
-  `UPDATE`/`DELETE`/`SELECT FOR UPDATE` on the same row but not
-  plain `SELECT`, which is what enables read-only callers to keep
-  reading concurrently with a held `LockPartition`.
+- **Advisory locks** (`pg_advisory_xact_lock`) for both the
+  sequencer's single-instance serialization (fixed key) and
+  `LockPartition`'s per-partition pessimistic lock (key derived
+  from a hash of `partitionKey`). Advisory locks don't block
+  plain SQL operations on tables — read-only callers keep
+  reading concurrently with a held `LockPartition`, and
+  cooperative writers that don't take the lock proceed without
+  blocking on a holder.
 - **`LISTEN/NOTIFY`** for low-latency feed wake-ups (optional).
 
 Each is load-bearing — switching to a database that lacks them would
@@ -1362,7 +1369,6 @@ CREATE TABLE s3pgstore_partitions (
     part_customer       TEXT NOT NULL,
     version             BIGINT NOT NULL DEFAULT 0,
     file_count          INT NOT NULL DEFAULT 0,
-    last_write_at       TIMESTAMPTZ,
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX ON s3pgstore_partitions (part_charge_period, part_customer);

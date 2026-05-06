@@ -228,8 +228,7 @@ func expectedSchema[T any](r Config[T]) expectedSchemaSet {
 	}
 
 	partitionsCols := []string{
-		"partition_key", "version", "file_count", "last_write_at",
-		"updated_at",
+		"partition_key", "version", "file_count", "updated_at",
 	}
 	for _, p := range r.PartitionKeyParts {
 		partitionsCols = append(partitionsCols,

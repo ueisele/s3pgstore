@@ -42,10 +42,10 @@ func WithIdempotencyTokenOf[T any](fn func([]T) (string, error)) WriteOption {
 // version differs.
 //
 // expected=0 has special semantics: it asserts "this partition
-// has had no writes yet" — satisfied either when the partition
-// row doesn't exist, or when it exists at version=0 (e.g.
-// after LockPartition). Both states upsert successfully into
-// version=1.
+// has had no writes yet" — satisfied when the partition row
+// doesn't exist (the only version=0 state in v2.0; LockPartition
+// uses pg_advisory_xact_lock and never touches the row). Upserts
+// successfully into version=1.
 //
 // expected>0 requires the partition row to exist at that
 // version; "no row yet" fails with ErrVersionConflict.

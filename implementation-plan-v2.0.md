@@ -678,24 +678,95 @@ become `s3pgstore.*` (different metric names, same shape).
   start, GC reclaim, sequencer batch). Match s3store's log key
   conventions (`partition_key`, `file_id`, `error.type`).
 - Error-classification helpers (sentinel + wrapped).
-- **Grafana dashboard** at `dashboards/s3pgstore.json`: one panel
-  per registered metric, label filters mirroring s3store's
-  conventions (`cluster`, `stage`, `k8s_namespace_name`,
-  `s3pgstore_bucket`, `s3pgstore_prefix`). Incident counters
-  (`encode_buf_dropped`, `iter.stall.count`,
-  `s3.transient_error.count`, `gc.reclaimed` failure rate, etc.)
-  use the yellow-at-`0.001/s`, red-at-`0.1/s` threshold pattern.
-  Quantile panels show **P95 + P99 always**, plus **P100 on size
-  and count histograms** (write/read records, partitions, bytes,
-  files, fan-out items/workers, S3 body sizes) — `histogram_quantile(1.0,
-  ...)` returns the upper bound of the highest non-empty bucket,
-  which is the right signal for sizing
-  `EncodeBufPoolMaxBytes` against actual peak parquet write size.
-  Duration panels keep P95+P99 only (P100 on duration is one
-  outlier dominating the panel; not useful for capacity planning).
-  The dashboard ships in this phase — the
+- **Grafana dashboard** at `dashboards/s3pgstore.json`. Mirrors
+  s3store's dashboard structure: a single dashboard JSON, no
+  rows-as-`row` collapse blocks (Grafana's deprecated rows
+  attribute) — instead, panels are organized into **section
+  rows** (Grafana `row` panel type) so operators can collapse
+  concerns visually. Ships in this phase; the
   [CLAUDE.md § Metrics ↔ dashboard sync](CLAUDE.md#metrics--dashboard-sync)
   rule is in force from v2.0 onward.
+
+  **Templating variables** (mirrors s3store):
+  - `datasource_metrics` — Prometheus datasource selector.
+  - `cluster`, `stage` — deployment-level filters.
+  - `namespace` (queries `k8s_namespace_name` label).
+  - `bucket` (queries `s3pgstore_bucket` label).
+  - `prefix` (queries `s3pgstore_prefix` label).
+
+  **Section rows** (adapted from s3store; one row per concern):
+
+  1. **Overview — all stores** (independent of bucket/prefix).
+     Headline stat panels: writes/sec, reads/sec, write P95,
+     read P95, current feed lag.
+  2. **Library methods — selected bucket/prefix**. Per-method
+     duration P50+P95+P99, in-flight gauge, call rate,
+     outcome breakdown.
+  3. **Write volumes**. Bytes/Write (P50/P95/P99/P100 — the
+     P100 is the `EncodeBufPoolMaxBytes` tuning loop; panel
+     description must explain this), records/Write,
+     files written/sec, encode-buffer dropped rate (the
+     incident counter signalling cap is undersized).
+  4. **Read volumes**. Bytes/Read, records/Read, partitions
+     read, files fetched per call.
+  5. **S3 operations**. PUT/GET/DELETE rates, request body
+     sizes, request duration, transient-error rate by error
+     type (the `s3pgstore.s3.transient_error.count` panel),
+     SDK retry quota exhaustion if available.
+  6. **Target saturation**. `MaxInflightRequests` semaphore
+     wait time and current depth — operators tune the cap
+     against this.
+  7. **Fan-out**. Per-method partition counts, parallel-worker
+     counts, fan-out item counts.
+  8. **Iter pipeline saturation**. Body-slot wait, byte-budget
+     wait, partition decode duration, stall counter (incident
+     gauge). Panel descriptions reference the
+     [CLAUDE.md Concurrency invariants](CLAUDE.md#concurrency-invariants).
+  9. **Sequencer & feed**. `feed_seq` assignment rate, advisory-
+     lock acquisition wait, NOTIFY round-trip latency, current
+     unsequenced-row count, sequencer-iteration duration.
+  10. **Catalog & locking**. Transaction commit duration,
+      `LockPartition` acquisition wait, OCC version-conflict
+      rate, `LookupByToken` hit rate, partition-row UPSERT
+      duration.
+
+  **Per-panel conventions** (every panel obeys these):
+
+  - Quantile panels show **P50 + P95 + P99** always, plus
+    **P100 on size and count histograms** (write/read records,
+    partitions, bytes, files, fan-out items/workers, S3 body
+    sizes) — `histogram_quantile(1.0, ...)` returns the upper
+    bound of the highest non-empty bucket, which is the right
+    signal for sizing `EncodeBufPoolMaxBytes` against actual
+    peak parquet write size. Duration panels keep P50+P95+P99
+    only (P100 on duration is one outlier dominating the panel).
+  - Every `rate(...)` and `histogram_quantile(...)` query sets
+    **`Min step 1m`** in Grafana's panel options — Prometheus's
+    default step is the dashboard auto-step (~10s at typical
+    refresh), which makes spiky rate panels at high resolution.
+    1m matches the workload's natural granularity (per s3store
+    commit `33b9b0d`).
+  - Label filters in every panel mirror the templating
+    variables verbatim — copy from a sibling panel rather than
+    rewriting from scratch.
+  - **Incident counters** (`encode_buf_dropped`,
+    `iter.stall.count`, `s3.transient_error.count`,
+    `commit_after_timeout` not applicable but use the same
+    pattern, OCC `version_conflict.count`, GC failure rate, etc.)
+    use the yellow-at-`0.001/s`, red-at-`0.1/s` threshold
+    pattern with stat-panel red overlay so a non-zero rate is
+    visually obvious.
+  - Incident counters with single-series shape go into the
+    `prewarm` slice in the metrics constructor so Prometheus
+    `rate()` returns a value on the first non-zero sample
+    (otherwise the chart shows `No data` until the second
+    sample lands — confusing during incident triage).
+
+  **Dashboard PR convention** (per CLAUDE.md sync rule): any
+  metric added to the codebase lands with its panel in the
+  same PR. Conversely, removing/renaming a metric requires
+  removing/updating the corresponding panel. A panel querying
+  a non-existent metric shows `No data` and erodes trust.
 - **Histogram bucket boundaries** mirror s3store's `byteBuckets`
   (vendored from upstream's `metrics.go`), specifically including
   **8 MiB and 64 MiB** boundaries so the bytes/Write P100 panel

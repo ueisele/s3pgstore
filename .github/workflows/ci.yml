@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  # Lint with the full linter set (staticcheck, errcheck, etc.)
+  # declared in .golangci.yml.
+  lint:
+    name: lint (golangci-lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.11.4
+
+  # Build + short-mode unit tests. The library is cgo-free, so
+  # this runs with CGO_ENABLED=0 to catch any future cgo
+  # dependency creep — a regression we'd want to fail loudly on.
+  build:
+    name: build + test (cgo-free)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: vet (with integration tag)
+        env:
+          CGO_ENABLED: "0"
+        run: go vet -tags=integration ./...
+      - name: build
+        env:
+          CGO_ENABLED: "0"
+        run: go build ./...
+      - name: test (unit)
+        env:
+          CGO_ENABLED: "0"
+        run: go test -short -count=1 ./...
+
+  # Integration tests gated on the `integration` build tag. Uses
+  # testcontainers to spin up a shared PostgreSQL + MinIO per
+  # `go test` invocation (see fixture_test.go). Docker is
+  # preinstalled on ubuntu-latest runners.
+  integration:
+    name: integration (testcontainers + PG + MinIO)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: pre-pull container images
+        # Keep in sync with fixture_test.go's postgresImage / minioImage
+        run: |
+          docker pull postgres:17.5-alpine
+          docker pull pgsty/minio:RELEASE.2026-04-17T00-00-00Z
+      - name: test (integration)
+        run: go test -tags=integration -count=1 -timeout=15m ./...

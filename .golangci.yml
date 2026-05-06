@@ -1,0 +1,42 @@
+# golangci-lint v2 configuration.
+# https://golangci-lint.run/usage/configuration/
+version: "2"
+
+run:
+  # Include integration-tagged test files in lint scope so bugs
+  # there surface alongside unit tests.
+  build-tags:
+    - integration
+
+linters:
+  # Start from zero, enable only what we've decided to use — more
+  # predictable than starting from "standard" and opting out.
+  default: none
+  enable:
+    - copyloopvar   # pre-Go-1.22 loop-variable capture (safety net)
+    - durationcheck # time.Second * time.Second footgun
+    - errcheck      # unchecked errors (real bug finder)
+    - govet         # standard Go analyzers
+    - ineffassign   # assigned values never read
+    - makezero      # make([]T, N) + append(s, x) — meant len 0 cap N
+    - misspell      # typos in comments + strings
+    - nilerr        # `if err != nil { return nil }` anti-pattern
+    - nolintlint    # //nolint directives must be well-formed
+    - staticcheck   # absorbs gosimple + stylecheck in v2
+    - unused        # dead code, unused fields/consts
+
+  settings:
+    errcheck:
+      # Deferred Close / Rollback calls are idiomatic fire-and-forget.
+      # Same for best-effort cleanup of orphan S3 objects.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*database/sql.Rows).Close
+        - (*database/sql.DB).Close
+        - (github.com/jackc/pgx/v5.Tx).Rollback
+        - (github.com/jackc/pgx/v5/pgxpool.Conn).Release
+
+formatters:
+  enable:
+    - gofmt         # baseline: what gofmt enforces
+    - goimports     # import ordering + grouping

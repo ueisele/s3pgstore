@@ -162,7 +162,89 @@ must preserve them — even when the change appears unrelated.
   per-attempt parquets that the catalog row points at one of.
   Refactors must not introduce non-determinism into parquet
   encoding (random row ordering, timestamp injection beyond
-  `InsertedAtField`).
+  `InsertedAtField`). The pooled-encoder path
+  (`pqWriterPool` + `encodeBufPool`) must produce
+  byte-identical bytes to a fresh non-pooled encode — this is a
+  load-bearing test, not a perf optimization (see Verification §
+  Benchmarks).
+- **Deterministic emission order across read and write paths**
+  — every read path (`Read` / `ReadIter` / `ReadPartitionIter` /
+  `ReadRangeIter` / `ReadPartitionRangeIter` / `ReadEntriesIter`
+  / `ReadPartitionEntriesIter` / `PollRecords`) and the
+  write-side partition grouping emit partitions in **lex order
+  of the partition-key string**, with per-partition records in
+  **`(entity, version)` ascending order** when dedup is
+  configured (decode/insertion order without it). Same input on
+  the same data produces byte-identical output every time.
+  Consumers may rely on this for diffing, hashing, replay
+  equality, and golden-file tests.
+
+  The load-bearing pieces (named once they exist):
+
+  1. The catalog SELECT on the read path uses `ORDER BY
+     partition_key, feed_seq` (or the equivalent for non-feed
+     queries) — collapses Go's randomized map iteration to
+     deterministic lex order before files are grouped.
+  2. Per-partition file ordering by `s3_key` — deterministic
+     decode order within a partition.
+  3. `sortAndDedup` (vendored from s3store) runs a stable
+     `(entity, version)` sort followed by in-place dedup —
+     deterministic record order within a partition's output.
+  4. The write-side `GroupByPartition` sorts partition keys
+     before emitting — same map-iteration-collapse pattern.
+
+  Refactors must not introduce non-deterministic partition
+  iteration, parallel-decode pipelines that race batch sends
+  out of order, or non-stable record sorts inside a partition.
+  `PollRecords` consumers needing wall-clock ordering across
+  partitions must re-sort by their own timestamp field — its
+  next-offset advancement (the "don't miss records" property)
+  is unaffected.
+
+# Concurrency invariants
+
+These bound how the iter pipeline (Phase 12; vendored from
+s3store) and any future multi-goroutine pipeline must
+coordinate. Properties recent regressions in s3store taught us
+— preserve them on every refactor.
+
+- **No `cond.Broadcast` with per-actor predicates.** When N
+  actors wait on a condition that depends on each actor's
+  individual progress (e.g., "did *my* slot land"), use a
+  buffered channel as a FIFO semaphore — Go's runtime drains a
+  channel's sendq strictly FIFO on every receive. The earlier
+  cond+counter design in s3store's iter pipeline allowed
+  scheduler-biased starvation: `Broadcast` wakes everyone, all
+  waiters race for the mutex, and the scheduler can consistently
+  pick the same winner, leaving one specific actor's predicate
+  permanently unsatisfied and deadlocking the pipeline. This is
+  not theoretical — it was reproduced deterministically on a
+  1417-partition cost read (s3store commit `da75ca9`).
+  `sync.Cond` is acceptable only when there is exactly one
+  waiter AND the predicate is global (not per-actor) AND a
+  chan-based wake bell would be measurably worse; in practice
+  that combination is rare enough that channels should be the
+  default.
+
+- **Every blocking primitive must observe `ctx.Done()`
+  natively.** A primitive that requires a sibling
+  broadcast-on-cancel goroutine to unblock is a code smell — the
+  workaround adds goroutine count, lifecycle complexity, and a
+  separate synchronisation site that can drift out of sync with
+  the primitive it protects. Channel-based primitives (`<-ch`,
+  buffered semaphores, wake bells) `select` on `ctx.Done()` for
+  free. Refactors must not reintroduce primitives that need a
+  cancel-broadcast helper goroutine.
+
+- **Stall watchdogs are observers, never cancellers.** The iter
+  pipeline's stall observer (vendored from s3store) surfaces
+  stalls via `slog.Warn` + a `s3pgstore.read.iter.stall.count`
+  counter without aborting. Auto-cancelling on stall would mask
+  the goroutine state needed for SIGQUIT diagnosis and risk
+  false-positive aborts of legitimately slow consumers. Hard
+  ceilings belong at the call site via `ctx.WithTimeout`.
+  Refactors must not promote the observer into a circuit
+  breaker.
 
 # Backend assumptions
 
@@ -252,3 +334,76 @@ read-, write-, sequencer-, or schema-path change; plain
 `golangci-lint run` covers gofmt, govet, and the project's
 configured linters in one shot. Pre-existing lint issues count —
 fix them in the same PR rather than carrying them forward.
+
+## Benchmarks (perf-sensitive changes only)
+
+The four-gate suite above does not run benchmarks — they are not
+a hard gate, intentionally. Bench numbers are noisy without
+benchstat, slow at the size tiers we care about, and most
+changes don't touch perf-sensitive paths. Making it a global
+gate would burn contributor time on every PR for value most PRs
+don't deliver.
+
+But benchmarks ARE the right verification gate for changes that
+touch:
+
+- `encodeParquet` (the `Writer[T]` method) or its pool
+  (`pqWriterPool`, `encodeBufPool`).
+- `EncodeBufPoolMaxBytes` defaults, the cap-discard logic, or
+  the surrounding `bytes.Buffer` reset/copy semantics.
+- `decodeParquet` or any caller's per-file allocation pattern in
+  the iter-pipeline decoder.
+- The S3 client wrapper's body-buffer allocation strategy.
+
+The 16 MiB → 48 MiB cap regression caught upstream in s3store's
+`parquet_bench_test.go` — pooled encode silently went **+27%
+B/op vs no-pool** at sizes above the cap — is the kind of issue
+only benchmarks surface, and it would have shipped if the writer
+pool had been merged without bench data. We inherit the same
+pool machinery, so we inherit the same bench requirement.
+
+For these changes, capture before/after numbers via benchstat
+and attach them to the PR description:
+
+```sh
+git stash                                     # save WIP
+go test -bench=. -benchmem -count=10 -cpu=1 \
+  -run=^$ ./... > /tmp/bench-base.txt
+git stash pop                                 # apply WIP
+go test -bench=. -benchmem -count=10 -cpu=1 \
+  -run=^$ ./... > /tmp/bench-pr.txt
+benchstat /tmp/bench-base.txt /tmp/bench-pr.txt
+```
+
+`-count=10` over `-count=3` because benchstat's confidence
+intervals widen sharply on small samples; 10 samples per config
+matches the upstream Go performance-tracking convention and
+gives meaningful p-values.
+
+For changes that don't touch the paths above, the four-gate
+suite is enough — don't bother running benchmarks.
+
+## Metrics ↔ dashboard sync
+
+Every new OTel instrument registered in the metrics file must
+also appear as a panel in `dashboards/s3pgstore.json` in the
+same PR. Drift is silent — a metric that emits but isn't
+visualized is operationally invisible, and metric/dashboard PRs
+that land separately tend never to land at all.
+
+When adding a metric:
+
+1. Register it in the metrics constructor.
+2. If it's a rare-event single-series counter, add it to the
+   prewarm list so `rate()` catches the first non-zero sample.
+3. Add a panel to `dashboards/s3pgstore.json` matching an
+   existing instrument of the same shape — copy the label
+   filters (`cluster`, `stage`, `k8s_namespace_name`,
+   `s3pgstore_bucket`, `s3pgstore_prefix`) verbatim from a
+   sibling panel. Incident counters use the
+   yellow-at-`0.001/s`, red-at-`0.1/s` threshold pattern.
+
+The same rule runs in reverse: removing or renaming a metric
+requires removing or updating the corresponding dashboard panel
+in the same PR. A panel querying a metric that no longer exists
+shows `No data` and erodes trust in the dashboard.

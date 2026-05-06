@@ -30,6 +30,67 @@ By the end of v2.0 we have:
   slow." Hot-path tuning lands once we have real workloads to
   measure.
 
+## Source attribution and licensing
+
+A meaningful subset of the implementation is **vendored from
+[s3store](https://github.com/ueisele/s3store)** with attribution.
+Both projects are MIT-licensed under the same author, so license
+compatibility is straightforward — but provenance still needs to
+be explicit so future maintainers know where to look upstream
+when something needs porting back.
+
+### What we vendor
+
+Substrate-independent code that solves the same problem in both
+libraries: parquet bytes are parquet bytes, the chan-based iter
+pipeline is hard-won concurrency, dedup is dedup. Specifically:
+
+- `parquet.go` — Phase 3 (encode/decode).
+- Selected pieces of `target.go` — Phase 4 (retry + semaphore;
+  not consistency-control or timing-config seeding).
+- `reader_dedup.go` — Phases 6 and 12 (per-partition dedup).
+- `reader_iter.go` post-`860cf19` — Phase 12 (chan-based
+  pipeline, read-ahead knobs, stall watchdog).
+- `metrics.go` patterns — Phase 16 (`methodScope`, attribute
+  conventions; metric names become `s3pgstore.*`).
+
+### What we do NOT vendor
+
+Substrate-dependent code where the catalog replaces s3store's
+S3-only coordination machinery: token-commit markers, `refMicroTs` /
+`SettleWindow` / `MaxClockSkew`, ref filename encoding, glob
+grammar (replaced by `PartitionFilter`), `ConsistencyControl`
+header routing, optimistic-commit / `RestampRef` /
+`LookupCommit` / `ErrCommitAfterTimeout`, idempotency-token
+storage paths.
+
+### Attribution header
+
+Every vendored file carries this header at the top, after the
+package clause:
+
+```go
+// Adapted from https://github.com/ueisele/s3store/blob/<sha>/<path>
+// Copyright (c) 2024-2026 Uwe Eisele. MIT License.
+//
+// <one-line note on what changed for s3pgstore, e.g.:
+//  "Stripped commit-marker handling; renamed package from
+//  s3store to s3pgstore.">
+```
+
+The `<sha>` pins the exact upstream version we vendored from so
+maintainers can diff against it later.
+
+### Sync policy
+
+s3store and s3pgstore evolve independently after the initial
+vendor. We don't auto-sync. When a meaningful improvement lands
+in s3store (e.g., a deadlock fix in the iter pipeline), we make
+a deliberate decision per file: port the change forward,
+diverge, or backport our version upstream. The same applies in
+reverse — improvements in s3pgstore can be hand-ported to
+s3store. The shared author makes this practical without tooling.
+
 ## Module layout
 
 ```
@@ -166,33 +227,96 @@ truth for table names and shared SQL.
 
 ### Phase 3 — Parquet encode/decode
 
-- Reflection-based parquet schema derivation from `T`'s struct
-  tags via parquet-go.
-- Encoder: `[]T` → parquet bytes; deterministic ordering (no
-  randomization, no goroutine races).
-- Decoder: parquet bytes → `[]T`; missing columns decode to
-  zero value.
-- `InsertedAtField` support: at encode time, populate the
-  named `time.Time` field with `time.Now().UTC()`.
-- Compression: snappy (default), zstd, gzip, uncompressed.
-- Unit tests: round-trip, deterministic-bytes assertion,
-  missing-column tolerance, InsertedAtField round-trip.
+**Source: vendored from s3store** (post-v0.25.0). Note: the
+`parquet.go` file no longer exists in s3store — `52c34e7` moved
+the parquet-tag walker into `materialized_view.go` (and
+unexported it as `parquetFields`) since materialized views are
+the only caller. The encode/decode work for s3pgstore lives in
+several upstream files.
 
-**Milestone:** stable encode/decode for arbitrary `T`.
+Vendor scope (with attribution):
+
+- **Encoder** — `encodeParquet` from `writer_write.go`, plus
+  the pool machinery from `writer.go`:
+  - `pqWriterPool` (`*parquet.GenericWriter[T]` reuse)
+  - `encodeBufPool` (`*bytes.Buffer` reuse with cap-discard)
+  - `encodeBufPoolMaxBytes` (resolved from
+    `WriterConfig.EncodeBufPoolMaxBytes`)
+  - `defaultEncodeBufPoolMaxBytes = 48 << 20` (48 MiB; commit
+    `9ef2075`)
+- **Encoder config knob** — surface `EncodeBufPoolMaxBytes`
+  on s3pgstore's `Config[T]` with the same semantics: cap above
+  largest typical produced parquet; non-zero rate of
+  `s3pgstore.write.encode_buf_dropped` (added in Phase 16)
+  signals undersized cap.
+- **Decoder** — the `decodeParquet` helper from
+  `reader_iter.go`'s `runDecoder` (extracted; substrate-
+  independent).
+- **Read-value lifetime contract** — `2a2e7f9` pins the
+  parquet-go `GenericReader` read-value lifetime guarantee
+  (records valid until the next Read or Close). Vendor
+  `parquet_lifetime_test.go` to keep the contract pinned.
+- **Determinism test** — `f29e77f` verifies that pooled encode
+  produces byte-identical output to a fresh non-pooled encode.
+  Vendor this test; it's load-bearing per CLAUDE.md (the
+  pooled-encoder path must be byte-equivalent for
+  `WithIdempotencyToken` retries to remain correct).
+- **Benchmarks** — vendor `parquet_bench_test.go` (encode +
+  decode benchmarks across workload size tiers; commit
+  `3b3b4b5`). Required by CLAUDE.md § Benchmarks for any future
+  change that touches the encoder pool.
+
+Adjust:
+
+- Package from `s3store` to `s3pgstore`.
+- Metric/log attribute names from `s3store.*` to `s3pgstore.*`.
+- Drop any s3store-specific knobs (e.g., `ConsistencyControl`)
+  from the `WriterConfig` projection.
+
+Unit tests, benchmarks, and the lifetime test come over with
+the files. Integration tests not needed for this phase (no S3
+or PG involvement).
+
+**Milestone:** stable encode/decode for arbitrary `T`, with the
+hard-won determinism guarantees inherited from s3store, the
+pooled-encoder byte-equivalence test passing, and benchmarks
+green at expected size tiers.
 
 ### Phase 4 — S3 wiring
 
-- Internal `s3target` struct holding `*s3.Client`, bucket, prefix,
-  bounded parallelism semaphore (default 32).
-- `put(ctx, key, body) error`, `get(ctx, key) (io.ReadCloser, error)`,
-  `delete(ctx, key) error` with retry on transient errors.
-- UUID key generation (UUIDv7 via `google/uuid`) under the
-  partition prefix.
-- Integration tests against MinIO: PUT, GET round-trip; concurrent
-  PUTs respect the parallelism cap.
+**Source: partial vendor from s3store** (`target.go`). Lift the
+retry policy and `MaxInflightRequests` semaphore wrapper. Drop
+the consistency-control routing (we only need
+`read-after-new-write`), the timing-config seeding from
+`<prefix>/_config/*`, and any code that reads/writes ref or
+commit-marker paths.
+
+What we lift verbatim (with attribution):
+
+- `retry()` with jittered backoff + transient-error
+  classification (`isTransientS3Error`).
+- The `MaxInflightRequests` semaphore primitive (acquire/release
+  around every PUT/GET/HEAD/LIST).
+- `verifyPutObjectETag` for 0-byte-on-retry detection
+  (commit `d3829cd`).
+
+What we redo for s3pgstore:
+
+- `s3target` struct: holds `*s3.Client`, bucket, prefix,
+  semaphore. No `CommitTimeout`/`MaxClockSkew`/`SettleWindow`
+  fields, no timing-config GETs at construction.
+- `put`, `get`, `delete` operations with the lifted retry
+  wrapping. No `head` on the runtime path (only `cmd/s3pgstore-rebuild`
+  uses HEAD, and only for parquet footer reads via GET).
+- UUID key generation (UUIDv7 via `google/uuid`).
+
+Integration tests against MinIO: PUT, GET round-trip; concurrent
+PUTs respect the parallelism cap; transient-error retry escalates
+correctly.
 
 **Milestone:** library can read and write S3 objects keyed by
-UUID under the configured prefix.
+UUID under the configured prefix, with s3store's
+hard-tuned retry behavior.
 
 ### Phase 5 — Write path (no idempotency, no OCC, no MV)
 
@@ -216,6 +340,15 @@ UUID under the configured prefix.
 
 ### Phase 6 — Read path
 
+**Source: vendored dedup, fresh enumeration.** Port
+`reader_dedup.go` from s3store (`sortAndDedup`,
+`sortKeyMetasByKey`) verbatim with attribution; the per-partition
+dedup logic is identical regardless of how files are enumerated.
+Reimplement the file-enumeration step against the catalog instead
+of LIST + ref filtering.
+
+Fresh implementation (no s3store equivalent):
+
 - `PartitionFilter` constructors: `Eq`, `Prefix`, `Between`, `GE`,
   `LT`, `In`. `And`, `Or` for composition.
 - Filter → SQL WHERE clause translation (with parameter binding,
@@ -223,15 +356,30 @@ UUID under the configured prefix.
 - Single-query SELECT against `s3pgstore_files`.
 - Group by `partition_key`; derive `Version =
   MAX(written_at_version)` per group.
-- Parallel S3 GETs (capped by the parallelism semaphore).
-- Decode parquet → `[]T` per file.
-- Optional dedup via `EntityKeyOf` + `VersionOf` (per-partition).
-- `PartitionResult[T]` returned.
-- Integration tests: read-after-write within transaction;
-  read-after-write across transactions; dedup correctness; complete
-  file set returned per partition; lex-stable emission order.
 
-**Milestone:** can read written records back with the right Version.
+Vendored from s3store (with attribution):
+
+- `sortKeyMetasByKey` — stable sort within a partition.
+- `sortAndDedup` — `(EntityKeyOf, VersionOf)` stable sort + in-place
+  dedup, last-version-wins semantics, `WithHistory()` opt-out.
+
+Wired together:
+
+- After the catalog SELECT and partition grouping, hand each
+  partition's file list to the vendored decode+dedup pipeline.
+- Parallel S3 GETs capped by the Phase 4 semaphore.
+- Decode parquet → `[]T` per file using the Phase 3 decoder.
+- Apply dedup if `EntityKeyOf` + `VersionOf` are configured.
+- Return `[]PartitionResult[T]`.
+
+Integration tests: read-after-write within transaction;
+read-after-write across transactions; dedup correctness;
+complete file set returned per partition; lex-stable emission
+order; per-partition dedup edge cases (matches s3store's existing
+test corpus where applicable).
+
+**Milestone:** can read written records back with the right
+Version; s3store's dedup correctness inherited verbatim.
 
 ### Phase 7 — Idempotency, OCC, LookupByToken
 
@@ -332,16 +480,51 @@ walk by offset.
 
 ### Phase 12 — ReadIter (streaming reads)
 
-The internal pipeline is shared across all six iter methods —
-filter resolution → file enumeration → parallel S3 downloads →
-per-partition decode + dedup → emit. The methods differ only in
-input mode (filters / time range / pre-resolved entries) and
-output shape (records / per-partition).
+**Source: vendored pipeline from s3store** (`reader_iter.go` after
+`860cf19` "Replace iter pipeline sync.Cond with chan-based
+primitives" and `da75ca9` "Fix iter pipeline deadlock under
+cond.Wait scheduler unfairness"). The producer → downloader →
+decoder topology, the `WithReadAheadPartitions` /
+`WithReadAheadBytes` budget knobs, the cancel-on-break semantics,
+and the stall-watchdog are all hard-won correctness work that we
+should inherit verbatim. Keep the test corpus too — the
+concurrency tests are exactly what catches deadlocks.
 
-**Pipeline (shared):**
+**Concurrency contracts inherited:** the three rules in
+[CLAUDE.md § Concurrency invariants](CLAUDE.md#concurrency-invariants)
+(buffered-channel FIFO over `cond.Broadcast`, every blocking
+primitive observes `ctx.Done()` natively, stall watchdogs are
+observers never cancellers) come along with the vendor. They
+must not be relaxed when adapting the pipeline.
 
-- `ReadIter` and friends use a producer → downloader → decoder
-  pipeline.
+What we vendor (with attribution):
+
+- The chan-based producer/downloader/decoder pipeline structure.
+- `WithReadAheadPartitions`, `WithReadAheadBytes` options.
+- `runProducer`, `runDownloader`, `runDecoder` and their
+  back-pressure wiring.
+- The stall watchdog (`dd83417`).
+- Per-partition emit helpers (`recordEmit`, `partitionEmit`).
+
+What we adapt:
+
+- Replace s3store's `resolvePatterns` (LIST + glob filter +
+  commit-gate) with our `PartitionFilter`-to-SQL enumerator from
+  Phase 6.
+- Replace s3store's `walkRangeKeys` (`_ref/` LIST over a time
+  window) with a SQL SELECT bounded by `feed_seq_at`.
+- Replace `validateEntriesBelongHere` to check bucket+prefix
+  ownership (s3store's check is the same shape; just point at
+  our paths).
+- Drop the upfront commit-gate HEAD per ref (catalog rows are
+  the gate now).
+
+The methods differ only in input mode (filters / time range /
+pre-resolved entries) and output shape (records / per-partition);
+all six share the same vendored pipeline.
+
+**Pipeline (shared, vendored):**
+
 - Producer enumerates file rows for the input mode, groups by
   partition, emits in lex order of partition key.
 - Downloader runs N parallel S3 GETs (capped by the parallelism
@@ -395,6 +578,19 @@ full 3×2 iter matrix (filters / time range / pre-resolved entries
 × records / per-partition).
 
 ### Phase 13 — MaterializedView
+
+**Source: vendored helpers from s3store**'s `materialized_view.go`.
+Specifically the `parquetFields` tag walker (now unexported
+upstream after `52c34e7`) and the auto-binding/auto-projection
+helpers that map between `T`'s parquet-tagged fields and the MV
+table's columns. These are the same helpers our MV
+write/read paths need; vendoring keeps the parquet-tag
+convention interpreted in one place.
+
+Adapt the upstream's S3-marker-key encoding to PostgreSQL row
+inserts: instead of building marker paths under
+`<prefix>/_matview/`, insert rows into `s3pgstore_mv_<name>`
+with the same column-derivation logic.
 
 - `MaterializedViewDef[T]` in `Config.MaterializedViews`.
 - Schema generation: each MV becomes `s3pgstore_mv_<name>` with
@@ -451,23 +647,90 @@ total catalog loss.
 
 ### Phase 16 — Observability + polish
 
+**Source: pattern lifted from s3store** (`metrics.go`). Follow
+s3store's OTel attribute conventions and `methodScope` helper for
+consistent metric/log boundaries; the metric names themselves
+become `s3pgstore.*` (different metric names, same shape).
+
+- `methodScope(ctx, methodName)` helper: starts the
+  duration histogram, captures attributes, returns a `scope` whose
+  `end(*err)` records duration + outcome (success / error type).
+  Same pattern as s3store, renamed metrics.
 - OTel metrics:
-  - `s3pgstore.write.duration` (histogram)
-  - `s3pgstore.write.errors` (counter, by error type)
-  - `s3pgstore.read.duration`
-  - `s3pgstore.read.partition_count`
-  - `s3pgstore.poll.lag` (gauge: now − latest feed_seq_at)
+  - `s3pgstore.method.duration` (histogram, labeled by `method`)
+  - `s3pgstore.method.calls` (counter, labeled by `method`,
+    `outcome`)
+  - `s3pgstore.method.in_flight` (gauge, labeled by `method`)
+  - `s3pgstore.write.bytes` (histogram)
+  - `s3pgstore.write.records` (histogram)
+  - `s3pgstore.write.encode_buf_dropped` (counter; non-zero rate
+    indicates `EncodeBufPoolMaxBytes` is undersized for the
+    workload — see Phase 3)
+  - `s3pgstore.poll.lag` (gauge: now − latest `feed_seq_at`)
   - `s3pgstore.sequencer.assigned` (counter)
   - `s3pgstore.gc.reclaimed` (counter)
+  - `s3pgstore.read.iter.stall.count` (counter; emitted by the
+    iter pipeline's stall observer per CLAUDE.md § Concurrency
+    invariants)
+  - `s3pgstore.s3.transient_error.count` (counter, labeled by
+    `error.type` — same as s3store after `bcabdb8`).
 - slog structured logging at key boundaries (write commit, read
-  start, GC reclaim, sequencer batch).
+  start, GC reclaim, sequencer batch). Match s3store's log key
+  conventions (`partition_key`, `file_id`, `error.type`).
 - Error-classification helpers (sentinel + wrapped).
+- **Grafana dashboard** at `dashboards/s3pgstore.json`: one panel
+  per registered metric, label filters mirroring s3store's
+  conventions (`cluster`, `stage`, `k8s_namespace_name`,
+  `s3pgstore_bucket`, `s3pgstore_prefix`). Incident counters
+  (`encode_buf_dropped`, `iter.stall.count`,
+  `s3.transient_error.count`, `gc.reclaimed` failure rate, etc.)
+  use the yellow-at-`0.001/s`, red-at-`0.1/s` threshold pattern.
+  Quantile panels show **P95 + P99 always**, plus **P100 on size
+  and count histograms** (write/read records, partitions, bytes,
+  files, fan-out items/workers, S3 body sizes) — `histogram_quantile(1.0,
+  ...)` returns the upper bound of the highest non-empty bucket,
+  which is the right signal for sizing
+  `EncodeBufPoolMaxBytes` against actual peak parquet write size.
+  Duration panels keep P95+P99 only (P100 on duration is one
+  outlier dominating the panel; not useful for capacity planning).
+  The dashboard ships in this phase — the
+  [CLAUDE.md § Metrics ↔ dashboard sync](CLAUDE.md#metrics--dashboard-sync)
+  rule is in force from v2.0 onward.
+- **Histogram bucket boundaries** mirror s3store's `byteBuckets`
+  (vendored from upstream's `metrics.go`), specifically including
+  **8 MiB and 64 MiB** boundaries so the bytes/Write P100 panel
+  resolves cap-tuning recommendations to "bump
+  `EncodeBufPoolMaxBytes` to ~10 MiB vs ~16 MiB" and
+  "~80 MiB vs ~150 MiB" rather than collapsing both to a single
+  bucket. The 32 MiB extra boundary is also kept (2× resolution
+  point at typical workload upper end). Two extra buckets across
+  ~5 metrics × ~3 method labels = ~30 extra series per pod —
+  modest cardinality cost for materially better cap tuning.
+- **README section: "Tuning the Go runtime
+  (`GOMEMLIMIT` / `GOGC`)"** mirroring s3store's `299b290`. The
+  decode path we vendor allocates ~32× input file size per
+  parquet body (most inside parquet-go, not reachable from this
+  library), so the writer pool reduces encode-side floor but not
+  the decode-side. For GC-bound services, `GOMEMLIMIT` and
+  `GOGC` are the highest-leverage knobs. Section covers what
+  each does, suggested starting values keyed to common pod
+  memory limits (1Gi → `800MiB`, 2Gi → `1600MiB`, etc.; `GOGC`
+  100–400 by tier), how to set them in K8s vs programmatically,
+  three verification signals (GC CPU fraction / p99 / heap
+  headroom) with PromQL queries against
+  `go_runtime_metrics_total`, and gotchas (Go does NOT auto-detect
+  cgroup memory limits the way Go 1.25+ does for `GOMAXPROCS`;
+  pointer to `KimMachineGun/automemlimit` for auto-detection,
+  with a "verify against current release notes" caveat).
 - README expansion: full Quick Start with executable code, GORM
   integration example, schema-management workflow.
 - Godoc on every exported symbol.
 
-**Milestone:** production-ready instrumentation; README that a new
-user can follow without reading the proposal.
+**Milestone:** production-ready instrumentation aligned with
+s3store's conventions (operators running both libraries see
+consistent attribute keys); a Grafana dashboard with one panel
+per registered metric; README that a new user can follow without
+reading the proposal.
 
 ---
 

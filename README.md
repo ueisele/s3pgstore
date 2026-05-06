@@ -150,6 +150,9 @@ S3).
   design sketch: compaction, supersession, two-phase Poll offset,
   retention, replication. Provisional; informed by v2.0
   implementation experience.
+- [implementation-plan-v2.0.md](implementation-plan-v2.0.md) —
+  phased plan for shipping v2.0: 16 milestones with dependencies,
+  test strategy, and done criteria.
 - [CLAUDE.md](CLAUDE.md) — correctness invariants, backend
   assumptions, verification commands. Read this before refactoring.
 

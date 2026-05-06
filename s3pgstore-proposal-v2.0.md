@@ -875,6 +875,81 @@ results, _ := store.Read(ctx, []s3pgstore.PartitionFilter{
 The single `Read` handles single- and multi-partition cases
 uniformly.
 
+#### Iter-based reads
+
+`Read` buffers the full result set in memory before returning. For
+large result sets, the library offers a 3×2 matrix of streaming
+read methods — three input modes × two output shapes.
+
+| Input | Records output (`iter.Seq2[T, error]`) | Per-partition output (`iter.Seq2[PartitionResult[T], error]`) |
+|---|---|---|
+| Filters (snapshot) | `ReadIter` | `ReadPartitionIter` |
+| Time range `[since, until)` | `ReadRangeIter` | `ReadPartitionRangeIter` |
+| Pre-resolved `[]StreamEntry` | `ReadEntriesIter` | `ReadPartitionEntriesIter` |
+
+```go
+// Filters → records
+for r, err := range store.ReadIter(ctx, filters) {
+    if err != nil { return err }
+    process(r)
+}
+
+// Filters → per-partition results (when the partition boundary matters)
+for part, err := range store.ReadPartitionIter(ctx, filters) {
+    if err != nil { return err }
+    aggregate(part.PartitionKey, part.Records)
+}
+
+// Time range → records (everything written between two wall-clock points)
+for r, err := range store.ReadRangeIter(ctx, since, until) {
+    if err != nil { return err }
+    process(r)
+}
+
+// Pre-resolved entries → records (decode without re-querying the catalog)
+entries, _, _ := store.Poll(ctx, lastOffset, 1000)
+filtered := filterByExtensions(entries)
+for r, err := range store.ReadEntriesIter(ctx, filtered) {
+    if err != nil { return err }
+    process(r)
+}
+```
+
+**Time-range methods** (`ReadRangeIter`, `ReadPartitionRangeIter`)
+take `time.Time` bounds. The library resolves both bounds to
+`feed_seq` values at call entry (one indexed lookup each on
+`feed_seq_at`), then walks the resolved offset range. Snapshotting
+the bounds at call entry — not at first iteration — keeps the
+upper bound stable under concurrent writes. Half-open semantics:
+records at `since` are included, records at `until` are not. A
+zero `time.Time` means unbounded (`since=zero` → stream head;
+`until=zero` → live tip captured at call entry).
+
+**Entries-based methods** (`ReadEntriesIter`,
+`ReadPartitionEntriesIter`) take `[]StreamEntry` from a previous
+`Poll` and decode the corresponding parquet files. Useful for
+replicators, inspection tools, and any caller that wants to filter
+or coordinate on entry metadata before paying for the GETs. The
+library validates that every entry's `S3Key` lives under this
+Store's `Bucket`/`Prefix` — passing entries from a different
+Store fails before any S3 traffic.
+
+**Per-partition output** yields one `PartitionResult[T]` per
+partition (in lex order of partition key). All `PartitionResult`
+fields are populated — `Records`, `Version`, `FileExtensions` —
+the same shape as `Read` returns, but one at a time.
+
+All iter methods share the same per-partition pipeline as
+`ReadIter`: dedup via `EntityKeyOf` + `VersionOf` (or
+`WithHistory()` to disable), cancel-on-break, lex-stable emission
+order. Memory bound is one partition's records (or
+`WithReadAheadBytes` if set; see `ReadIter` notes).
+
+**Caveat: range and entries methods don't expose offset
+checkpoints.** A consumer that aborts mid-iteration cannot resume
+from where it left off. For checkpointable consumption use
+`Poll` / `PollRecords` with `WithUntilOffset`.
+
 ### Stream path
 
 The naive design — `BIGSERIAL` column polled with `WHERE id > last`
@@ -942,6 +1017,23 @@ offset, err := store.OffsetAt(ctx, t)
 no GETs). `PollRecords` returns `[]T` (decoded records).
 `OffsetAt(ctx, t)` returns the first `feed_seq` whose `feed_seq_at`
 is at or after `t`, letting consumers seek to a wall-clock time.
+
+**Bounded poll via `WithUntilOffset`.** Pass `WithUntilOffset(end
+Offset)` to bound the upper cursor. Useful for "drain everything
+committed up to point X and stop":
+
+```go
+tip, _ := store.OffsetAt(ctx, time.Now())
+for since := startOffset; since < tip; {
+    records, next, _ := store.PollRecords(ctx, since, 100,
+        s3pgstore.WithUntilOffset(tip))
+    if len(records) == 0 { break }
+    process(records)
+    since = next
+}
+```
+
+Both `Poll` and `PollRecords` accept the option.
 
 **Replay from offset 0 is always correct.** Because v2.0 never
 removes or hides any catalog row, a consumer reading from `cursor =
@@ -1435,8 +1527,18 @@ type FileExtensions struct {
 type ReadOption interface { /* ... */ }
 func WithHistory() ReadOption  // disable per-partition dedup
 
+// Snapshot reads (filter-based)
 func (s *Store[T]) Read(ctx context.Context, filters []PartitionFilter, opts ...ReadOption) ([]PartitionResult[T], error)
 func (s *Store[T]) ReadIter(ctx context.Context, filters []PartitionFilter, opts ...ReadOption) iter.Seq2[T, error]
+func (s *Store[T]) ReadPartitionIter(ctx context.Context, filters []PartitionFilter, opts ...ReadOption) iter.Seq2[PartitionResult[T], error]
+
+// Time-range reads (records or per-partition output)
+func (s *Store[T]) ReadRangeIter(ctx context.Context, since, until time.Time, opts ...ReadOption) iter.Seq2[T, error]
+func (s *Store[T]) ReadPartitionRangeIter(ctx context.Context, since, until time.Time, opts ...ReadOption) iter.Seq2[PartitionResult[T], error]
+
+// Decode pre-resolved entries (typically the output of Poll)
+func (s *Store[T]) ReadEntriesIter(ctx context.Context, entries []StreamEntry, opts ...ReadOption) iter.Seq2[T, error]
+func (s *Store[T]) ReadPartitionEntriesIter(ctx context.Context, entries []StreamEntry, opts ...ReadOption) iter.Seq2[PartitionResult[T], error]
 
 // Stream
 type Offset = int64
@@ -1448,8 +1550,11 @@ type StreamEntry struct {
     Extensions map[string]any
 }
 
-func (s *Store[T]) Poll(ctx context.Context, since Offset, n int) ([]StreamEntry, Offset, error)
-func (s *Store[T]) PollRecords(ctx context.Context, since Offset, n int) ([]T, Offset, error)
+type PollOption interface { /* ... */ }
+func WithUntilOffset(until Offset) PollOption  // bound the upper cursor
+
+func (s *Store[T]) Poll(ctx context.Context, since Offset, n int, opts ...PollOption) ([]StreamEntry, Offset, error)
+func (s *Store[T]) PollRecords(ctx context.Context, since Offset, n int, opts ...PollOption) ([]T, Offset, error)
 func (s *Store[T]) OffsetAt(ctx context.Context, t time.Time) (Offset, error)
 
 // OCC

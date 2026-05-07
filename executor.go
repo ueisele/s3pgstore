@@ -23,7 +23,8 @@ type DBTX interface {
 // Executor abstracts the caller's connection-management
 // strategy. The library calls Run for read paths and
 // single-statement writes; RunInTx for the multi-statement
-// catalog write path.
+// catalog write path; DetachTx for the rare write that must
+// commit independently of any caller-supplied tx.
 //
 // The executor's contract:
 //   - If ctx already carries an active transaction (via WithTx
@@ -32,15 +33,23 @@ type DBTX interface {
 //   - Otherwise Run acquires a connection from the pool for
 //     fn and releases it on return; RunInTx opens a new
 //     transaction, commits on nil return, rolls back on error.
+//   - DetachTx returns a child context that strips the caller's
+//     tx so a subsequent Run/RunInTx call goes to the pool
+//     instead of participating. Cancellation and deadlines
+//     from ctx must be preserved. Used for orphan-tracking
+//     inserts that MUST commit even if the caller's tx rolls
+//     back — see writePartition's pending_writes pre-tx.
 //
 // This is the only seam between the library and the caller's
 // PostgreSQL access stack. NewPoolExecutor returns the default
 // implementation backed by pgxpool. Callers using GORM or a
 // custom database/sql wrapper implement Executor in their own
-// adapter package.
+// adapter package; DetachTx is the implementation's own
+// equivalent of "don't compose with the host tx for this call."
 type Executor interface {
 	Run(ctx context.Context, fn func(DBTX) error) error
 	RunInTx(ctx context.Context, fn func(DBTX) error) error
+	DetachTx(ctx context.Context) context.Context
 }
 
 // txCtxKey is the unexported context-key type for WithTx /
@@ -68,6 +77,20 @@ func WithTx(ctx context.Context, tx pgx.Tx) context.Context {
 func txFromContext(ctx context.Context) pgx.Tx {
 	tx, _ := ctx.Value(txCtxKey{}).(pgx.Tx)
 	return tx
+}
+
+// DetachTx masks any pgx.Tx previously injected via WithTx by
+// overwriting the txCtxKey with a nil value. Cancellation and
+// deadlines from ctx are preserved; only the tx value is
+// cleared.
+//
+// A subsequent call to Run / RunInTx on the same executor with
+// the returned context goes to the pool path, not the
+// participate-in-caller-tx path — guaranteeing an independent
+// commit even when the caller wrapped the operation in their
+// own pgx.Tx via WithTx.
+func (e *poolExecutor) DetachTx(ctx context.Context) context.Context {
+	return context.WithValue(ctx, txCtxKey{}, nil)
 }
 
 // poolExecutor is the default Executor implementation backed by

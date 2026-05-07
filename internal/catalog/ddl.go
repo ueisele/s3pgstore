@@ -104,6 +104,7 @@ func renderFiles(sb *strings.Builder, in DDLInput) error {
 	}
 	// File metadata
 	sb.WriteString("    file_size            BIGINT NOT NULL,\n")
+	sb.WriteString("    uncompressed_size    BIGINT NOT NULL,\n")
 	sb.WriteString("    record_count         BIGINT,\n")
 	// Versioning
 	sb.WriteString("    written_at_version   BIGINT,\n")

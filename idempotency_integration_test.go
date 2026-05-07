@@ -214,6 +214,14 @@ func TestLookupByToken_Existing(t *testing.T) {
 	if got.FileID != written[0].FileID {
 		t.Errorf("FileID: want %d, got %d", written[0].FileID, got.FileID)
 	}
+	if got.FileSize != written[0].FileSize {
+		t.Errorf("FileSize via lookup: want %d, got %d",
+			written[0].FileSize, got.FileSize)
+	}
+	if got.UncompressedSize != written[0].UncompressedSize {
+		t.Errorf("UncompressedSize via lookup: want %d, got %d",
+			written[0].UncompressedSize, got.UncompressedSize)
+	}
 }
 
 func TestLookupByToken_Missing(t *testing.T) {

@@ -53,17 +53,19 @@ func (s *Store[T]) lookupTokenWriteResult(
 	ctx context.Context, partitionKey, token string,
 ) (WriteResult, bool, error) {
 	var (
-		fileID, version int64
-		s3Key           string
-		fileSize        int
-		recordCount     int
+		fileID, version  int64
+		s3Key            string
+		fileSize         int
+		uncompressedSize int64
+		recordCount      int
 	)
 	err := s.cfg.Executor.Run(ctx, func(d DBTX) error {
 		row := d.QueryRow(ctx,
 			s.names.IdempotencyLookupSQL(),
 			partitionKey, token)
 		return row.Scan(
-			&fileID, &s3Key, &version, &fileSize, &recordCount)
+			&fileID, &s3Key, &version,
+			&fileSize, &uncompressedSize, &recordCount)
 	})
 	if err != nil {
 		if isNoRowsErr(err) {
@@ -72,12 +74,13 @@ func (s *Store[T]) lookupTokenWriteResult(
 		return WriteResult{}, false, err
 	}
 	return WriteResult{
-		PartitionKey: partitionKey,
-		S3Key:        s3Key,
-		FileID:       fileID,
-		Version:      version,
-		RecordCount:  recordCount,
-		FileSize:     fileSize,
+		PartitionKey:     partitionKey,
+		S3Key:            s3Key,
+		FileID:           fileID,
+		Version:          version,
+		RecordCount:      recordCount,
+		FileSize:         fileSize,
+		UncompressedSize: uncompressedSize,
 	}, true, nil
 }
 

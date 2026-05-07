@@ -15,6 +15,7 @@ type stubExecutor struct{}
 
 func (stubExecutor) Run(context.Context, func(DBTX) error) error     { return nil }
 func (stubExecutor) RunInTx(context.Context, func(DBTX) error) error { return nil }
+func (stubExecutor) DetachTx(ctx context.Context) context.Context    { return ctx }
 
 // validConfig returns a Config that passes validation. Tests
 // mutate one field at a time to verify each rule.

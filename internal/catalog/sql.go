@@ -35,10 +35,12 @@ func (n Names) PendingWriteDeleteSQL() string {
 // Only one row can match the partial UNIQUE index, so the
 // caller's QueryRow is unambiguous. Returns the columns the
 // public WriteResult struct cares about: file_id, s3_key,
-// written_at_version, file_size, record_count.
+// written_at_version, file_size, uncompressed_size,
+// record_count.
 func (n Names) IdempotencyLookupSQL() string {
 	return fmt.Sprintf(
-		`SELECT file_id, s3_key, written_at_version, file_size, record_count
+		`SELECT file_id, s3_key, written_at_version,
+		        file_size, uncompressed_size, record_count
 		FROM %s
 		WHERE partition_key = $1 AND idempotency_token = $2`,
 		n.Files())
@@ -165,10 +167,11 @@ func (n Names) MVInsertSQL(mvName string, columns []string) string {
 //	$1  partition_key
 //	$2  s3_key
 //	$3  written_at_version (the value returned by PartitionUpsertSQL)
-//	$4  file_size
-//	$5  record_count
-//	$6  idempotency_token (NULL when no token)
-//	$7...  part_<n> columns (in PartitionKeyParts order)
+//	$4  file_size (compressed parquet bytes on S3)
+//	$5  uncompressed_size (sum of TotalUncompressedSize per column chunk)
+//	$6  record_count
+//	$7  idempotency_token (NULL when no token)
+//	$8...  part_<n> columns (in PartitionKeyParts order)
 //	then  ext_<n> columns (in ExtensionColumns order)
 //
 // Returns file_id so the caller can build a WriteResult with
@@ -176,7 +179,8 @@ func (n Names) MVInsertSQL(mvName string, columns []string) string {
 func (n Names) FilesInsertSQL(parts, exts []string) string {
 	cols := []string{
 		"partition_key", "s3_key", "written_at_version",
-		"file_size", "record_count", "idempotency_token",
+		"file_size", "uncompressed_size", "record_count",
+		"idempotency_token",
 	}
 	for _, p := range parts {
 		cols = append(cols, PartColumnPrefix+p)

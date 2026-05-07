@@ -9,14 +9,29 @@ must preserve them — even when the change appears unrelated.
   window, no propagation delay, no marker-gate. Refactors must not
   introduce visibility gates outside the catalog transaction or
   read paths that bypass it.
-- **Orphan tracking via `s3pgstore_pending_writes`** — S3 PUT and
-  the catalog INSERT cannot be transactionally coupled. The
-  pending-writes row is INSERTed before the S3 PUT and DELETEd
-  inside the same transaction as the catalog INSERT. On rollback,
-  the S3 file exists with no catalog reference; the pending-writes
-  row stays and `cmd/s3pgstore-gc` reclaims the orphan after a
-  grace period. Refactors must not move the pending-writes DELETE
-  outside the catalog transaction, or skip the INSERT-before-PUT.
+- **Orphan tracking via `s3pgstore_pending_writes`** — The S3 PUT
+  side-effect cannot be undone by a transaction rollback. The
+  pending-writes row is INSERTed in its own pre-transaction (so it
+  commits *before* any S3 PUT runs), and DELETEd inside the catalog
+  write transaction (so a rollback of that tx restores the row).
+  The pre-tx INSERT goes through `Executor.Run(Executor.DetachTx(ctx), ...)`
+  so it lands on a fresh pool connection even when the caller
+  composed via `WithTx` — independence from the caller's tx is
+  load-bearing: a caller-rollback after a successful S3 PUT must
+  still leave a tracked orphan.
+  The catalog tx wraps the S3 PUT: encode + INSERT files + PUT +
+  DELETE pending_writes all happen between BEGIN and COMMIT, with
+  the file row INSERTed *before* the PUT so a token-race
+  unique-violation aborts before any S3 write. On rollback after a
+  successful PUT (PUT succeeded but COMMIT crashed, or any later
+  step in the tx failed), the S3 file exists with no catalog
+  reference and the pre-tx pending-writes row points at it;
+  `cmd/s3pgstore-gc` reclaims the orphan after a grace period.
+  Refactors must not move the pending-writes DELETE outside the
+  catalog transaction, must not skip the pending-writes pre-tx
+  INSERT, must not commit the catalog row before the PUT
+  completes, and must not let the pre-tx INSERT participate in a
+  caller-supplied tx (always go through `Executor.DetachTx`).
 - **Read stability — no library-driven deletion** — Two consecutive
   reads with no intervening writes return the same records. The
   library never deletes catalog rows, MV rows, or S3 objects on
@@ -94,10 +109,16 @@ must preserve them — even when the change appears unrelated.
   catalog write. If ctx carries an active transaction, fn
   participates in it (no nested BEGIN). If not, the executor opens
   its own. A successful Write commits if and only if the host
-  transaction commits. Refactors must not bypass the Executor for
-  catalog writes (no direct `pool.Begin`, no `pgxpool.Pool.Exec`
-  on a catalog table) and must not assume the executor always
-  opens its own tx.
+  transaction commits. The orphan-tracking pending_writes INSERT
+  is the one deliberate exception: it goes through
+  `Executor.Run(Executor.DetachTx(ctx), …)` so it always commits
+  on its own pool connection, even when the caller composed via
+  `WithTx` — see the orphan-tracking invariant for why. Refactors
+  must not bypass the Executor for catalog writes (no direct
+  `pool.Begin`, no `pgxpool.Pool.Exec` on a catalog table), must
+  not assume the executor always opens its own tx, and must not
+  remove `DetachTx` from the Executor interface — every adapter
+  needs an escape hatch for orphan-tracking-class writes.
 - **MaterializedView is a set-membership index, no FK to
   s3pgstore_files** — MV rows hold the column tuple declared as
   `Config.MaterializedViews[i].Columns`; the primary key is the

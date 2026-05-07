@@ -77,7 +77,7 @@ func BenchmarkEncode_NoPool(b *testing.B) {
 	for _, sc := range benchSizes {
 		b.Run(sc.name, func(b *testing.B) {
 			recs := makeBenchRecs(sc.n)
-			data, err := encodeParquetUnpooled(recs, &parquet.Snappy)
+			data, _, err := encodeParquetUnpooled(recs, &parquet.Snappy)
 			if err != nil {
 				b.Fatalf("warmup encode: %v", err)
 			}
@@ -85,7 +85,7 @@ func BenchmarkEncode_NoPool(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if _, err := encodeParquetUnpooled(
+				if _, _, err := encodeParquetUnpooled(
 					recs, &parquet.Snappy); err != nil {
 					b.Fatalf("encode: %v", err)
 				}
@@ -104,7 +104,7 @@ func BenchmarkEncode_Pooled(b *testing.B) {
 			enc := newParquetEncoder[benchRec](&parquet.Snappy,
 				defaultEncodeBufPoolMaxBytes, nil)
 			ctx := context.Background()
-			data, err := enc.encode(ctx, recs)
+			data, _, err := enc.encode(ctx, recs)
 			if err != nil {
 				b.Fatalf("warmup encode: %v", err)
 			}
@@ -112,7 +112,7 @@ func BenchmarkEncode_Pooled(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if _, err := enc.encode(ctx, recs); err != nil {
+				if _, _, err := enc.encode(ctx, recs); err != nil {
 					b.Fatalf("encode: %v", err)
 				}
 			}
@@ -128,7 +128,7 @@ func BenchmarkDecode(b *testing.B) {
 	for _, sc := range benchSizes {
 		b.Run(sc.name, func(b *testing.B) {
 			recs := makeBenchRecs(sc.n)
-			data, err := encodeParquetUnpooled(recs, &parquet.Snappy)
+			data, _, err := encodeParquetUnpooled(recs, &parquet.Snappy)
 			if err != nil {
 				b.Fatalf("encode fixture: %v", err)
 			}

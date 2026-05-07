@@ -84,6 +84,16 @@ func TestWrite_SinglePartition(t *testing.T) {
 	if r.FileSize == 0 {
 		t.Errorf("FileSize: want non-zero")
 	}
+	// UncompressedSize sums per-column-chunk
+	// TotalUncompressedSize from the parquet footer; it should
+	// always be > 0 for non-empty input. (No relationship to
+	// FileSize is asserted here — for tiny inputs the footer
+	// dominates the file and file_size > uncompressed_size is
+	// expected; only at larger sizes does compression dominate.)
+	if r.UncompressedSize <= 0 {
+		t.Errorf("UncompressedSize: want > 0, got %d",
+			r.UncompressedSize)
+	}
 	if r.S3Key == "" {
 		t.Errorf("S3Key: empty")
 	}

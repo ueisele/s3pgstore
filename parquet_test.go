@@ -83,7 +83,7 @@ func TestEncodeParquet_PooledMatchesFresh(t *testing.T) {
 			Payload: []byte("third-payload-bytes")},
 	}
 
-	fresh, err := encodeParquetUnpooled(in, &parquet.Snappy)
+	fresh, freshUnc, err := encodeParquetUnpooled(in, &parquet.Snappy)
 	if err != nil {
 		t.Fatalf("fresh encode: %v", err)
 	}
@@ -92,11 +92,11 @@ func TestEncodeParquet_PooledMatchesFresh(t *testing.T) {
 		defaultEncodeBufPoolMaxBytes, nil)
 	ctx := context.Background()
 
-	first, err := enc.encode(ctx, in)
+	first, firstUnc, err := enc.encode(ctx, in)
 	if err != nil {
 		t.Fatalf("pooled encode #1: %v", err)
 	}
-	second, err := enc.encode(ctx, in)
+	second, secondUnc, err := enc.encode(ctx, in)
 	if err != nil {
 		t.Fatalf("pooled encode #2 (after Reset): %v", err)
 	}
@@ -113,6 +113,17 @@ func TestEncodeParquet_PooledMatchesFresh(t *testing.T) {
 		t.Errorf("pooled-first != pooled-second: lens %d vs %d "+
 			"(non-deterministic across Reset)",
 			len(first), len(second))
+	}
+
+	// Uncompressed size must be > 0 for non-empty input and
+	// stable across pooled vs fresh encodes — same source
+	// records, same column chunks, same per-chunk metadata.
+	if freshUnc <= 0 {
+		t.Errorf("fresh uncompressed size: want > 0, got %d", freshUnc)
+	}
+	if firstUnc != freshUnc || secondUnc != freshUnc {
+		t.Errorf("uncompressed size diverges: fresh=%d first=%d second=%d",
+			freshUnc, firstUnc, secondUnc)
 	}
 }
 
@@ -146,13 +157,13 @@ func TestEncodeParquet_PoolReturnedAfterPanic(t *testing.T) {
 		// After panic, the encoder must remain usable. A new
 		// encode (with a saner cap + no-op cb) should produce
 		// the same bytes as the unpooled reference.
-		want, err := encodeParquetUnpooled(recs, &parquet.Snappy)
+		want, _, err := encodeParquetUnpooled(recs, &parquet.Snappy)
 		if err != nil {
 			t.Fatalf("ref encode: %v", err)
 		}
 		enc2 := newParquetEncoder[rec](&parquet.Snappy,
 			defaultEncodeBufPoolMaxBytes, nil)
-		got, err := enc2.encode(context.Background(), recs)
+		got, _, err := enc2.encode(context.Background(), recs)
 		if err != nil {
 			t.Fatalf("recovery encode: %v", err)
 		}
@@ -160,7 +171,7 @@ func TestEncodeParquet_PoolReturnedAfterPanic(t *testing.T) {
 			t.Errorf("recovery encode bytes differ from reference")
 		}
 	}()
-	_, _ = enc.encode(context.Background(), recs)
+	_, _, _ = enc.encode(context.Background(), recs)
 }
 
 // TestEncodeParquet_BufDroppedCallback verifies that the
@@ -186,7 +197,7 @@ func TestEncodeParquet_BufDroppedCallback(t *testing.T) {
 		enc := newParquetEncoder[rec](&parquet.Snappy,
 			16<<20, // 16 MiB — way larger than any output here
 			func(context.Context) { fired++ })
-		if _, err := enc.encode(context.Background(), recs); err != nil {
+		if _, _, err := enc.encode(context.Background(), recs); err != nil {
 			t.Fatalf("encode: %v", err)
 		}
 		if fired != 0 {
@@ -199,7 +210,7 @@ func TestEncodeParquet_BufDroppedCallback(t *testing.T) {
 		enc := newParquetEncoder[rec](&parquet.Snappy,
 			16, // tiny cap → every buffer exceeds it
 			func(context.Context) { fired++ })
-		if _, err := enc.encode(context.Background(), recs); err != nil {
+		if _, _, err := enc.encode(context.Background(), recs); err != nil {
 			t.Fatalf("encode: %v", err)
 		}
 		if fired != 1 {
@@ -224,9 +235,12 @@ func TestEncodeParquet_RoundTrip(t *testing.T) {
 	enc := newParquetEncoder[rec](&parquet.Snappy,
 		defaultEncodeBufPoolMaxBytes, nil)
 
-	data, err := enc.encode(context.Background(), in)
+	data, unc, err := enc.encode(context.Background(), in)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
+	}
+	if unc <= 0 {
+		t.Errorf("uncompressed size: want > 0, got %d", unc)
 	}
 	out, err := decodeParquet[rec](data)
 	if err != nil {
@@ -246,7 +260,7 @@ func TestDecodeParquet_Empty(t *testing.T) {
 	type rec struct {
 		ID int64 `parquet:"id"`
 	}
-	data, err := encodeParquetUnpooled[rec](nil, &parquet.Snappy)
+	data, _, err := encodeParquetUnpooled[rec](nil, &parquet.Snappy)
 	if err != nil {
 		t.Fatalf("encode empty: %v", err)
 	}

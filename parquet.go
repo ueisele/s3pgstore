@@ -62,20 +62,51 @@ func resolveCompression(c CompressionCodec) (compress.Codec, error) {
 // or type per call) and as the byte-equivalence reference for
 // the pooled encoder. The production write path goes through
 // parquetEncoder.encode below.
+//
+// Returns (bytes, uncompressedSize, err). The uncompressed size
+// is summed across every column chunk in the resulting file
+// (TotalUncompressedSize from parquet's per-chunk metadata).
 func encodeParquetUnpooled[T any](
 	records []T,
 	codec compress.Codec,
-) ([]byte, error) {
+) ([]byte, int64, error) {
 	var buf bytes.Buffer
 	writer := parquet.NewGenericWriter[T](
 		&buf, parquet.Compression(codec))
 	if _, err := writer.Write(records); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if err := writer.Close(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return buf.Bytes(), nil
+	return buf.Bytes(), uncompressedSizeOf(writer), nil
+}
+
+// uncompressedSizeOf walks the parquet writer's just-closed
+// FileMetaData and sums TotalUncompressedSize across every
+// column chunk in every row group. parquet-go writes one row
+// group per Close call by default, so this is typically a
+// single-row-group walk.
+//
+// Must be called after the writer's Close (the metadata is
+// only finalized then) and before the writer is Reset (Reset
+// clears the metadata for the next encode).
+func uncompressedSizeOf[T any](pw *parquet.GenericWriter[T]) int64 {
+	view := pw.File()
+	if view == nil {
+		return 0
+	}
+	md := view.Metadata()
+	if md == nil {
+		return 0
+	}
+	var total int64
+	for _, rg := range md.RowGroups {
+		for _, c := range rg.Columns {
+			total += c.MetaData.TotalUncompressedSize
+		}
+	}
+	return total
 }
 
 // parquetEncoder owns the pooled parquet-go writer and output
@@ -142,7 +173,7 @@ func newParquetEncoder[T any](
 //     the caller's stack trace is preserved.
 func (e *parquetEncoder[T]) encode(
 	ctx context.Context, records []T,
-) (out []byte, err error) {
+) (out []byte, uncompressed int64, err error) {
 	buf, _ := e.encodeBufPool.Get().(*bytes.Buffer)
 	if buf == nil {
 		buf = &bytes.Buffer{}
@@ -178,12 +209,16 @@ func (e *parquetEncoder[T]) encode(
 	}()
 
 	if _, err = pw.Write(records); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if err = pw.Close(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return append([]byte(nil), buf.Bytes()...), nil
+	// Read uncompressed size from the writer's now-finalized
+	// metadata before the writer goes back in the pool (Reset
+	// on next Get clears it).
+	uncompressed = uncompressedSizeOf(pw)
+	return append([]byte(nil), buf.Bytes()...), uncompressed, nil
 }
 
 // decodeParquet reads all rows of a parquet file into []T. T

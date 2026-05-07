@@ -293,6 +293,17 @@ func insertFileRow(
 	}
 	recordCount := pf.NumRows()
 
+	// Sum TotalUncompressedSize across every column chunk in
+	// the footer — same derivation the writer pipeline uses.
+	var uncompressedSize int64
+	if md := pf.Metadata(); md != nil {
+		for _, rg := range md.RowGroups {
+			for _, c := range rg.Columns {
+				uncompressedSize += c.MetaData.TotalUncompressedSize
+			}
+		}
+	}
+
 	var fileSize int64
 	if head.ContentLength != nil {
 		fileSize = *head.ContentLength
@@ -302,11 +313,11 @@ func insertFileRow(
 
 	cols := []string{
 		"partition_key", "s3_key", "written_at_version",
-		"file_size", "record_count",
+		"file_size", "uncompressed_size", "record_count",
 	}
 	args := []any{
 		partitionKey, s3Key, writtenAtVersion,
-		fileSize, recordCount,
+		fileSize, uncompressedSize, recordCount,
 	}
 	if head.LastModified != nil {
 		cols = append(cols, "written_at")

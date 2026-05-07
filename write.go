@@ -336,6 +336,22 @@ func (s *Store[T]) writePartition(
 			s.names.PendingWriteDeleteSQL(), s3Key); err != nil {
 			return fmt.Errorf("delete pending_writes: %w", err)
 		}
+
+		// Sequencer wake-up. NOTIFY is queued by PostgreSQL
+		// inside the tx and delivered at COMMIT, so a rolled-
+		// back catalog write produces no notification — exactly
+		// the right semantics for "tell the sequencer a new row
+		// is ready to be assigned." Empty NotifyChannel disables
+		// LISTEN/NOTIFY entirely; the sequencer falls back to
+		// interval polling.
+		if s.resolved.NotifyChannel != "" {
+			if _, err := d.Exec(ctx,
+				"SELECT pg_notify($1, $2)",
+				s.resolved.NotifyChannel, "",
+			); err != nil {
+				return fmt.Errorf("pg_notify: %w", err)
+			}
+		}
 		return nil
 	})
 	if err != nil {

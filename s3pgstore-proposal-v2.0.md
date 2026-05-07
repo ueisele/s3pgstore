@@ -1627,10 +1627,12 @@ func (m *MaterializedView[K]) Lookup(ctx context.Context, filters []PartitionFil
 package sequencer
 
 type Config struct {
-    Executor      s3pgstore.Executor
+    Pool          *pgxpool.Pool  // required (LISTEN needs a dedicated connection,
+                                 //  which the Executor abstraction can't expose)
     SchemaName    string         // default "public"
     TablePrefix   string         // default "s3pgstore_"
     PollInterval  time.Duration  // default 1s
+    BatchSize     int            // default 1000
     NotifyChannel string         // default "s3pgstore_writes"; empty disables LISTEN
 }
 

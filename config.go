@@ -118,10 +118,13 @@ type Config[T any] struct {
 	// § Benchmarks for the reasoning).
 	EncodeBufPoolMaxBytes int
 
-	// NotifyChannel is the LISTEN/NOTIFY channel name. Empty
-	// disables NOTIFY (the sequencer falls back to interval
-	// polling).
-	NotifyChannel string // default "s3pgstore_writes"
+	// NotifyChannel is the LISTEN/NOTIFY channel name the
+	// writer emits on after each catalog commit. The bundled
+	// sequencer LISTENs on the same channel. Empty resolves to
+	// DefaultNotifyChannel ("s3pgstore_writes") — there is no
+	// way to disable NOTIFY emission in v2.0; operators not
+	// running a sequencer pay one cheap Exec per write.
+	NotifyChannel string
 }
 
 // validate runs every Config invariant the library depends on.
@@ -226,6 +229,12 @@ func (c Config[T]) validate() error {
 		add("EncodeBufPoolMaxBytes must be >= 0")
 	}
 
+	if c.NotifyChannel != "" &&
+		len(c.NotifyChannel) > maxNotifyChannelLen {
+		add("NotifyChannel %q is too long (max %d chars; "+
+			"NAMEDATALEN-1)", c.NotifyChannel, maxNotifyChannelLen)
+	}
+
 	if len(errs) > 0 {
 		return fmt.Errorf("invalid Config: %s",
 			strings.Join(errs, "; "))
@@ -272,6 +281,11 @@ const (
 	// full 63 chars without breaking downstream table-name
 	// composition.
 	maxSchemaNameLen = 63
+	// maxNotifyChannelLen mirrors PostgreSQL's NAMEDATALEN-1
+	// limit for NOTIFY channel names. pg_notify() accepts any
+	// string but PostgreSQL's internal channel registry caps at
+	// this length.
+	maxNotifyChannelLen = 63
 )
 
 //nolint:gochecknoglobals // package-level compiled regexes

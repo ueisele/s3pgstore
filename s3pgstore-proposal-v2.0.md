@@ -1354,18 +1354,25 @@ assumes `PartitionKeyParts: [charge_period, customer]` and
 
 ```sql
 CREATE TABLE s3pgstore_files (
+    -- Identity
     file_id                 BIGSERIAL PRIMARY KEY,
+    s3_key                  TEXT NOT NULL UNIQUE,
+    -- Partition membership
     partition_key           TEXT NOT NULL,                  -- materialized "part1=v1/..."
     part_charge_period      TEXT NOT NULL,                  -- one column per PartitionKeyParts entry
     part_customer           TEXT NOT NULL,
-    s3_key                  TEXT NOT NULL UNIQUE,
-    feed_seq                BIGINT UNIQUE,                  -- assigned by sequencer; NULL until then
-    feed_seq_at             TIMESTAMPTZ,
-    written_at_version      BIGINT,                         -- partition version at write time
-    idempotency_token       TEXT,
+    -- File metadata
     file_size               BIGINT NOT NULL,
     record_count            BIGINT,
+    -- Versioning
+    written_at_version      BIGINT,                         -- partition version at write time
     written_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Idempotency
+    idempotency_token       TEXT,
+    -- Sequencer / stream
+    feed_seq                BIGINT UNIQUE,                  -- assigned by sequencer; NULL until then
+    feed_seq_at             TIMESTAMPTZ,
+    -- User extensions
     ext_job_id              TEXT,                           -- one column per ExtensionColumns entry
     ext_tenant_id           UUID
 );

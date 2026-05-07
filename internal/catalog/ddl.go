@@ -94,20 +94,26 @@ func validateDDLInput(in DDLInput) error {
 func renderFiles(sb *strings.Builder, in DDLInput) error {
 	files := in.Names.Files()
 	fmt.Fprintf(sb, "CREATE TABLE IF NOT EXISTS %s (\n", files)
+	// Identity
 	sb.WriteString("    file_id              BIGSERIAL PRIMARY KEY,\n")
+	sb.WriteString("    s3_key               TEXT NOT NULL UNIQUE,\n")
+	// Partition membership
 	sb.WriteString("    partition_key        TEXT NOT NULL,\n")
 	for _, p := range in.Parts {
 		fmt.Fprintf(sb, "    %s%s            TEXT NOT NULL,\n",
 			PartColumnPrefix, p.Name)
 	}
-	sb.WriteString("    s3_key               TEXT NOT NULL UNIQUE,\n")
-	sb.WriteString("    feed_seq             BIGINT UNIQUE,\n")
-	sb.WriteString("    feed_seq_at          TIMESTAMPTZ,\n")
-	sb.WriteString("    written_at_version   BIGINT,\n")
-	sb.WriteString("    idempotency_token    TEXT,\n")
+	// File metadata
 	sb.WriteString("    file_size            BIGINT NOT NULL,\n")
 	sb.WriteString("    record_count         BIGINT,\n")
-	sb.WriteString("    written_at           TIMESTAMPTZ NOT NULL DEFAULT now()")
+	// Versioning
+	sb.WriteString("    written_at_version   BIGINT,\n")
+	sb.WriteString("    written_at           TIMESTAMPTZ NOT NULL DEFAULT now(),\n")
+	// Idempotency
+	sb.WriteString("    idempotency_token    TEXT,\n")
+	// Sequencer / stream
+	sb.WriteString("    feed_seq             BIGINT UNIQUE,\n")
+	sb.WriteString("    feed_seq_at          TIMESTAMPTZ")
 	for _, e := range in.Exts {
 		fmt.Fprintf(sb, ",\n    %s%s         %s",
 			ExtColumnPrefix, e.Name, strings.ToUpper(e.Type))

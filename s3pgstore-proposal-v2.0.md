@@ -420,20 +420,26 @@ proceed without blocking on a holder; the pattern is "all
 participants take the lock, or none."
 
 ```go
-err := executor.RunInTx(ctx, func(ctx context.Context) error {
-    if err := store.LockPartition(ctx, partitionKey,
-        s3pgstore.WithLockTimeout(5*time.Second)); err != nil {
-        return err
-    }
-    
-    result, err := store.Read(ctx, filters)  // protected by the lock
-    if err != nil { return err }
-    
-    modified := compute(result)
-    
-    _, err = store.Write(ctx, modified)  // no WithExpectedVersion needed
+tx, err := pool.BeginTx(ctx, pgx.TxOptions{})
+if err != nil { return err }
+defer tx.Rollback(context.Background())
+
+ctx = s3pgstore.WithTx(ctx, tx)
+
+if err := store.LockPartition(ctx, partitionKey,
+    s3pgstore.WithLockTimeout(5*time.Second)); err != nil {
     return err
-})
+}
+
+result, err := store.Read(ctx, filters)  // protected by the lock
+if err != nil { return err }
+
+modified := compute(result)
+
+if _, err := store.Write(ctx, modified); err != nil {  // no WithExpectedVersion needed
+    return err
+}
+return tx.Commit(ctx)
 ```
 
 The lock guarantees no concurrent `LockPartition` holder can

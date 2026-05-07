@@ -68,7 +68,9 @@ func (withHistoryOpt) applyRead(o *readOpts) { o.includeHistory = true }
 // matched, no S3 traffic.
 func (s *Store[T]) Read(
 	ctx context.Context, filters []PartitionFilter, opts ...ReadOption,
-) ([]PartitionResult[T], error) {
+) (parts []PartitionResult[T], err error) {
+	defer s.metrics.methodScope(ctx, "Read", &err).end()
+
 	if len(filters) == 0 {
 		return nil, nil
 	}

@@ -3,11 +3,10 @@
 PostgreSQL-coordinated Parquet on S3. The v2 of the
 [s3store](https://github.com/ueisele/s3store) family.
 
-> **Status: pre-release, in design.** No code has shipped yet. The
-> full specification lives in
-> [s3pgstore-proposal-v2.0.md](s3pgstore-proposal-v2.0.md); refactoring
-> contracts and backend assumptions in [CLAUDE.md](CLAUDE.md). This
-> README will fill out as features land.
+> **Status: v2.0 implementation complete.** All 16 phases of the
+> [implementation plan](implementation-plan-v2.0.md) have shipped.
+> Specification: [s3pgstore-proposal-v2.0.md](s3pgstore-proposal-v2.0.md).
+> Refactoring contracts: [CLAUDE.md](CLAUDE.md).
 
 ## What it does (planned)
 
@@ -66,7 +65,39 @@ remains the right choice.
 Full rationale and design discussion in
 [s3pgstore-proposal-v2.0.md](s3pgstore-proposal-v2.0.md#why-s3pgstore-the-correctness-argument).
 
-## Quick start (planned API)
+## Quick start
+
+End-to-end example: spin up local PostgreSQL + MinIO via
+`docker compose`, apply the schema, write records, read them
+back, and stream them via `Poll`.
+
+### 1. Local infrastructure
+
+```yaml
+# docker-compose.yml
+services:
+  postgres:
+    image: postgres:17.5-alpine
+    environment:
+      POSTGRES_USER: s3pgstore
+      POSTGRES_PASSWORD: s3pgstore
+      POSTGRES_DB: s3pgstore
+    ports: ["5432:5432"]
+
+  minio:
+    image: pgsty/minio:RELEASE.2026-04-17T00-00-00Z
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address :9001
+    ports: ["9000:9000", "9001:9001"]
+```
+
+```sh
+docker compose up -d
+```
+
+### 2. Construct a Store and write records
 
 ```go
 type CostRecord struct {
@@ -102,9 +133,99 @@ results, err := store.Read(ctx, []s3pgstore.PartitionFilter{
     s3pgstore.Eq("customer", "abc"),
 })
 
-// Stream: gap-free, sequencer-assigned offsets.
+// Stream: gap-free, sequencer-assigned offsets (after running
+// cmd/s3pgstore-sequencer).
 entries, next, err := store.Poll(ctx, lastOffset, 100)
 ```
+
+### 3. Apply schema
+
+```go
+mgr := s3pgstore.NewSchemaManager(cfg)
+if err := mgr.Create(ctx); err != nil { /* ... */ }
+```
+
+For production, render the SQL via `s3pgstore.RenderDDL(cfg)`
+and feed it to your migration tool — `SchemaManager.Create` is
+intended for tests and small deployments.
+
+### 4. Run the sequencer (optional, for stream consumption)
+
+```sh
+S3PGSTORE_DATABASE_URL=postgres://s3pgstore:s3pgstore@localhost/s3pgstore?sslmode=disable \
+  go run github.com/ueisele/s3pgstore/cmd/s3pgstore-sequencer
+```
+
+The sequencer assigns gap-free `feed_seq` to committed catalog
+rows. Wakes on NOTIFY (the writer emits one inside the catalog
+tx) or on `S3PGSTORE_POLL_INTERVAL` ticks (default 1s).
+
+### 5. Run garbage collection (recommended, for orphan reclaim)
+
+```sh
+S3PGSTORE_DATABASE_URL=postgres://s3pgstore:s3pgstore@localhost/s3pgstore?sslmode=disable \
+S3PGSTORE_BUCKET=warehouse \
+S3PGSTORE_S3_ENDPOINT=http://localhost:9000 \
+  go run github.com/ueisele/s3pgstore/cmd/s3pgstore-gc
+```
+
+Reclaims S3 objects whose write transactions rolled back.
+`S3PGSTORE_GRACE` controls the minimum age before reclaim
+(default 24h); `S3PGSTORE_ONESHOT=1` runs once and exits
+(useful for cron-style scheduling).
+
+## Concurrency strategies
+
+| Pattern | When |
+|---|---|
+| **OCC** (`Read` + `Write` with `WithExpectedVersion`) | Low contention, retries are cheap. |
+| **Pessimistic** (`LockPartition` + `Read` + `Write`) | High contention, retries are expensive. |
+| **Read only** | No concurrency control needed. |
+
+`LockPartition` requires an active transaction in `ctx` (inject
+via `s3pgstore.WithTx`) since `pg_advisory_xact_lock` releases
+on autocommit. Don't mix OCC and `LockPartition` for the same
+partition — see the
+[don't-mix caveat](s3pgstore-proposal-v2.0.md#cooperative-protocol-caveat)
+in the proposal.
+
+## Disaster recovery
+
+The catalog is fully recoverable from S3. After total catalog
+loss:
+
+```sh
+S3PGSTORE_DATABASE_URL=postgres://... \
+S3PGSTORE_BUCKET=warehouse \
+S3PGSTORE_S3_PREFIX=billing \
+S3PGSTORE_PARTITION_KEY_PARTS=charge_period,customer \
+  go run github.com/ueisele/s3pgstore/cmd/s3pgstore-rebuild
+```
+
+`PartitionKeyParts` must match the writer's configuration. The
+rebuild tool re-creates `s3pgstore_files` and
+`s3pgstore_partitions` from the discovered parquet objects;
+`feed_seq` is reassigned the next time the sequencer runs.
+Materialized views are NOT rebuilt — operators re-run their
+own MV-population pipelines after rebuild.
+
+## Observability
+
+Pass `cfg.Meter` (an
+[`go.opentelemetry.io/otel/metric.Meter`](https://pkg.go.dev/go.opentelemetry.io/otel/metric))
+to enable telemetry:
+
+```go
+cfg.Meter = otelProvider.Meter("s3pgstore")
+```
+
+The Store registers `s3pgstore.method.duration` (histogram) and
+`s3pgstore.method.calls` (counter), both labeled by `method` and
+`outcome` (success / error / canceled). A starter Grafana
+dashboard ships at
+[dashboards/s3pgstore.json](dashboards/s3pgstore.json) with
+panels for the registered instruments. More metrics + panels
+land in v2.0.x as instrumentation hooks expand.
 
 ## Architecture (one-line summary)
 

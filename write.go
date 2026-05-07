@@ -67,7 +67,9 @@ func (s *Store[T]) resolveWriteOpts(opts ...WriteOption) (writeOpts, error) {
 // — no S3 PUTs, no catalog INSERTs.
 func (s *Store[T]) Write(
 	ctx context.Context, records []T, opts ...WriteOption,
-) ([]WriteResult, error) {
+) (out []WriteResult, err error) {
+	defer s.metrics.methodScope(ctx, "Write", &err).end()
+
 	if len(records) == 0 {
 		return nil, nil
 	}
@@ -113,7 +115,7 @@ func (s *Store[T]) Write(
 	// partial-UNIQUE short-circuit collapses retries to the
 	// canonical row regardless of which partitions committed
 	// first.
-	out := make([]WriteResult, len(keys))
+	out = make([]WriteResult, len(keys))
 	if err := fanOut(ctx, keys, s.target.effectiveConcurrency(), nil,
 		func(ctx context.Context, i int, key string) error {
 			res, err := s.writePartition(ctx, key,

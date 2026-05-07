@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // Default values for Config fields. Exported so tests and
@@ -125,6 +126,17 @@ type Config[T any] struct {
 	// way to disable NOTIFY emission in v2.0; operators not
 	// running a sequencer pay one cheap Exec per write.
 	NotifyChannel string
+
+	// Meter is the OTel meter the Store registers its
+	// instruments against. Nil resolves to a no-op meter, so
+	// telemetry is opt-in: callers that don't wire OTel see no
+	// instruments and pay no overhead.
+	//
+	// See dashboards/s3pgstore.json for the panels backing the
+	// registered instruments. Adding a new metric requires
+	// adding the matching panel in the same PR — CLAUDE.md §
+	// Metrics ↔ dashboard sync.
+	Meter metric.Meter
 }
 
 // validate runs every Config invariant the library depends on.

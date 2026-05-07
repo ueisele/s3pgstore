@@ -21,6 +21,7 @@ type Store[T any] struct {
 	names    catalog.Names
 	target   *s3target
 	encoder  *parquetEncoder[T]
+	metrics  *Metrics
 }
 
 // New constructs a Store[T] for cfg. Validates cfg, resolves
@@ -60,16 +61,21 @@ func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
 		return nil, err
 	}
 
+	metrics, err := newMetrics(cfg.Meter)
+	if err != nil {
+		return nil, fmt.Errorf("register metrics: %w", err)
+	}
+
 	return &Store[T]{
 		cfg:      cfg,
 		resolved: r,
 		names:    catalog.NewNames(r.SchemaName, r.TablePrefix),
 		target:   target,
 		encoder: newParquetEncoder[T](codec, bufCap, func(ctx context.Context) {
-			// Phase 16 wires the encode_buf_dropped counter
-			// here. Currently a no-op so the field is non-nil
-			// for tests that exercise the cap-discard path.
+			// Phase 16.x wires the encode_buf_dropped counter
+			// here once the metrics surface expands.
 		}),
+		metrics: metrics,
 	}, nil
 }
 

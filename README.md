@@ -145,9 +145,142 @@ mgr := s3pgstore.NewSchemaManager(cfg)
 if err := mgr.Create(ctx); err != nil { /* ... */ }
 ```
 
-For production, render the SQL via `s3pgstore.RenderDDL(cfg)`
-and feed it to your migration tool — `SchemaManager.Create` is
-intended for tests and small deployments.
+`SchemaManager.Create` is intended for tests and small
+deployments. For production, see the next section.
+
+### 3a. Production schema management
+
+Production deployments should drive their existing migration
+tool (Atlas, golang-migrate, sqlc-generated migrations, etc.)
+off `s3pgstore.RenderDDL(cfg)` rather than calling
+`SchemaManager.Create` from the application. The pattern: a
+shared package that defines the `Config[T]` once, two binaries
+that consume it.
+
+**Shared package.** Schema-shaping fields are defined once;
+runtime-only fields (`Executor` / `S3Client` / `Bucket`) are
+filled in by the constructor.
+
+```go
+// internal/billing/store.go
+package billing
+
+import (
+    "context"
+
+    "github.com/aws/aws-sdk-go-v2/service/s3"
+    "github.com/jackc/pgx/v5/pgxpool"
+
+    "github.com/ueisele/s3pgstore"
+)
+
+type Record struct {
+    CustomerID   string  `parquet:"customer_id"`
+    ChargePeriod string  `parquet:"charge_period"`
+    SKU          string  `parquet:"sku"`
+    NetCost      float64 `parquet:"net_cost"`
+}
+
+// schemaCfg returns the schema-shaping fields shared by the
+// runtime Store and the DDL generator.
+func schemaCfg() s3pgstore.Config[Record] {
+    return s3pgstore.Config[Record]{
+        SchemaName:        "billing",
+        TablePrefix:       "billing_",
+        PartitionKeyParts: []string{"charge_period", "customer"},
+        PartitionKeyOf: func(r Record) string {
+            return "charge_period=" + r.ChargePeriod +
+                "/customer=" + r.CustomerID
+        },
+        ExtensionColumns: []s3pgstore.ExtensionColumn{
+            {Name: "job_id", Type: "TEXT"},
+        },
+        MaterializedViews: []s3pgstore.MaterializedViewDef[Record]{{
+            Name:    "customer_sku_period",
+            Columns: []string{"customer_id", "sku", "charge_period"},
+            Of: func(r Record) ([][]string, error) {
+                return [][]string{{
+                    r.CustomerID, r.SKU, r.ChargePeriod,
+                }}, nil
+            },
+        }},
+    }
+}
+
+// NewStore wires runtime fields onto schemaCfg.
+func NewStore(
+    ctx context.Context,
+    pool *pgxpool.Pool, s3c *s3.Client, bucket string,
+) (*s3pgstore.Store[Record], error) {
+    cfg := schemaCfg()
+    cfg.Executor = s3pgstore.NewPoolExecutor(pool)
+    cfg.S3Client = s3c
+    cfg.Bucket = bucket
+    cfg.Prefix = "billing"
+    return s3pgstore.New(ctx, cfg)
+}
+
+// RenderSchema returns the DDL for this store. Stubs for
+// runtime-only fields satisfy Config.validate(); they are
+// never invoked on the rendering path.
+func RenderSchema() (string, error) {
+    cfg := schemaCfg()
+    cfg.Executor = s3pgstore.NewPoolExecutor(nil) // never invoked
+    cfg.S3Client = &s3.Client{}                   // never invoked
+    cfg.Bucket = "schema-only"
+    return s3pgstore.RenderDDL(cfg)
+}
+```
+
+**DDL generator binary.** A small `main.go` that emits the SQL
+to a known location your migration tool watches.
+
+```go
+// cmd/render-ddl/main.go
+package main
+
+import (
+    "flag"
+    "fmt"
+    "os"
+
+    "yourorg/yourrepo/internal/billing"
+)
+
+func main() {
+    out := flag.String("out", "schema/billing.sql",
+        "output path; '-' for stdout")
+    flag.Parse()
+
+    sql, err := billing.RenderSchema()
+    if err != nil {
+        fmt.Fprintln(os.Stderr, err)
+        os.Exit(1)
+    }
+    if *out == "-" {
+        fmt.Print(sql)
+        return
+    }
+    if err := os.WriteFile(*out, []byte(sql), 0o644); err != nil {
+        fmt.Fprintln(os.Stderr, err)
+        os.Exit(1)
+    }
+}
+```
+
+**Workflow.** Edit `internal/billing/store.go`, regenerate, let
+the migration tool diff against the live database:
+
+```sh
+go run ./cmd/render-ddl
+# then run your migration tool's diff command, e.g.
+#   atlas migrate diff add_job_id_ext --env billing
+#   golang-migrate create -dir migrations -ext sql add_job_id_ext
+```
+
+The runtime `Store` and the DDL generator share the same
+`schemaCfg` definition, so schema drift between them is
+impossible by construction.
 
 ### 4. Run the sequencer (optional, for stream consumption)
 

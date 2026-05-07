@@ -303,7 +303,6 @@ func (s *Store[T]) writePartition(
 		}
 		fileArgs := []any{
 			partitionKey, s3Key, version,
-			s.resolved.SchemaVersion,
 			len(body), len(records),
 			tokenArg,
 		}

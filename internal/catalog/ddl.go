@@ -105,7 +105,6 @@ func renderFiles(sb *strings.Builder, in DDLInput) error {
 	sb.WriteString("    feed_seq_at          TIMESTAMPTZ,\n")
 	sb.WriteString("    written_at_version   BIGINT,\n")
 	sb.WriteString("    idempotency_token    TEXT,\n")
-	sb.WriteString("    schema_version       INT,\n")
 	sb.WriteString("    file_size            BIGINT NOT NULL,\n")
 	sb.WriteString("    record_count         BIGINT,\n")
 	sb.WriteString("    written_at           TIMESTAMPTZ NOT NULL DEFAULT now()")

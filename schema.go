@@ -217,7 +217,7 @@ func expectedSchema[T any](r Config[T]) expectedSchemaSet {
 
 	filesCols := []string{
 		"file_id", "partition_key", "s3_key", "feed_seq", "feed_seq_at",
-		"written_at_version", "idempotency_token", "schema_version",
+		"written_at_version", "idempotency_token",
 		"file_size", "record_count", "written_at",
 	}
 	for _, p := range r.PartitionKeyParts {

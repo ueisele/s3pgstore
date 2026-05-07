@@ -95,12 +95,6 @@ type Config[T any] struct {
 	// handles via NewMaterializedView at runtime.
 	MaterializedViews []MaterializedViewDef[T]
 
-	// SchemaVersion is propagated into
-	// s3pgstore_files.schema_version on every write. Lets
-	// migration tools filter "files older than version N"
-	// without parquet footer reads.
-	SchemaVersion int
-
 	// EntityKeyOf and VersionOf together enable read-time
 	// dedup. Both fields together or neither — set one without
 	// the other and Config validation fails.

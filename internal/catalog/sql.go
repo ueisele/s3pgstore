@@ -131,11 +131,10 @@ func (n Names) PartitionUpdateOCCSQL() string {
 //	$1  partition_key
 //	$2  s3_key
 //	$3  written_at_version (the value returned by PartitionUpsertSQL)
-//	$4  schema_version
-//	$5  file_size
-//	$6  record_count
-//	$7  idempotency_token (NULL when no token)
-//	$8...  part_<n> columns (in PartitionKeyParts order)
+//	$4  file_size
+//	$5  record_count
+//	$6  idempotency_token (NULL when no token)
+//	$7...  part_<n> columns (in PartitionKeyParts order)
 //	then  ext_<n> columns (in ExtensionColumns order)
 //
 // Returns file_id so the caller can build a WriteResult with
@@ -143,8 +142,7 @@ func (n Names) PartitionUpdateOCCSQL() string {
 func (n Names) FilesInsertSQL(parts, exts []string) string {
 	cols := []string{
 		"partition_key", "s3_key", "written_at_version",
-		"schema_version", "file_size", "record_count",
-		"idempotency_token",
+		"file_size", "record_count", "idempotency_token",
 	}
 	for _, p := range parts {
 		cols = append(cols, PartColumnPrefix+p)

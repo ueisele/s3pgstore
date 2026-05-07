@@ -1252,13 +1252,13 @@ Adding a column to `T` works without library changes: parquet-go
 matches by tag, missing columns decode to Go's zero value. Old files
 have the new column as zero-valued; new files carry the data.
 
-For schema versioning at the file level, `Config.SchemaVersion`
-propagates an int into `s3pgstore_files.schema_version`. Migration
-tools that rewrite files can use this to filter "files older than
-version N" without reading the file headers.
-
 Renames, type changes, splits, and computed derivations require
-rewriting affected files. Out of scope for the library.
+rewriting affected files. Out of scope for v2.0 — applications
+that need a queryable per-file schema-version label can declare
+an `ExtensionColumn{Name: "schema_version", Type: "INT"}` and
+pass it via `WithMetadata` per write. A first-class
+`SchemaVersion` field plus migration scaffolding is a v2.1
+candidate.
 
 ### Disaster recovery and replication
 
@@ -1363,7 +1363,6 @@ CREATE TABLE s3pgstore_files (
     feed_seq_at             TIMESTAMPTZ,
     written_at_version      BIGINT,                         -- partition version at write time
     idempotency_token       TEXT,
-    schema_version          INT,
     file_size               BIGINT NOT NULL,
     record_count            BIGINT,
     written_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -1476,9 +1475,6 @@ type Config[T any] struct {
 
     // Materialized views — declared up-front; typed query handles via NewMaterializedView at runtime.
     MaterializedViews []MaterializedViewDef[T]
-
-    // Schema versioning
-    SchemaVersion int
 
     // Read-side dedup. Both fields together or neither.
     EntityKeyOf func(T) string

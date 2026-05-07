@@ -22,6 +22,16 @@ What v2.1 adds:
   optionally entire partitions).
 - **Replication** — `cmd/s3pgstore-replicate` for one-way
   catalog+data replication to a secondary site.
+- **Per-file schema-version label and migration scaffolding** —
+  v2.0 dropped `Config.SchemaVersion` and the
+  `s3pgstore_files.schema_version` column because nothing in the
+  library consumed them and applications needing a queryable
+  label could already declare an
+  `ExtensionColumn{Name: "schema_version", Type: "INT"}`. v2.1
+  may reintroduce the field as first-class API alongside actual
+  migration helpers (e.g. "rewrite all files where
+  schema_version < N" with progress tracking and pause/resume).
+  Defer the design until a concrete migration use case lands.
 
 What v2.1 keeps from v2.0 unchanged:
 

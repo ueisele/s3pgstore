@@ -235,7 +235,7 @@ func expectedSchema[T any](r Config[T]) expectedSchemaSet {
 			catalog.PartColumnPrefix+p)
 	}
 
-	pwCols := []string{"pending_id", "s3_key", "intended_at"}
+	pwCols := []string{"s3_key", "intended_at"}
 
 	out := expectedSchemaSet{
 		tables: []expectedTable{

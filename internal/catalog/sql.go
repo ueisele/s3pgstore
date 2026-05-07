@@ -7,22 +7,21 @@ import (
 
 // PendingWriteInsertSQL returns the INSERT statement for the
 // orphan-tracking row that's INSERTed before the S3 PUT and
-// DELETEd inside the catalog write transaction. Single-row,
-// returning the generated UUID so the caller can match it to
-// the subsequent DELETE.
+// DELETEd inside the catalog write transaction. The s3_key is
+// the row's primary key; the caller already holds it (it was
+// generated before this INSERT) and reuses it for the DELETE.
 func (n Names) PendingWriteInsertSQL() string {
 	return fmt.Sprintf(
-		`INSERT INTO %s (s3_key) VALUES ($1) RETURNING pending_id`,
+		`INSERT INTO %s (s3_key) VALUES ($1)`,
 		n.PendingWrites())
 }
 
 // PendingWriteDeleteSQL returns the DELETE statement for the
-// orphan-tracking row, by pending_id (the UUID returned from
-// the INSERT). Idempotent — DELETE on a missing row succeeds
-// with rowcount=0.
+// orphan-tracking row, keyed by s3_key. Idempotent — DELETE on
+// a missing row succeeds with rowcount=0.
 func (n Names) PendingWriteDeleteSQL() string {
 	return fmt.Sprintf(
-		`DELETE FROM %s WHERE pending_id = $1`,
+		`DELETE FROM %s WHERE s3_key = $1`,
 		n.PendingWrites())
 }
 

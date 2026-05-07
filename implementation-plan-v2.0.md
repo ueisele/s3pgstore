@@ -631,7 +631,7 @@ preserves MV consistency.
 
 - `gc/` package.
 - `RunOnce(ctx, cfg) (reclaimed int, err error)`:
-  - SELECT `pending_id`, `s3_key` FROM `s3pgstore_pending_writes`
+  - SELECT `s3_key` FROM `s3pgstore_pending_writes`
     WHERE `intended_at < now() - $grace`.
   - For each: S3 DELETE; on success, DELETE catalog row; on S3
     DELETE failure, log and skip (retry next run).

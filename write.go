@@ -226,12 +226,12 @@ func (s *Store[T]) writePartition(
 
 	// Step 3 — INSERT pending_writes (separate tx; the row
 	// must be visible before the S3 PUT lands so a crash
-	// between them is recoverable by GC).
-	var pendingID uuid.UUID
+	// between them is recoverable by GC). s3Key is the row's
+	// primary key; the catalog tx in step 5 deletes by it.
 	if err := s.cfg.Executor.RunInTx(ctx, func(d DBTX) error {
-		return d.QueryRow(ctx,
-			s.names.PendingWriteInsertSQL(), s3Key,
-		).Scan(&pendingID)
+		_, err := d.Exec(ctx,
+			s.names.PendingWriteInsertSQL(), s3Key)
+		return err
 	}); err != nil {
 		return WriteResult{}, fmt.Errorf(
 			"insert pending_writes: %w", err)
@@ -334,7 +334,7 @@ func (s *Store[T]) writePartition(
 		}
 
 		if _, err := d.Exec(ctx,
-			s.names.PendingWriteDeleteSQL(), pendingID); err != nil {
+			s.names.PendingWriteDeleteSQL(), s3Key); err != nil {
 			return fmt.Errorf("delete pending_writes: %w", err)
 		}
 		return nil

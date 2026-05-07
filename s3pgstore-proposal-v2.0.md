@@ -1391,8 +1391,7 @@ CREATE TABLE s3pgstore_partitions (
 CREATE INDEX ON s3pgstore_partitions (part_charge_period, part_customer);
 
 CREATE TABLE s3pgstore_pending_writes (
-    pending_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    s3_key       TEXT NOT NULL UNIQUE,
+    s3_key       TEXT PRIMARY KEY,
     intended_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

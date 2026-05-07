@@ -184,8 +184,7 @@ func renderPartitions(sb *strings.Builder, in DDLInput) error {
 func renderPendingWrites(sb *strings.Builder, in DDLInput) {
 	pw := in.Names.PendingWrites()
 	fmt.Fprintf(sb, "CREATE TABLE IF NOT EXISTS %s (\n", pw)
-	sb.WriteString("    pending_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),\n")
-	sb.WriteString("    s3_key       TEXT NOT NULL UNIQUE,\n")
+	sb.WriteString("    s3_key       TEXT PRIMARY KEY,\n")
 	sb.WriteString("    intended_at  TIMESTAMPTZ NOT NULL DEFAULT now()\n")
 	sb.WriteString(");\n")
 

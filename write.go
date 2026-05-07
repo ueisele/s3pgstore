@@ -213,6 +213,16 @@ func (s *Store[T]) writePartition(
 		}
 	}
 
+	// Resolve MV rows up front so shape errors (Key/Value
+	// length mismatches) surface before any S3 PUT. The
+	// resolved rows are inserted inside the catalog tx (step 5)
+	// so MV state stays consistent with file state under both
+	// commit and rollback.
+	mvRows, err := s.resolveMVRows(records)
+	if err != nil {
+		return WriteResult{}, err
+	}
+
 	body, err := s.encoder.encode(ctx, records)
 	if err != nil {
 		return WriteResult{}, fmt.Errorf("encode parquet: %w", err)
@@ -335,6 +345,15 @@ func (s *Store[T]) writePartition(
 		if _, err := d.Exec(ctx,
 			s.names.PendingWriteDeleteSQL(), s3Key); err != nil {
 			return fmt.Errorf("delete pending_writes: %w", err)
+		}
+
+		// Materialized-view inserts. Same tx as the file row,
+		// so MV consistency tracks file consistency under both
+		// commit and rollback. Per-MV conflict policy is
+		// determined by shape (DO NOTHING for key-only,
+		// DO UPDATE for shaped).
+		if err := s.insertMVRows(ctx, d, mvRows); err != nil {
+			return fmt.Errorf("MV inserts: %w", err)
 		}
 
 		// Sequencer wake-up. NOTIFY is queued by PostgreSQL

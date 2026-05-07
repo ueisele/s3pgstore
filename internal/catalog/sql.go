@@ -3,6 +3,8 @@ package catalog
 import (
 	"fmt"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // PendingWriteInsertSQL returns the INSERT statement for the
@@ -122,6 +124,67 @@ func (n Names) PartitionUpdateOCCSQL() string {
         WHERE partition_key = $1 AND version = $2
         RETURNING version`,
 		n.Partitions())
+}
+
+// MVInsertSQL returns the INSERT ... ON CONFLICT statement for
+// one row of a materialized-view table. Conflict policy is
+// chosen by shape:
+//
+//   - len(valueColumns) == 0 → ON CONFLICT (key) DO NOTHING.
+//     Key-only MV; first writer wins; idempotent.
+//   - len(valueColumns) > 0  → ON CONFLICT (key) DO UPDATE SET
+//     val = EXCLUDED.val, ... Last writer wins.
+//
+// Positional parameters are ($1...$N) covering keyColumns
+// followed by valueColumns in declaration order.
+//
+// Identifiers are quoted via pgx.Identifier.Sanitize so reserved
+// words / case-sensitive names round-trip correctly. The
+// configuration validator already rejects identifiers that
+// would need escaping; this is belt-and-suspenders.
+func (n Names) MVInsertSQL(mvName string, keyColumns, valueColumns []string) string {
+	tbl := n.MV(mvName)
+
+	cols := make([]string, 0, len(keyColumns)+len(valueColumns))
+	for _, c := range keyColumns {
+		cols = append(cols, pgx.Identifier{c}.Sanitize())
+	}
+	for _, c := range valueColumns {
+		cols = append(cols, pgx.Identifier{c}.Sanitize())
+	}
+
+	placeholders := make([]string, len(cols))
+	for i := range cols {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	}
+
+	keyList := make([]string, len(keyColumns))
+	for i, c := range keyColumns {
+		keyList[i] = pgx.Identifier{c}.Sanitize()
+	}
+
+	var conflict string
+	if len(valueColumns) == 0 {
+		conflict = fmt.Sprintf(
+			"ON CONFLICT (%s) DO NOTHING",
+			strings.Join(keyList, ", "))
+	} else {
+		assigns := make([]string, len(valueColumns))
+		for i, c := range valueColumns {
+			q := pgx.Identifier{c}.Sanitize()
+			assigns[i] = fmt.Sprintf("%s = EXCLUDED.%s", q, q)
+		}
+		conflict = fmt.Sprintf(
+			"ON CONFLICT (%s) DO UPDATE SET %s",
+			strings.Join(keyList, ", "),
+			strings.Join(assigns, ", "))
+	}
+
+	return fmt.Sprintf(
+		"INSERT INTO %s (%s) VALUES (%s) %s",
+		tbl, strings.Join(cols, ", "),
+		strings.Join(placeholders, ", "),
+		conflict)
 }
 
 // FilesInsertSQL returns the INSERT statement for the catalog

@@ -195,7 +195,7 @@ func (s *Store[T]) selectFileRows(
 	ctx context.Context, filters []PartitionFilter,
 ) ([]fileRow, error) {
 	where, args, err := translateFilters(filters,
-		s.resolved.PartitionKeyParts)
+		partColResolver(s.resolved.PartitionKeyParts))
 	if err != nil {
 		return nil, err
 	}

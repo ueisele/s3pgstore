@@ -7,7 +7,8 @@ import (
 
 func translateOrFail(t *testing.T, parts []string, f PartitionFilter) (string, []any) {
 	t.Helper()
-	sql, args, err := translateFilters([]PartitionFilter{f}, parts)
+	sql, args, err := translateFilters(
+		[]PartitionFilter{f}, partColResolver(parts))
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
@@ -51,7 +52,8 @@ func TestFilter_Between(t *testing.T) {
 func TestFilter_BetweenInvalidOrder(t *testing.T) {
 	parts := []string{"period"}
 	_, _, err := translateFilters(
-		[]PartitionFilter{Between("period", "z", "a")}, parts)
+		[]PartitionFilter{Between("period", "z", "a")},
+		partColResolver(parts))
 	if err == nil {
 		t.Fatal("Between with from>=to: want error")
 	}
@@ -119,7 +121,7 @@ func TestFilter_TopLevelAndJoinsMultipleFilters(t *testing.T) {
 	sql, args, err := translateFilters([]PartitionFilter{
 		Eq("period", "2026-03"),
 		Eq("customer", "abc"),
-	}, parts)
+	}, partColResolver(parts))
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
@@ -134,7 +136,8 @@ func TestFilter_TopLevelAndJoinsMultipleFilters(t *testing.T) {
 func TestFilter_UnknownPart(t *testing.T) {
 	parts := []string{"period"}
 	_, _, err := translateFilters(
-		[]PartitionFilter{Eq("not_declared", "x")}, parts)
+		[]PartitionFilter{Eq("not_declared", "x")},
+		partColResolver(parts))
 	if err == nil {
 		t.Fatal("unknown part: want error")
 	}
@@ -161,15 +164,16 @@ func TestFilter_DeterministicOutput(t *testing.T) {
 		),
 		Eq("customer", "b"),
 	)
-	a, _, _ := translateFilters([]PartitionFilter{f}, parts)
-	b, _, _ := translateFilters([]PartitionFilter{f}, parts)
+	a, _, _ := translateFilters([]PartitionFilter{f}, partColResolver(parts))
+	b, _, _ := translateFilters([]PartitionFilter{f}, partColResolver(parts))
 	if a != b {
 		t.Fatalf("non-deterministic translation: %q vs %q", a, b)
 	}
 }
 
 func TestTranslateFilters_Empty(t *testing.T) {
-	sql, args, err := translateFilters(nil, []string{"period"})
+	sql, args, err := translateFilters(nil,
+		partColResolver([]string{"period"}))
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}

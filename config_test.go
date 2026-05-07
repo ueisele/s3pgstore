@@ -141,25 +141,25 @@ func TestConfigValidate_AllExtensionColumnTypes(t *testing.T) {
 func TestConfigValidate_MaterializedView(t *testing.T) {
 	cfg := validConfig()
 	cfg.MaterializedViews = []MaterializedViewDef[map[string]any]{
-		{Name: "ok", KeyColumns: []string{"a"}, Of: func(map[string]any) ([]MVRow, error) { return nil, nil }},
-		{Name: "missing_of", KeyColumns: []string{"a"}}, // no Of
+		{Name: "ok", Columns: []string{"a"}, Of: func(map[string]any) ([][]string, error) { return nil, nil }},
+		{Name: "missing_of", Columns: []string{"a"}}, // no Of
 	}
 	requireErrContains(t, cfg.validate(), "Of is required")
 }
 
-func TestConfigValidate_MaterializedViewNoKeyColumns(t *testing.T) {
+func TestConfigValidate_MaterializedViewNoColumns(t *testing.T) {
 	cfg := validConfig()
 	cfg.MaterializedViews = []MaterializedViewDef[map[string]any]{
-		{Name: "x", Of: func(map[string]any) ([]MVRow, error) { return nil, nil }},
+		{Name: "x", Of: func(map[string]any) ([][]string, error) { return nil, nil }},
 	}
-	requireErrContains(t, cfg.validate(), "KeyColumns must be non-empty")
+	requireErrContains(t, cfg.validate(), "Columns must be non-empty")
 }
 
 func TestConfigValidate_DuplicateMaterializedViewNames(t *testing.T) {
 	cfg := validConfig()
 	mv := MaterializedViewDef[map[string]any]{
-		Name: "v", KeyColumns: []string{"a"},
-		Of: func(map[string]any) ([]MVRow, error) { return nil, nil },
+		Name: "v", Columns: []string{"a"},
+		Of: func(map[string]any) ([][]string, error) { return nil, nil },
 	}
 	cfg.MaterializedViews = []MaterializedViewDef[map[string]any]{mv, mv}
 	requireErrContains(t, cfg.validate(), "duplicate Name")

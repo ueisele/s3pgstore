@@ -1112,36 +1112,28 @@ query to "live as of N" rather than "all up to N."
 
 ### MaterializedView
 
-For lookups by non-partition keys, declare a materialized view. Each
-MV is a PostgreSQL table holding the user-projected columns; rows
-are inserted in the same transaction as the file row.
+For lookups by non-partition keys, declare a materialized view.
+Each MV is a PostgreSQL table holding a user-projected column
+tuple; rows are inserted in the same transaction as the file
+row.
 
 ```go
 // Write side — declared in Config.MaterializedViews
 type MaterializedViewDef[T any] struct {
-    Name         string
-    KeyColumns   []string
-    ValueColumns []string  // optional; data carried alongside the key
+    Name    string
+    Columns []string
 
-    // Of emits zero or more rows per record. Each row's Key length
-    // must equal len(KeyColumns) and Value length must equal
-    // len(ValueColumns).
-    Of func(T) ([]MVRow, error)
-}
-
-type MVRow struct {
-    Key   []string
-    Value []string  // empty when ValueColumns is empty
+    // Of emits zero or more tuples per record. Each tuple's
+    // length must equal len(Columns).
+    Of func(T) ([][]string, error)
 }
 
 // Read side — bound at runtime via NewMaterializedView
-type MaterializedViewLookupDef[K comparable] struct {
-    Name         string
-    KeyColumns   []string
-    ValueColumns []string
+type MaterializedViewLookupDef[K any] struct {
+    Name    string
+    Columns []string
 
-    // From projects (KeyColumns + ValueColumns) values onto K.
-    // Optional; nil → reflection-based mapping.
+    // From projects the tuple values onto K. Required.
     From func(values []string) (K, error)
 }
 
@@ -1160,31 +1152,50 @@ Schema:
 
 ```sql
 CREATE TABLE s3pgstore_mv_<name> (
-    key_col1   TEXT NOT NULL,
-    key_col2   TEXT NOT NULL,
-    val_col1   TEXT,           -- only when ValueColumns non-empty
-    val_col2   TEXT,
-    PRIMARY KEY (key_col1, key_col2)
+    col1   TEXT NOT NULL,
+    col2   TEXT NOT NULL,
+    col3   TEXT NOT NULL,
+    PRIMARY KEY (col1, col2, col3)
 );
 ```
 
-Conflict policy is chosen by the MV's shape:
+Every column is part of the primary key. Conflict policy is
+uniform: `ON CONFLICT (col1, col2, col3) DO NOTHING`.
 
-- **No `ValueColumns`** (key-only MV) → `ON CONFLICT (key_cols) DO
-  NOTHING`. First write wins; idempotent.
-- **Has `ValueColumns`** → `ON CONFLICT (key_cols) DO UPDATE SET
-  val_col1 = EXCLUDED.val_col1, ...`. Last write wins.
+**Set-membership semantics.** An MV row's presence means "this
+tuple was observed by some Write." Two consequences operators
+build against:
 
-MV rows are self-contained: no foreign-key reference to
-`s3pgstore_files`. Queries against the MV table answer directly
-without reading parquet. Use the MV when you need fast lookups by
-non-partition keys; use the regular `Read` path when you need the
-full record.
+- **No false negatives.** Once a record emits a tuple, that
+  tuple is in the MV until an operator deletes it. The MV
+  faithfully records every column-tuple ever observed.
+- **False positives possible.** A tuple logically superseded by
+  a later record (per `EntityKeyOf`+`VersionOf` dedup on the
+  Read path) still has its MV row. Lookup returns the
+  historical set, not the current state.
 
-The MV must be declared up-front in `Config.MaterializedViews` so
-the catalog DDL can include its table. `NewMaterializedView` returns
-an error if the name doesn't match a declared MV, or if the
-declared schema doesn't match the actual table.
+The intended split:
+
+- **MV** — fast existence/set-membership lookups by columns
+  that don't appear in the partition key. "Has this tuple ever
+  been observed?" Cheap, conservative, append-only.
+- **Read path** — authoritative current state per entity. Filter
+  via the MV to narrow candidates, then `Read` to get the
+  current value (post-`VersionOf` dedup).
+
+This avoids the MVCC churn and out-of-order overwrite hazards of
+last-writer-wins MV updates: same tuple seen N times collapses
+to a single row via `DO NOTHING`, no tuple is ever overwritten,
+and concurrent writers within a partition produce the same
+final MV state regardless of commit ordering.
+
+MV rows are self-contained — no foreign-key reference to
+`s3pgstore_files`. Queries against the MV answer directly
+without reading parquet. The MV must be declared up-front in
+`Config.MaterializedViews` so the catalog DDL can include its
+table. `NewMaterializedView` returns an error if the name
+doesn't match a declared MV, or if the declared `Columns`
+don't match the actual table.
 
 ### ExtensionColumns
 
@@ -1408,12 +1419,14 @@ CREATE TABLE s3pgstore_pending_writes (
 );
 
 -- Per-MV tables (one per MaterializedViewDef in Config.MaterializedViews)
--- Example: KeyColumns = [sku_id, period_start], ValueColumns = [region]
-CREATE TABLE s3pgstore_mv_sku_period (
+-- Example: Columns = [sku_id, period_start, region]
+-- Every column is part of the PK; ON CONFLICT DO NOTHING gives
+-- set-membership semantics (no false negatives, idempotent).
+CREATE TABLE s3pgstore_mv_sku_period_region (
     sku_id        TEXT NOT NULL,
     period_start  TEXT NOT NULL,
-    region        TEXT,
-    PRIMARY KEY (sku_id, period_start)
+    region        TEXT NOT NULL,
+    PRIMARY KEY (sku_id, period_start, region)
 );
 ```
 
@@ -1598,23 +1611,16 @@ func WithLockTimeout(d time.Duration) LockOption
 func (s *Store[T]) LockPartition(ctx context.Context, partitionKey string, opts ...LockOption) error
 
 // MaterializedView
-type MVRow struct {
-    Key   []string
-    Value []string
-}
-
 type MaterializedViewDef[T any] struct {
-    Name         string
-    KeyColumns   []string
-    ValueColumns []string
-    Of           func(T) ([]MVRow, error)
+    Name    string
+    Columns []string
+    Of      func(T) ([][]string, error)
 }
 
-type MaterializedViewLookupDef[K comparable] struct {
-    Name         string
-    KeyColumns   []string
-    ValueColumns []string
-    From         func(values []string) (K, error)
+type MaterializedViewLookupDef[K any] struct {
+    Name    string
+    Columns []string
+    From    func(values []string) (K, error)
 }
 
 func NewMaterializedView[T, K any](store *Store[T], def MaterializedViewLookupDef[K]) (*MaterializedView[K], error)

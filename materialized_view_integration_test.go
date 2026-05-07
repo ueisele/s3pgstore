@@ -14,14 +14,18 @@ import (
 )
 
 type mvRec struct {
-	Customer string `parquet:"customer"`
-	JobID    string `parquet:"job_id"`
-	Status   string `parquet:"status"`
+	Customer     string `parquet:"customer"`
+	JobID        string `parquet:"job_id"`
+	SKU          string `parquet:"sku"`
+	ChargePeriod string `parquet:"charge_period"`
 }
 
-// newMVCfg builds a Config with one shaped MV (customer →
-// status) and one key-only MV (job_id index). The MV's Of
-// closures emit one row per record from each.
+// newMVCfg builds a Config with two MVs that exercise the
+// set-membership semantics:
+//
+//   - "customer_sku_period" — three-column tuple, the canonical
+//     "find customers using sku at period" use case.
+//   - "job_index" — single-column existence index.
 func newMVCfg(f *fixture) s3pgstore.Config[mvRec] {
 	return s3pgstore.Config[mvRec]{
 		Executor:          s3pgstore.NewPoolExecutor(f.Pool),
@@ -35,26 +39,27 @@ func newMVCfg(f *fixture) s3pgstore.Config[mvRec] {
 		},
 		MaterializedViews: []s3pgstore.MaterializedViewDef[mvRec]{
 			{
-				Name:         "customer_status",
-				KeyColumns:   []string{"customer"},
-				ValueColumns: []string{"status"},
-				Of: func(r mvRec) ([]s3pgstore.MVRow, error) {
-					return []s3pgstore.MVRow{
-						{Key: []string{r.Customer},
-							Value: []string{r.Status}},
+				Name: "customer_sku_period",
+				Columns: []string{
+					"customer", "sku", "charge_period",
+				},
+				Of: func(r mvRec) ([][]string, error) {
+					if r.SKU == "" || r.ChargePeriod == "" {
+						return nil, nil
+					}
+					return [][]string{
+						{r.Customer, r.SKU, r.ChargePeriod},
 					}, nil
 				},
 			},
 			{
-				Name:       "job_index",
-				KeyColumns: []string{"job_id"},
-				Of: func(r mvRec) ([]s3pgstore.MVRow, error) {
+				Name:    "job_index",
+				Columns: []string{"job_id"},
+				Of: func(r mvRec) ([][]string, error) {
 					if r.JobID == "" {
 						return nil, nil
 					}
-					return []s3pgstore.MVRow{
-						{Key: []string{r.JobID}},
-					}, nil
+					return [][]string{{r.JobID}}, nil
 				},
 			},
 		},
@@ -75,32 +80,30 @@ func newMVStore(t *testing.T, cfg s3pgstore.Config[mvRec]) *s3pgstore.Store[mvRe
 	return store
 }
 
-// TestMV_WriteInsertsRowsInSameTx writes one record and
-// verifies both MVs got the corresponding row. Reads back
-// via Lookup for the shaped MV; via direct SQL for the
-// key-only MV (the lookup constructor for empty K is
-// ergonomically clunky, so we verify via SQL).
-func TestMV_WriteInsertsRowsInSameTx(t *testing.T) {
+// TestMV_WriteInsertsTuplesInSameTx: one record produces one
+// tuple per declared MV. Verifies the multi-column MV via
+// Lookup and the single-column MV via direct count.
+func TestMV_WriteInsertsTuplesInSameTx(t *testing.T) {
 	f := newFixture(t)
 	store := newMVStore(t, newMVCfg(f))
 
 	rec := mvRec{
-		Customer: "alice",
-		JobID:    "job-42",
-		Status:   "active",
+		Customer:     "alice",
+		JobID:        "job-42",
+		SKU:          "compute",
+		ChargePeriod: "2026-03",
 	}
 	if _, err := store.Write(t.Context(), []mvRec{rec}); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 
-	// Shaped MV: customer → status.
+	// Multi-column MV: lookup via the SKU index.
 	mv, err := s3pgstore.NewMaterializedView(store,
 		s3pgstore.MaterializedViewLookupDef[string]{
-			Name:         "customer_status",
-			KeyColumns:   []string{"customer"},
-			ValueColumns: []string{"status"},
+			Name:    "customer_sku_period",
+			Columns: []string{"customer", "sku", "charge_period"},
 			From: func(values []string) (string, error) {
-				return values[0] + "=" + values[1], nil
+				return values[0], nil // project customer
 			},
 		})
 	if err != nil {
@@ -108,52 +111,97 @@ func TestMV_WriteInsertsRowsInSameTx(t *testing.T) {
 	}
 	got, err := mv.Lookup(t.Context(),
 		[]s3pgstore.PartitionFilter{
-			s3pgstore.Eq("customer", "alice"),
+			s3pgstore.Eq("sku", "compute"),
+			s3pgstore.Eq("charge_period", "2026-03"),
 		})
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
 	}
-	if len(got) != 1 || got[0] != "alice=active" {
-		t.Errorf("Lookup: got %v, want [alice=active]", got)
+	if len(got) != 1 || got[0] != "alice" {
+		t.Errorf("Lookup: got %v, want [alice]", got)
 	}
 
-	// Key-only MV: job_index.
-	var jobIDCount int
+	// Single-column MV via direct count.
+	var n int
 	if err := f.Pool.QueryRow(t.Context(),
 		`SELECT count(*) FROM "`+f.Schema+`"."s3pgstore_mv_job_index" `+
 			`WHERE "job_id" = $1`,
-		rec.JobID).Scan(&jobIDCount); err != nil {
+		rec.JobID).Scan(&n); err != nil {
 		t.Fatalf("count job_index: %v", err)
 	}
-	if jobIDCount != 1 {
+	if n != 1 {
 		t.Errorf("job_index rows for %q: got %d, want 1",
-			rec.JobID, jobIDCount)
+			rec.JobID, n)
 	}
 }
 
-// TestMV_ShapedConflictUpdates verifies the last-writer-wins
-// semantic: a second Write to the same key updates the
-// ValueColumns.
-func TestMV_ShapedConflictUpdates(t *testing.T) {
+// TestMV_DuplicateTupleIsNoOp: writing the same record twice
+// produces one MV row per declared MV. ON CONFLICT DO NOTHING
+// makes re-inserts of the same tuple idempotent — bounded
+// table size, no MVCC churn.
+func TestMV_DuplicateTupleIsNoOp(t *testing.T) {
 	f := newFixture(t)
 	store := newMVStore(t, newMVCfg(f))
 
-	if _, err := store.Write(t.Context(),
-		[]mvRec{{Customer: "alice", Status: "active"}}); err != nil {
-		t.Fatalf("Write 1: %v", err)
+	rec := mvRec{
+		Customer:     "alice",
+		JobID:        "job-stable",
+		SKU:          "compute",
+		ChargePeriod: "2026-03",
 	}
-	if _, err := store.Write(t.Context(),
-		[]mvRec{{Customer: "alice", Status: "suspended"}}); err != nil {
-		t.Fatalf("Write 2: %v", err)
+	for range 3 {
+		if _, err := store.Write(t.Context(),
+			[]mvRec{rec}); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+
+	for _, mv := range []string{
+		"s3pgstore_mv_customer_sku_period",
+		"s3pgstore_mv_job_index",
+	} {
+		var n int
+		if err := f.Pool.QueryRow(t.Context(),
+			`SELECT count(*) FROM "`+f.Schema+`"."`+mv+`"`,
+		).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", mv, n)
+		}
+		if n != 1 {
+			t.Errorf("%s: got %d rows, want 1 (idempotent)",
+				mv, n)
+		}
+	}
+}
+
+// TestMV_DistinctTuplesAccumulate: the same key value with
+// different tail-column values produces multiple rows. This is
+// the load-bearing semantic for the "false positives OK, false
+// negatives never" contract — every distinct tuple ever
+// observed is preserved.
+func TestMV_DistinctTuplesAccumulate(t *testing.T) {
+	f := newFixture(t)
+	store := newMVStore(t, newMVCfg(f))
+
+	// Same customer, different (sku, period) pairs across
+	// writes.
+	writes := []mvRec{
+		{Customer: "alice", SKU: "compute", ChargePeriod: "2026-03"},
+		{Customer: "alice", SKU: "storage", ChargePeriod: "2026-03"},
+		{Customer: "alice", SKU: "compute", ChargePeriod: "2026-04"},
+	}
+	for _, r := range writes {
+		if _, err := store.Write(t.Context(),
+			[]mvRec{r}); err != nil {
+			t.Fatalf("Write %+v: %v", r, err)
+		}
 	}
 
 	mv, err := s3pgstore.NewMaterializedView(store,
-		s3pgstore.MaterializedViewLookupDef[string]{
-			Name:         "customer_status",
-			KeyColumns:   []string{"customer"},
-			ValueColumns: []string{"status"},
-			From: func(values []string) (string, error) {
-				return values[1], nil
+		s3pgstore.MaterializedViewLookupDef[[3]string]{
+			Name:    "customer_sku_period",
+			Columns: []string{"customer", "sku", "charge_period"},
+			From: func(v []string) ([3]string, error) {
+				return [3]string{v[0], v[1], v[2]}, nil
 			},
 		})
 	if err != nil {
@@ -166,34 +214,9 @@ func TestMV_ShapedConflictUpdates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
 	}
-	if len(got) != 1 || got[0] != "suspended" {
-		t.Errorf("expected last-write-wins=suspended, got %v", got)
-	}
-}
-
-// TestMV_KeyOnlyConflictDoesNothing verifies the first-writer-
-// wins semantic: a second Write with the same key doesn't
-// touch the row. Test exposes this by writing twice and
-// counting rows in the key-only MV.
-func TestMV_KeyOnlyConflictDoesNothing(t *testing.T) {
-	f := newFixture(t)
-	store := newMVStore(t, newMVCfg(f))
-
-	for range 3 {
-		if _, err := store.Write(t.Context(),
-			[]mvRec{{Customer: "alice",
-				JobID: "job-stable", Status: "x"}}); err != nil {
-			t.Fatalf("Write: %v", err)
-		}
-	}
-	var n int
-	if err := f.Pool.QueryRow(t.Context(),
-		`SELECT count(*) FROM "`+f.Schema+`"."s3pgstore_mv_job_index"`,
-	).Scan(&n); err != nil {
-		t.Fatalf("count: %v", err)
-	}
-	if n != 1 {
-		t.Errorf("key-only MV: got %d rows, want 1 (idempotent)", n)
+	if len(got) != 3 {
+		t.Errorf("got %d tuples, want 3 (one per distinct "+
+			"(sku, period) combination)", len(got))
 	}
 }
 
@@ -212,7 +235,10 @@ func TestMV_RollbackPreservesConsistency(t *testing.T) {
 	ctx := s3pgstore.WithTx(t.Context(), tx)
 
 	if _, err := store.Write(ctx,
-		[]mvRec{{Customer: "alice", Status: "active"}}); err != nil {
+		[]mvRec{{
+			Customer: "alice", SKU: "compute",
+			ChargePeriod: "2026-03",
+		}}); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 
@@ -227,7 +253,7 @@ func TestMV_RollbackPreservesConsistency(t *testing.T) {
 		t.Fatalf("count files: %v", err)
 	}
 	if err := f.Pool.QueryRow(t.Context(),
-		`SELECT count(*) FROM "`+f.Schema+`"."s3pgstore_mv_customer_status"`,
+		`SELECT count(*) FROM "`+f.Schema+`"."s3pgstore_mv_customer_sku_period"`,
 	).Scan(&nMV); err != nil {
 		t.Fatalf("count MV: %v", err)
 	}
@@ -245,8 +271,8 @@ func TestNewMaterializedView_RejectsUndeclaredName(t *testing.T) {
 
 	_, err := s3pgstore.NewMaterializedView(store,
 		s3pgstore.MaterializedViewLookupDef[string]{
-			Name:       "no_such_mv",
-			KeyColumns: []string{"x"},
+			Name:    "no_such_mv",
+			Columns: []string{"x"},
 			From: func([]string) (string, error) {
 				return "", nil
 			},
@@ -257,24 +283,23 @@ func TestNewMaterializedView_RejectsUndeclaredName(t *testing.T) {
 	}
 }
 
-// TestNewMaterializedView_RejectsKeyColumnsMismatch: lookup
-// def's KeyColumns must match the declared MV.
-func TestNewMaterializedView_RejectsKeyColumnsMismatch(t *testing.T) {
+// TestNewMaterializedView_RejectsColumnsMismatch: lookup def's
+// Columns must match the declared MV's Columns verbatim.
+func TestNewMaterializedView_RejectsColumnsMismatch(t *testing.T) {
 	f := newFixture(t)
 	store := newMVStore(t, newMVCfg(f))
 
 	_, err := s3pgstore.NewMaterializedView(store,
 		s3pgstore.MaterializedViewLookupDef[string]{
-			Name:         "customer_status",
-			KeyColumns:   []string{"unrelated"}, // wrong column
-			ValueColumns: []string{"status"},
+			Name:    "customer_sku_period",
+			Columns: []string{"customer", "wrong_col", "charge_period"},
 			From: func([]string) (string, error) {
 				return "", nil
 			},
 		})
 	if err == nil ||
-		!strings.Contains(err.Error(), "KeyColumns mismatch") {
-		t.Fatalf("expected KeyColumns error, got %v", err)
+		!strings.Contains(err.Error(), "Columns mismatch") {
+		t.Fatalf("expected Columns mismatch error, got %v", err)
 	}
 }
 
@@ -286,9 +311,8 @@ func TestNewMaterializedView_RejectsNilFrom(t *testing.T) {
 
 	_, err := s3pgstore.NewMaterializedView(store,
 		s3pgstore.MaterializedViewLookupDef[string]{
-			Name:         "customer_status",
-			KeyColumns:   []string{"customer"},
-			ValueColumns: []string{"status"},
+			Name:    "customer_sku_period",
+			Columns: []string{"customer", "sku", "charge_period"},
 		})
 	if err == nil ||
 		!strings.Contains(err.Error(), "From is required") {
@@ -303,16 +327,18 @@ func TestMV_LookupPropagatesFromError(t *testing.T) {
 	store := newMVStore(t, newMVCfg(f))
 
 	if _, err := store.Write(t.Context(),
-		[]mvRec{{Customer: "alice", Status: "x"}}); err != nil {
+		[]mvRec{{
+			Customer: "alice", SKU: "compute",
+			ChargePeriod: "2026-03",
+		}}); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 
 	sentinel := errors.New("from-failure")
 	mv, err := s3pgstore.NewMaterializedView(store,
 		s3pgstore.MaterializedViewLookupDef[string]{
-			Name:         "customer_status",
-			KeyColumns:   []string{"customer"},
-			ValueColumns: []string{"status"},
+			Name:    "customer_sku_period",
+			Columns: []string{"customer", "sku", "charge_period"},
 			From: func([]string) (string, error) {
 				return "", sentinel
 			},
@@ -329,23 +355,26 @@ func TestMV_LookupPropagatesFromError(t *testing.T) {
 	}
 }
 
-// TestMV_LookupFiltersByMVColumn: filters reference MV columns
-// (not part_<n>). Verify the unknown-column path errors.
-func TestMV_LookupFiltersByMVColumn(t *testing.T) {
+// TestMV_LookupFiltersByAnyColumn: filters reference any MV
+// column. Verify the unknown-column path errors.
+func TestMV_LookupFiltersByAnyColumn(t *testing.T) {
 	f := newFixture(t)
 	store := newMVStore(t, newMVCfg(f))
 
-	if _, err := store.Write(t.Context(),
-		[]mvRec{{Customer: "alice", Status: "x"},
-			{Customer: "bob", Status: "y"}}); err != nil {
-		t.Fatalf("Write: %v", err)
+	for _, r := range []mvRec{
+		{Customer: "alice", SKU: "compute", ChargePeriod: "2026-03"},
+		{Customer: "bob", SKU: "storage", ChargePeriod: "2026-03"},
+	} {
+		if _, err := store.Write(t.Context(),
+			[]mvRec{r}); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
 	}
 
 	mv, err := s3pgstore.NewMaterializedView(store,
 		s3pgstore.MaterializedViewLookupDef[string]{
-			Name:         "customer_status",
-			KeyColumns:   []string{"customer"},
-			ValueColumns: []string{"status"},
+			Name:    "customer_sku_period",
+			Columns: []string{"customer", "sku", "charge_period"},
 			From: func(values []string) (string, error) {
 				return values[0], nil
 			},
@@ -354,12 +383,11 @@ func TestMV_LookupFiltersByMVColumn(t *testing.T) {
 		t.Fatalf("NewMaterializedView: %v", err)
 	}
 
-	// Filter by status (a value column) — should work since the
-	// resolver accepts any column declared in KeyColumns +
-	// ValueColumns.
+	// Filter by sku — non-leading column. Should work since the
+	// resolver accepts any declared column.
 	got, err := mv.Lookup(t.Context(),
 		[]s3pgstore.PartitionFilter{
-			s3pgstore.Eq("status", "x"),
+			s3pgstore.Eq("sku", "compute"),
 		})
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
@@ -387,16 +415,19 @@ func TestMV_EmptyFiltersReturnsAllRows(t *testing.T) {
 
 	for _, c := range []string{"alice", "bob", "carol"} {
 		if _, err := store.Write(t.Context(),
-			[]mvRec{{Customer: c, Status: "x"}}); err != nil {
+			[]mvRec{{
+				Customer:     c,
+				SKU:          "compute",
+				ChargePeriod: "2026-03",
+			}}); err != nil {
 			t.Fatalf("Write: %v", err)
 		}
 	}
 
 	mv, err := s3pgstore.NewMaterializedView(store,
 		s3pgstore.MaterializedViewLookupDef[string]{
-			Name:         "customer_status",
-			KeyColumns:   []string{"customer"},
-			ValueColumns: []string{"status"},
+			Name:    "customer_sku_period",
+			Columns: []string{"customer", "sku", "charge_period"},
 			From: func(values []string) (string, error) {
 				return values[0], nil
 			},
@@ -421,13 +452,16 @@ func TestMV_OfErrorAbortsWrite(t *testing.T) {
 	f := newFixture(t)
 	cfg := newMVCfg(f)
 	sentinel := errors.New("of-failure")
-	cfg.MaterializedViews[0].Of = func(mvRec) ([]s3pgstore.MVRow, error) {
+	cfg.MaterializedViews[0].Of = func(mvRec) ([][]string, error) {
 		return nil, sentinel
 	}
 	store := newMVStore(t, cfg)
 
 	_, err := store.Write(t.Context(),
-		[]mvRec{{Customer: "alice", Status: "x"}})
+		[]mvRec{{
+			Customer: "alice", SKU: "compute",
+			ChargePeriod: "2026-03",
+		}})
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("expected sentinel from Of, got %v", err)
 	}
@@ -440,12 +474,34 @@ func TestMV_OfErrorAbortsWrite(t *testing.T) {
 		t.Fatalf("count files: %v", err)
 	}
 	if err := f.Pool.QueryRow(t.Context(),
-		`SELECT count(*) FROM "`+f.Schema+`"."s3pgstore_mv_customer_status"`,
+		`SELECT count(*) FROM "`+f.Schema+`"."s3pgstore_mv_customer_sku_period"`,
 	).Scan(&nMV); err != nil {
 		t.Fatalf("count MV: %v", err)
 	}
 	if nFiles != 0 || nMV != 0 {
 		t.Errorf("after Of failure: files=%d mv=%d (want 0/0)",
 			nFiles, nMV)
+	}
+}
+
+// TestMV_TupleShapeMismatchAbortsWrite: an Of closure that
+// emits a tuple with the wrong column count fails the Write
+// before the catalog tx opens.
+func TestMV_TupleShapeMismatchAbortsWrite(t *testing.T) {
+	f := newFixture(t)
+	cfg := newMVCfg(f)
+	cfg.MaterializedViews[0].Of = func(mvRec) ([][]string, error) {
+		return [][]string{{"only-one-value"}}, nil // wants 3
+	}
+	store := newMVStore(t, cfg)
+
+	_, err := store.Write(t.Context(),
+		[]mvRec{{
+			Customer: "alice", SKU: "compute",
+			ChargePeriod: "2026-03",
+		}})
+	if err == nil ||
+		!strings.Contains(err.Error(), "tuple len") {
+		t.Errorf("got %v, want tuple-len mismatch error", err)
 	}
 }

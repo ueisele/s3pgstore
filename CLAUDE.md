@@ -98,18 +98,36 @@ must preserve them — even when the change appears unrelated.
   catalog writes (no direct `pool.Begin`, no `pgxpool.Pool.Exec`
   on a catalog table) and must not assume the executor always
   opens its own tx.
-- **MaterializedView is self-contained; no FK to s3pgstore_files**
-  — MV rows hold `(KeyColumns..., ValueColumns...)` with a primary
-  key on `KeyColumns`. Conflict policy is determined by shape:
-  `ON CONFLICT DO NOTHING` when `ValueColumns` is empty
-  (key-only MV; first-write-wins, idempotent),
-  `ON CONFLICT DO UPDATE` when `ValueColumns` is non-empty
-  (last-write-wins). MV row insertion happens in the same
-  transaction as the catalog row, so consistency is automatic.
+- **MaterializedView is a set-membership index, no FK to
+  s3pgstore_files** — MV rows hold the column tuple declared as
+  `Config.MaterializedViews[i].Columns`; the primary key is the
+  full tuple. Conflict policy is uniform: `ON CONFLICT (...) DO
+  NOTHING` — writing the same tuple twice is idempotent; writing
+  a tuple that differs in any column is a new row. MV row
+  insertion happens in the same transaction as the catalog row,
+  so consistency is automatic.
+
+  Two semantic consequences operators rely on:
+
+  1. **No false negatives.** Once a record is written that emits
+     a tuple, that tuple is in the MV until an operator deletes
+     it. The MV faithfully records every column-tuple ever
+     observed.
+  2. **False positives possible.** A tuple logically superseded
+     by a later record (per `EntityKeyOf+VersionOf` dedup on the
+     Read path) still has its MV row. Lookup returns the
+     historical set, not the current state.
+
+  Operators wanting "current value per key" go through the Read
+  path, which dedups records via `VersionOf`. The MV is the
+  existence index; Read is the authoritative current state.
+
   Refactors must not add a FK to `file_id`, must not change the
-  conflict policy without changing the MV shape semantics, and
-  must not insert MV rows in a separate transaction from the
-  catalog write.
+  conflict policy from `DO NOTHING` (last-write-wins semantics
+  silently lose data under concurrent writers without OCC, and
+  reintroduce the MVCC-churn / out-of-order overwrite hazards
+  the all-PK design eliminates), and must not insert MV rows in
+  a separate transaction from the catalog write.
 - **ExtensionColumns are typed and declared up-front** —
   `Config.ExtensionColumns` declares each column's name and SQL
   type. `WithMetadata` validates that every key is declared and

@@ -25,14 +25,13 @@ type DDLExt struct {
 }
 
 // DDLMV describes one materialized-view table for DDL
-// rendering. Each entry produces an s3pgstore_mv_<name> table.
-// KeyColumns and ValueColumns hold simple identifiers; both
-// land as TEXT columns (the library writes string-form values
-// through MaterializedViewDef.Of).
+// rendering. Each entry produces an s3pgstore_mv_<name> table
+// whose primary key is the full column tuple (set-membership
+// semantics; ON CONFLICT DO NOTHING). Columns hold simple
+// identifiers; all land as TEXT NOT NULL.
 type DDLMV struct {
-	Name         string
-	KeyColumns   []string
-	ValueColumns []string
+	Name    string
+	Columns []string
 }
 
 // DDLInput is everything RenderAll needs. Callers pass a
@@ -204,18 +203,12 @@ func renderMV(sb *strings.Builder, names Names, mv DDLMV) {
 	tbl := names.MV(mv.Name)
 	fmt.Fprintf(sb, "CREATE TABLE IF NOT EXISTS %s (\n", tbl)
 
-	lines := make([]string, 0, len(mv.KeyColumns)+len(mv.ValueColumns)+1)
-	for _, kc := range mv.KeyColumns {
-		lines = append(lines, fmt.Sprintf("    %s TEXT NOT NULL",
-			pgx.Identifier{kc}.Sanitize()))
-	}
-	for _, vc := range mv.ValueColumns {
-		lines = append(lines, fmt.Sprintf("    %s TEXT",
-			pgx.Identifier{vc}.Sanitize()))
-	}
-	quoted := make([]string, len(mv.KeyColumns))
-	for i, kc := range mv.KeyColumns {
-		quoted[i] = pgx.Identifier{kc}.Sanitize()
+	lines := make([]string, 0, len(mv.Columns)+1)
+	quoted := make([]string, len(mv.Columns))
+	for i, c := range mv.Columns {
+		quoted[i] = pgx.Identifier{c}.Sanitize()
+		lines = append(lines,
+			fmt.Sprintf("    %s TEXT NOT NULL", quoted[i]))
 	}
 	lines = append(lines,
 		fmt.Sprintf("    PRIMARY KEY (%s)", strings.Join(quoted, ", ")))

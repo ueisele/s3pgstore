@@ -91,17 +91,16 @@ func TestSchemaManager_WithExtensionsAndMVs(t *testing.T) {
 	}
 	cfg.MaterializedViews = []s3pgstore.MaterializedViewDef[smokeRecord]{
 		{
-			Name:       "by_customer",
-			KeyColumns: []string{"customer_id"},
-			Of: func(smokeRecord) ([]s3pgstore.MVRow, error) {
+			Name:    "by_customer",
+			Columns: []string{"customer_id"},
+			Of: func(smokeRecord) ([][]string, error) {
 				return nil, nil
 			},
 		},
 		{
-			Name:         "by_period_customer",
-			KeyColumns:   []string{"period", "customer_id"},
-			ValueColumns: []string{"region"},
-			Of: func(smokeRecord) ([]s3pgstore.MVRow, error) {
+			Name:    "by_period_customer_region",
+			Columns: []string{"period", "customer_id", "region"},
+			Of: func(smokeRecord) ([][]string, error) {
 				return nil, nil
 			},
 		},

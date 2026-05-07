@@ -58,9 +58,9 @@ func TestRenderDDL_MaterializedViews(t *testing.T) {
 	cfg := validConfig()
 	cfg.MaterializedViews = []MaterializedViewDef[map[string]any]{
 		{
-			Name:       "by_sku",
-			KeyColumns: []string{"sku_id"},
-			Of:         func(map[string]any) ([]MVRow, error) { return nil, nil },
+			Name:    "by_sku",
+			Columns: []string{"sku_id"},
+			Of:      func(map[string]any) ([][]string, error) { return nil, nil },
 		},
 	}
 	out, err := RenderDDL(cfg)

@@ -126,31 +126,22 @@ func (n Names) PartitionUpdateOCCSQL() string {
 		n.Partitions())
 }
 
-// MVInsertSQL returns the INSERT ... ON CONFLICT statement for
-// one row of a materialized-view table. Conflict policy is
-// chosen by shape:
+// MVInsertSQL returns the INSERT ... ON CONFLICT DO NOTHING
+// statement for one tuple of a materialized-view table. Every
+// column is part of the primary key (set-membership semantics)
+// so a re-insert of the same tuple is a no-op; a tuple that
+// differs in any column is a new row.
 //
-//   - len(valueColumns) == 0 → ON CONFLICT (key) DO NOTHING.
-//     Key-only MV; first writer wins; idempotent.
-//   - len(valueColumns) > 0  → ON CONFLICT (key) DO UPDATE SET
-//     val = EXCLUDED.val, ... Last writer wins.
-//
-// Positional parameters are ($1...$N) covering keyColumns
-// followed by valueColumns in declaration order.
-//
-// Identifiers are quoted via pgx.Identifier.Sanitize so reserved
-// words / case-sensitive names round-trip correctly. The
-// configuration validator already rejects identifiers that
-// would need escaping; this is belt-and-suspenders.
-func (n Names) MVInsertSQL(mvName string, keyColumns, valueColumns []string) string {
+// Positional parameters are ($1...$N) covering columns in
+// declaration order. Identifiers are quoted via
+// pgx.Identifier.Sanitize so reserved words / case-sensitive
+// names round-trip correctly.
+func (n Names) MVInsertSQL(mvName string, columns []string) string {
 	tbl := n.MV(mvName)
 
-	cols := make([]string, 0, len(keyColumns)+len(valueColumns))
-	for _, c := range keyColumns {
-		cols = append(cols, pgx.Identifier{c}.Sanitize())
-	}
-	for _, c := range valueColumns {
-		cols = append(cols, pgx.Identifier{c}.Sanitize())
+	cols := make([]string, len(columns))
+	for i, c := range columns {
+		cols[i] = pgx.Identifier{c}.Sanitize()
 	}
 
 	placeholders := make([]string, len(cols))
@@ -158,33 +149,13 @@ func (n Names) MVInsertSQL(mvName string, keyColumns, valueColumns []string) str
 		placeholders[i] = fmt.Sprintf("$%d", i+1)
 	}
 
-	keyList := make([]string, len(keyColumns))
-	for i, c := range keyColumns {
-		keyList[i] = pgx.Identifier{c}.Sanitize()
-	}
-
-	var conflict string
-	if len(valueColumns) == 0 {
-		conflict = fmt.Sprintf(
-			"ON CONFLICT (%s) DO NOTHING",
-			strings.Join(keyList, ", "))
-	} else {
-		assigns := make([]string, len(valueColumns))
-		for i, c := range valueColumns {
-			q := pgx.Identifier{c}.Sanitize()
-			assigns[i] = fmt.Sprintf("%s = EXCLUDED.%s", q, q)
-		}
-		conflict = fmt.Sprintf(
-			"ON CONFLICT (%s) DO UPDATE SET %s",
-			strings.Join(keyList, ", "),
-			strings.Join(assigns, ", "))
-	}
-
 	return fmt.Sprintf(
-		"INSERT INTO %s (%s) VALUES (%s) %s",
-		tbl, strings.Join(cols, ", "),
+		"INSERT INTO %s (%s) VALUES (%s) "+
+			"ON CONFLICT (%s) DO NOTHING",
+		tbl,
+		strings.Join(cols, ", "),
 		strings.Join(placeholders, ", "),
-		conflict)
+		strings.Join(cols, ", "))
 }
 
 // FilesInsertSQL returns the INSERT statement for the catalog

@@ -50,9 +50,8 @@ func ddlInputFromConfig[T any](cfg Config[T]) catalog.DDLInput {
 	mvs := make([]catalog.DDLMV, len(r.MaterializedViews))
 	for i, mv := range r.MaterializedViews {
 		mvs[i] = catalog.DDLMV{
-			Name:         mv.Name,
-			KeyColumns:   mv.KeyColumns,
-			ValueColumns: mv.ValueColumns,
+			Name:    mv.Name,
+			Columns: mv.Columns,
 		}
 	}
 
@@ -245,11 +244,9 @@ func expectedSchema[T any](r Config[T]) expectedSchemaSet {
 		},
 	}
 	for _, mv := range r.MaterializedViews {
-		mvCols := append(append([]string{}, mv.KeyColumns...),
-			mv.ValueColumns...)
 		out.tables = append(out.tables, expectedTable{
 			name:    names.MVBare(mv.Name),
-			columns: mvCols,
+			columns: append([]string{}, mv.Columns...),
 		})
 	}
 	return out

@@ -46,24 +46,35 @@ type ExtensionColumn struct {
 	Type string // PostgreSQL type, e.g. "TEXT", "TIMESTAMPTZ", "UUID"
 }
 
-// MVRow is one materialized-view row produced by a
-// MaterializedViewDef.Of closure. Key length must equal
-// len(KeyColumns); Value length must equal len(ValueColumns).
-type MVRow struct {
-	Key   []string
-	Value []string
-}
-
 // MaterializedViewDef declares an MV for the write path. Each
 // declared MV becomes an s3pgstore_mv_<name> table at schema
-// render time. The Of closure emits zero or more rows per
-// record; rows are inserted in the same transaction as the
+// render time. The Of closure emits zero or more tuples per
+// record; tuples are inserted in the same transaction as the
 // catalog row, so MV state stays consistent with file state.
+//
+// MVs in v2.0 are set-membership indexes: every column forms
+// the primary key, conflicts DO NOTHING. Two semantic
+// consequences:
+//
+//   - **No false negatives.** Once a record is written that
+//     emits a tuple, that tuple is in the MV until an operator
+//     deletes it. The MV faithfully records every (Columns...)
+//     combination ever observed.
+//   - **False positives possible.** A tuple that was logically
+//     superseded by a later record (per EntityKeyOf+VersionOf
+//     dedup on the Read path) still has its MV row. Lookup
+//     returns the historical set, not the current state.
+//
+// Operators needing "current value per key" use the Read path,
+// which dedups records via VersionOf. The MV is the existence
+// index; Read is the authoritative current state.
+//
+// Each emitted tuple's length must equal len(Columns); shape
+// errors surface at write time before the catalog tx opens.
 type MaterializedViewDef[T any] struct {
-	Name         string
-	KeyColumns   []string
-	ValueColumns []string
-	Of           func(T) ([]MVRow, error)
+	Name    string
+	Columns []string
+	Of      func(T) ([][]string, error)
 }
 
 // Config holds everything s3pgstore needs to construct a
@@ -202,25 +213,28 @@ func (c Config[T]) validate() error {
 			add("MaterializedViews[%d].Name %q is not a valid identifier "+
 				"(must match %s, max 30 chars)", i, mv.Name, identRegexSrc)
 		}
-		if len(mv.KeyColumns) == 0 {
-			add("MaterializedViews[%d] (%q): KeyColumns must be non-empty",
+		if len(mv.Columns) == 0 {
+			add("MaterializedViews[%d] (%q): Columns must be non-empty",
 				i, mv.Name)
 		}
 		if mv.Of == nil {
 			add("MaterializedViews[%d] (%q): Of is required",
 				i, mv.Name)
 		}
-		for j, kc := range mv.KeyColumns {
-			if !validIdent(kc) {
-				add("MaterializedViews[%d].KeyColumns[%d] %q is not a "+
-					"valid identifier", i, j, kc)
+		for j, c := range mv.Columns {
+			if !validIdent(c) {
+				add("MaterializedViews[%d].Columns[%d] %q is not a "+
+					"valid identifier", i, j, c)
 			}
 		}
-		for j, vc := range mv.ValueColumns {
-			if !validIdent(vc) {
-				add("MaterializedViews[%d].ValueColumns[%d] %q is not a "+
-					"valid identifier", i, j, vc)
+		seenCol := make(map[string]struct{}, len(mv.Columns))
+		for _, c := range mv.Columns {
+			k := strings.ToLower(c)
+			if _, dup := seenCol[k]; dup {
+				add("MaterializedViews[%d] (%q): duplicate Column %q",
+					i, mv.Name, c)
 			}
+			seenCol[k] = struct{}{}
 		}
 	}
 	seenMV := make(map[string]struct{}, len(c.MaterializedViews))

@@ -65,12 +65,12 @@ func TestRenderAll_ExtensionColumns(t *testing.T) {
 	mustContain(t, out, "ext_tenant_id         UUID")
 }
 
-func TestRenderAll_MVKeyOnly(t *testing.T) {
+func TestRenderAll_MVSingleColumn(t *testing.T) {
 	in := DDLInput{
 		Names: NewNames("public", "s3pgstore_"),
 		Parts: []DDLPart{{Name: "period"}},
 		MVs: []DDLMV{
-			{Name: "by_sku", KeyColumns: []string{"sku_id"}},
+			{Name: "by_sku", Columns: []string{"sku_id"}},
 		},
 	}
 	out, err := RenderAll(in)
@@ -83,15 +83,14 @@ func TestRenderAll_MVKeyOnly(t *testing.T) {
 	mustContain(t, out, `PRIMARY KEY ("sku_id")`)
 }
 
-func TestRenderAll_MVKeyAndValue(t *testing.T) {
+func TestRenderAll_MVMultiColumn(t *testing.T) {
 	in := DDLInput{
 		Names: NewNames("public", "s3pgstore_"),
 		Parts: []DDLPart{{Name: "period"}},
 		MVs: []DDLMV{
 			{
-				Name:         "sku_period",
-				KeyColumns:   []string{"sku_id", "period_start"},
-				ValueColumns: []string{"region"},
+				Name:    "sku_period_region",
+				Columns: []string{"sku_id", "period_start", "region"},
 			},
 		},
 	}
@@ -100,11 +99,12 @@ func TestRenderAll_MVKeyAndValue(t *testing.T) {
 		t.Fatalf("RenderAll: %v", err)
 	}
 	mustContain(t, out,
-		`CREATE TABLE IF NOT EXISTS "public"."s3pgstore_mv_sku_period"`)
+		`CREATE TABLE IF NOT EXISTS "public"."s3pgstore_mv_sku_period_region"`)
 	mustContain(t, out, `"sku_id" TEXT NOT NULL,`)
 	mustContain(t, out, `"period_start" TEXT NOT NULL,`)
-	mustContain(t, out, `"region" TEXT,`)
-	mustContain(t, out, `PRIMARY KEY ("sku_id", "period_start")`)
+	mustContain(t, out, `"region" TEXT NOT NULL,`)
+	mustContain(t, out,
+		`PRIMARY KEY ("sku_id", "period_start", "region")`)
 }
 
 func TestRenderAll_DeterministicOutput(t *testing.T) {
@@ -116,8 +116,8 @@ func TestRenderAll_DeterministicOutput(t *testing.T) {
 			{Name: "tenant_id", Type: "UUID"},
 		},
 		MVs: []DDLMV{
-			{Name: "v1", KeyColumns: []string{"a"}},
-			{Name: "v2", KeyColumns: []string{"b"}, ValueColumns: []string{"c"}},
+			{Name: "v1", Columns: []string{"a"}},
+			{Name: "v2", Columns: []string{"b", "c"}},
 		},
 	}
 	a, err := RenderAll(in)

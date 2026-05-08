@@ -239,6 +239,18 @@ func (s *Store[T]) resolveMVRows(records []T) ([]mvWriteRows, error) {
 	return out, nil
 }
 
+// mvInsertChunkSize bounds how many tuples flow into a single
+// UNNEST INSERT. Chosen well above any realistic single-Write
+// MV row count so the chunk loop is a no-op for normal traffic;
+// it kicks in only for bulk-import-class workloads where the
+// per-INSERT working set would otherwise stress PostgreSQL's
+// work_mem and inflate wrapping-tx duration / replication lag.
+//
+// Hardcoded because nobody wants another knob to tune; if a
+// user-provided workload ever needs a different value we can
+// promote it to Config.
+const mvInsertChunkSize = 50_000
+
 // insertMVRows runs INSERT ... ON CONFLICT DO NOTHING for every
 // MV tuple resolved by resolveMVRows. Called inside the catalog
 // tx so MV state stays consistent with file state under both
@@ -249,9 +261,16 @@ func (s *Store[T]) resolveMVRows(records []T) ([]mvWriteRows, error) {
 // conflict path collapse no-op writes without a per-row IS
 // DISTINCT FROM check.
 //
-// Empty rows slice is a no-op — the SQL is built per tuple, so
-// an MV that emitted nothing for this batch produces no
-// statements.
+// All N tuples for a given MV go through one UNNEST INSERT —
+// row-major mv.rows is transposed to one text[] per column and
+// passed as positional args. PostgreSQL's plan cache hits
+// because the SQL is fixed regardless of row count.
+//
+// For very large N the work splits into chunks of
+// mvInsertChunkSize so a single statement's working set stays
+// bounded; in normal workloads N never exceeds the chunk size
+// and the loop runs exactly once per MV. Empty rows slice is a
+// no-op.
 func (s *Store[T]) insertMVRows(
 	ctx context.Context, d DBTX, mvs []mvWriteRows,
 ) error {
@@ -260,14 +279,22 @@ func (s *Store[T]) insertMVRows(
 			continue
 		}
 		insertSQL := s.sql.mvInserts[mv.name]
-		for i, r := range mv.rows {
-			args := make([]any, len(r))
-			for j, v := range r {
-				args[j] = v
+		for start := 0; start < len(mv.rows); start += mvInsertChunkSize {
+			end := min(start+mvInsertChunkSize, len(mv.rows))
+			chunk := mv.rows[start:end]
+			// Transpose [N rows][K cols] → K column arrays of
+			// len N to feed unnest($1::text[], $2::text[], ...).
+			args := make([]any, len(mv.columns))
+			for j := range mv.columns {
+				col := make([]string, len(chunk))
+				for i, r := range chunk {
+					col[i] = r[j]
+				}
+				args[j] = col
 			}
 			if _, err := d.Exec(ctx, insertSQL, args...); err != nil {
-				return fmt.Errorf("MV %q row %d: %w",
-					mv.name, i, err)
+				return fmt.Errorf("MV %q (rows %d-%d of %d): %w",
+					mv.name, start, end, len(mv.rows), err)
 			}
 		}
 	}

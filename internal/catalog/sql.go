@@ -129,35 +129,45 @@ func (n Names) PartitionUpdateOCCSQL() string {
 }
 
 // MVInsertSQL returns the INSERT ... ON CONFLICT DO NOTHING
-// statement for one tuple of a materialized-view table. Every
-// column is part of the primary key (set-membership semantics)
-// so a re-insert of the same tuple is a no-op; a tuple that
-// differs in any column is a new row.
+// statement for a materialized-view table. Every column is part
+// of the primary key (set-membership semantics), so a re-insert
+// of the same tuple is a no-op; a tuple that differs in any
+// column is a new row.
 //
-// Positional parameters are ($1...$N) covering columns in
-// declaration order. Identifiers are quoted via
-// pgx.Identifier.Sanitize so reserved words / case-sensitive
-// names round-trip correctly.
+// Shape is UNNEST-based so one prepared statement covers an
+// arbitrary number of rows without varying its SQL text — a
+// single INSERT replaces the per-row round trips the writer
+// would otherwise issue. Each column accepts a text[] array;
+// PostgreSQL coerces text → declared type per column (all MV
+// columns are TEXT NOT NULL per the catalog DDL, so the
+// coercion is the identity).
+//
+// Parameters are ($1::text[]...$N::text[]) covering columns in
+// declaration order; each array's length is the row count, and
+// the i-th element of every array forms the i-th tuple.
+// Identifiers are quoted via pgx.Identifier.Sanitize so
+// reserved words / case-sensitive names round-trip correctly.
+//
+// Duplicate tuples within the input arrays are handled by ON
+// CONFLICT DO NOTHING — the first occurrence inserts and any
+// subsequent duplicates (whether vs an existing table row or a
+// previously-inserted row in the same statement) are skipped.
 func (n Names) MVInsertSQL(mvName string, columns []string) string {
 	tbl := n.MV(mvName)
 
 	cols := make([]string, len(columns))
+	arrParams := make([]string, len(columns))
 	for i, c := range columns {
 		cols[i] = pgx.Identifier{c}.Sanitize()
+		arrParams[i] = fmt.Sprintf("$%d::text[]", i+1)
 	}
-
-	placeholders := make([]string, len(cols))
-	for i := range cols {
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
-	}
+	colList := strings.Join(cols, ", ")
 
 	return fmt.Sprintf(
-		"INSERT INTO %s (%s) VALUES (%s) "+
+		"INSERT INTO %s (%s) "+
+			"SELECT * FROM unnest(%s) "+
 			"ON CONFLICT (%s) DO NOTHING",
-		tbl,
-		strings.Join(cols, ", "),
-		strings.Join(placeholders, ", "),
-		strings.Join(cols, ", "))
+		tbl, colList, strings.Join(arrParams, ", "), colList)
 }
 
 // FilesInsertSQL returns the INSERT statement for the catalog

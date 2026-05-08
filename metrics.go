@@ -112,6 +112,19 @@ type Metrics struct {
 	// Catalog / locking.
 	occVersionConflict metric.Int64Counter
 	lookupByToken      metric.Int64Counter
+
+	// Iter pipeline (read_iter.go: producer/downloader/decoder).
+	// Vendored shape from s3store — same instrument names with the
+	// s3pgstore prefix. Saturation signals (body_slot, byte_budget)
+	// are paired wait+exhausted observations; decode_duration is
+	// per-partition wall-clock; stall.count is the watchdog's
+	// "no-forward-progress" pulse.
+	iterBodySlotWait        metric.Float64Histogram
+	iterBodySlotExhausted   metric.Int64Counter
+	iterByteBudgetWait      metric.Float64Histogram
+	iterByteBudgetExhausted metric.Int64Counter
+	iterDecodeDuration      metric.Float64Histogram
+	iterStallCount          metric.Int64Counter
 }
 
 // newMetrics registers every instrument in cfg.Meter and wires
@@ -357,6 +370,64 @@ func newMetrics(cfg metricsConfig) (*Metrics, error) {
 		"LookupByToken / write-path token short-circuit "+
 			"outcomes, labeled by result (hit / miss).",
 		"{lookup}"); err != nil {
+		return nil, err
+	}
+
+	// Iter pipeline. body_slot.wait fires only when a downloader
+	// blocks AND eventually acquires; body_slot.exhausted is the
+	// counter twin. byte_budget.* mirror the same shape for the
+	// decoder's reserveBytes path. decode.duration is per-
+	// partition wall-clock decode time. stall.count is the
+	// watchdog's pure-observer pulse — non-zero rate means the
+	// pipeline made no forward progress within the watchdog
+	// window (deadlock or extremely slow consumer).
+	if m.iterBodySlotWait, err = mustHist(
+		"s3pgstore.read.iter.body_slot.wait.duration",
+		"Time downloaders spent blocked acquiring a body-slot in "+
+			"the iter pipeline (recorded only when a wait actually "+
+			"occurred AND the acquire eventually succeeded — "+
+			"cancel-during-wait is shutdown noise).",
+		"s", shortWaitBuckets...); err != nil {
+		return nil, err
+	}
+	if m.iterBodySlotExhausted, err = mustCounter(
+		"s3pgstore.read.iter.body_slot.exhausted",
+		"Times the iter pipeline's body-slot pool was full and a "+
+			"downloader had to wait. Sustained non-zero rate = "+
+			"the consumer's per-record work is the bottleneck.",
+		"{event}"); err != nil {
+		return nil, err
+	}
+	if m.iterByteBudgetWait, err = mustHist(
+		"s3pgstore.read.iter.byte_budget.wait.duration",
+		"Time the decoder spent blocked reserving uncompressed "+
+			"bytes against ReadAheadBytes (recorded only when a "+
+			"wait actually occurred AND the reservation succeeded).",
+		"s", shortWaitBuckets...); err != nil {
+		return nil, err
+	}
+	if m.iterByteBudgetExhausted, err = mustCounter(
+		"s3pgstore.read.iter.byte_budget.exhausted",
+		"Times the iter pipeline's byte budget was full and the "+
+			"decoder had to wait. WithReadAheadBytes is binding.",
+		"{event}"); err != nil {
+		return nil, err
+	}
+	if m.iterDecodeDuration, err = mustHist(
+		"s3pgstore.read.iter.partition.decode.duration",
+		"Wall-clock parquet decode time per partition (excludes "+
+			"byte-budget wait and download time).",
+		"s", durationBuckets...); err != nil {
+		return nil, err
+	}
+	if m.iterStallCount, err = mustCounter(
+		"s3pgstore.read.iter.stall.count",
+		"Times the iter pipeline made no forward progress "+
+			"(markComplete or slot release) within the watchdog "+
+			"window. Pure observer — the watchdog does not cancel. "+
+			"Indicates a deadlock (library bug) or a slow consumer "+
+			"(heavy yield-side processing). Labeled by method.",
+		"{event}"); err != nil {
 		return nil, err
 	}
 
@@ -740,4 +811,65 @@ func classifyS3Error(err error) (outcome, errType string) {
 	// No HTTP response and not a known sentinel — treat as
 	// transport-layer (DNS / TCP / TLS / connection reset).
 	return outcomeError, errTypeTransport
+}
+
+// recordIterBodySlotWait reports one acquireBodySlot call that
+// blocked AND ended in a successful acquire. Records the wait
+// duration on the histogram and increments the exhausted
+// counter. Cancel-during-wait is intentionally NOT recorded —
+// that path fires only during shutdown races, where a near-zero
+// duration would drown out the saturation signal callers
+// actually want to see.
+func (m *Metrics) recordIterBodySlotWait(
+	ctx context.Context, dur time.Duration,
+) {
+	if m == nil {
+		return
+	}
+	m.iterBodySlotWait.Record(ctx, dur.Seconds())
+	m.iterBodySlotExhausted.Add(ctx, 1)
+}
+
+// recordIterByteBudgetWait reports one reserveBytes call that
+// blocked AND ended in a successful reservation. Same shape as
+// recordIterBodySlotWait — the cancel path is not recorded.
+func (m *Metrics) recordIterByteBudgetWait(
+	ctx context.Context, dur time.Duration,
+) {
+	if m == nil {
+		return
+	}
+	m.iterByteBudgetWait.Record(ctx, dur.Seconds())
+	m.iterByteBudgetExhausted.Add(ctx, 1)
+}
+
+// recordIterDecodeDuration reports one partition's parquet
+// decode wall-clock time. Recorded regardless of decode outcome
+// — decode time is meaningful even on the error path so
+// operators see how much time the decoder spent before failing.
+func (m *Metrics) recordIterDecodeDuration(
+	ctx context.Context, dur time.Duration,
+) {
+	if m == nil {
+		return
+	}
+	m.iterDecodeDuration.Record(ctx, dur.Seconds())
+}
+
+// recordIterStall reports one watchdog tick that observed a
+// pipeline with no forward progress within the threshold
+// window. Carries the public method as an attribute so
+// operators can attribute stalls to a specific entry point
+// (ReadIter / ReadPartitionIter / ReadRangeIter / ...).
+//
+// Pure observer — the caller logs slog.Warn alongside this
+// counter increment but does not cancel the pipeline.
+func (m *Metrics) recordIterStall(
+	ctx context.Context, method string,
+) {
+	if m == nil {
+		return
+	}
+	m.iterStallCount.Add(ctx, 1, metric.WithAttributes(
+		attribute.String(attrKeyMethod, method)))
 }

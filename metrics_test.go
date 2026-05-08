@@ -101,6 +101,10 @@ func TestMetrics_NilReceiverHelpersSafe(t *testing.T) {
 	m.recordTokenRaceRetry(ctx)
 	m.recordOCCConflict(ctx)
 	m.recordLookupByToken(ctx, true)
+	m.recordIterBodySlotWait(ctx, time.Millisecond)
+	m.recordIterByteBudgetWait(ctx, time.Millisecond)
+	m.recordIterDecodeDuration(ctx, time.Millisecond)
+	m.recordIterStall(ctx, "ReadIter")
 	if obs := m.fanOutObserverFor("X"); obs != nil {
 		t.Fatalf("nil receiver should produce nil observer")
 	}
@@ -166,6 +170,12 @@ func TestMetrics_RecordedInstruments(t *testing.T) {
 	scope.released()
 	scope.end(2, errors.New("server"))
 
+	// Iter pipeline saturation/observer signals.
+	m.recordIterBodySlotWait(ctx, 5*time.Millisecond)
+	m.recordIterByteBudgetWait(ctx, 7*time.Millisecond)
+	m.recordIterDecodeDuration(ctx, 12*time.Millisecond)
+	m.recordIterStall(ctx, "ReadIter")
+
 	// Collect.
 	var rm metricdata.ResourceMetrics
 	if err := reader.Collect(ctx, &rm); err != nil {
@@ -193,6 +203,12 @@ func TestMetrics_RecordedInstruments(t *testing.T) {
 		"s3pgstore.lookup_by_token.count",
 		"s3pgstore.poll.lag",
 		"s3pgstore.pending_writes.depth",
+		"s3pgstore.read.iter.body_slot.wait.duration",
+		"s3pgstore.read.iter.body_slot.exhausted",
+		"s3pgstore.read.iter.byte_budget.wait.duration",
+		"s3pgstore.read.iter.byte_budget.exhausted",
+		"s3pgstore.read.iter.partition.decode.duration",
+		"s3pgstore.read.iter.stall.count",
 	}
 	got := collectedMetricNames(rm)
 	for _, w := range want {

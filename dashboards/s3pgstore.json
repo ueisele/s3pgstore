@@ -328,6 +328,86 @@
       "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum (rate(s3pgstore_gc_reclaimed_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\"}[$__rate_interval]))", "legendFormat": "reclaimed/s", "interval": "1m", "refId": "A"}],
       "title": "GC reclaim rate",
       "type": "timeseries"
+    },
+
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 94}, "id": 900, "panels": [], "title": "Iter pipeline (ReadIter / ReadPartitionIter / ReadRangeIter / ReadPartitionRangeIter / ReadEntriesIter / ReadPartitionEntriesIter)", "type": "row"},
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Time downloaders spent blocked acquiring a body-slot in the iter pipeline (recorded only when a wait actually occurred AND the acquire eventually succeeded). Sustained non-zero P95 = the consumer's per-record yield work is the bottleneck — bump WithReadAheadPartitions, raise MaxInflightRequests, or move heavy yield-side processing off the iter goroutine.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 95},
+      "id": 901,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.50, sum by (le) (rate(s3pgstore_read_iter_body_slot_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P50", "interval": "1m", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.95, sum by (le) (rate(s3pgstore_read_iter_body_slot_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P95", "interval": "1m", "refId": "B"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.99, sum by (le) (rate(s3pgstore_read_iter_body_slot_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P99", "interval": "1m", "refId": "C"}
+      ],
+      "title": "Iter body-slot wait duration (P50/P95/P99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Times the iter pipeline's body-slot pool was full and a downloader had to wait. Pair with the wait-duration panel — high rate + non-zero P95 latency confirms saturation is real.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.001}, {"color": "red", "value": 0.1}]}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 95},
+      "id": 902,
+      "options": {"colorMode": "background", "graphMode": "area"},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum (rate(s3pgstore_read_iter_body_slot_exhausted_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval]))", "interval": "1m", "refId": "A"}],
+      "title": "Iter body-slot exhausted rate",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Time the decoder spent blocked reserving uncompressed bytes against WithReadAheadBytes (recorded only when a wait actually occurred AND the reservation succeeded). Non-zero P95 = the byte cap is binding before partition cap; either the workload is skewed-large or the cap is undersized.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 103},
+      "id": 903,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.50, sum by (le) (rate(s3pgstore_read_iter_byte_budget_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P50", "interval": "1m", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.95, sum by (le) (rate(s3pgstore_read_iter_byte_budget_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P95", "interval": "1m", "refId": "B"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.99, sum by (le) (rate(s3pgstore_read_iter_byte_budget_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P99", "interval": "1m", "refId": "C"}
+      ],
+      "title": "Iter byte-budget wait duration (P50/P95/P99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Times the iter pipeline's byte budget was full and the decoder had to wait. WithReadAheadBytes is binding — bump it or raise WithReadAheadPartitions.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.001}, {"color": "red", "value": 0.1}]}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 103},
+      "id": 904,
+      "options": {"colorMode": "background", "graphMode": "area"},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum (rate(s3pgstore_read_iter_byte_budget_exhausted_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval]))", "interval": "1m", "refId": "A"}],
+      "title": "Iter byte-budget exhausted rate",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Wall-clock parquet decode time per partition (excludes byte-budget wait and download time). Flat ~ms = healthy; tail growth indicates large partitions or CPU-bound decode contention.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 111},
+      "id": 905,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.50, sum by (le) (rate(s3pgstore_read_iter_partition_decode_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P50", "interval": "1m", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.95, sum by (le) (rate(s3pgstore_read_iter_partition_decode_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P95", "interval": "1m", "refId": "B"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.99, sum by (le) (rate(s3pgstore_read_iter_partition_decode_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P99", "interval": "1m", "refId": "C"}
+      ],
+      "title": "Iter partition decode duration (P50/P95/P99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Pipeline made no forward progress (markComplete or slot release) within the watchdog window. Pure observer — does NOT cancel. Non-zero rate indicates a deadlock (library bug — open an issue) or a slow consumer (heavy yield-side processing). Aggregated across all entry-point methods; drill down by `method` label in Explore.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.001}, {"color": "red", "value": 0.1}]}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 111},
+      "id": 906,
+      "options": {"colorMode": "background", "graphMode": "area"},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum (rate(s3pgstore_read_iter_stall_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval]))", "interval": "1m", "refId": "A"}],
+      "title": "Iter pipeline stall rate (incident — deadlock or slow consumer)",
+      "type": "stat"
     }
   ],
   "refresh": "30s",

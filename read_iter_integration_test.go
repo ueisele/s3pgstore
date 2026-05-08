@@ -3,10 +3,14 @@
 package s3pgstore_test
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/ueisele/s3pgstore"
 	"github.com/ueisele/s3pgstore/sequencer"
@@ -465,5 +469,195 @@ func TestReadIter_SchemaErrorSurfaces(t *testing.T) {
 	}
 	if errors.Is(captured, nil) {
 		t.Error("captured error is nil-equivalent")
+	}
+}
+
+// newIterStoreWithMeter wires a manual-reader OTel meter into
+// the Store so the iter tests can assert on emitted metrics.
+// Returns the Store + the manual reader so callers can collect
+// after exercising the iter.
+func newIterStoreWithMeter(
+	t *testing.T, f *fixture,
+) (*s3pgstore.Store[iterRec], sdkmetric.Reader) {
+	t.Helper()
+	cfg := newIterCfg(f)
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader))
+	cfg.Meter = provider.Meter("iter-test")
+	mgr := s3pgstore.NewSchemaManager(cfg)
+	if err := mgr.Create(t.Context()); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { _ = mgr.Drop(t.Context()) })
+	store, err := s3pgstore.New(t.Context(), cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return store, reader
+}
+
+// counterValue extracts a single Sum[int64] data-point value
+// for a metric name from the manual reader. Matches by name
+// only — used here for un-labeled counter pairs (the
+// byte_budget.exhausted instrument carries no method label).
+// Returns 0 if the metric isn't present yet (counter never
+// fired).
+func counterValue(
+	t *testing.T, reader sdkmetric.Reader, name string,
+) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, mt := range sm.Metrics {
+			if mt.Name != name {
+				continue
+			}
+			sum, ok := mt.Data.(metricdata.Sum[int64])
+			if !ok {
+				continue
+			}
+			var total int64
+			for _, dp := range sum.DataPoints {
+				total += dp.Value
+			}
+			return total
+		}
+	}
+	return 0
+}
+
+// TestReadIter_WithReadAheadBytes_GatesDecoder verifies the
+// byte-budget gate actually back-pressures the decoder under
+// runtime conditions. The signal we look for is
+// s3pgstore.read.iter.byte_budget.exhausted incrementing — it
+// fires only when reserveBytes makes at least one round
+// through its predicate loop without fitting (i.e., the
+// decoder genuinely had to wait, not just walked through
+// empty-buffer-escape on a fast consumer).
+//
+// To force the decoder to wait, the test consumer pauses on
+// the first record of every partition. releaseBytes runs
+// AFTER the user's yield returns (the emit loop's ordering),
+// so a sleeping yield holds the partition's reservation,
+// guaranteeing the decoder finds bufferedBytes > 0 when it
+// hits reserveBytes for the next partition.
+//
+// With WithReadAheadBytes(1) and any partition uncomp > 1
+// byte, the predicate `bufferedBytes <= 0 || ... <= cap`
+// fails on the first attempt (non-empty buffer, uncomp
+// dominates the 1-byte cap). The decoder parks, waited=true,
+// recordIterByteBudgetWait fires when releaseBytes wakes it.
+// Asserts the exhausted counter increments at least N-1 times
+// — one wait event per partition past the first.
+func TestReadIter_WithReadAheadBytes_GatesDecoder(t *testing.T) {
+	f := newFixture(t)
+	store, reader := newIterStoreWithMeter(t, f)
+
+	const numPartitions = 5
+	customers := []string{"alice", "bob", "carol", "dave", "eve"}
+	for _, c := range customers {
+		// Multi-record write so the parquet body is not
+		// degenerately small — the byte budget is configured
+		// independently of size, but a richer partition makes
+		// the test less sensitive to parquet's overhead floor.
+		batch := make([]iterRec, 10)
+		for i := range batch {
+			batch[i] = iterRec{Customer: c, Value: int64(i)}
+		}
+		if _, err := store.Write(t.Context(), batch); err != nil {
+			t.Fatalf("Write %s: %v", c, err)
+		}
+	}
+
+	// Consumer-side delay forces the decoder ahead. The
+	// per-partition pause must outlast the decoder's
+	// reserveBytes round-trip on the first attempt — anything
+	// >> the parquet-decode cost (sub-ms for 10 records) is
+	// safe; 30ms gives a comfortable margin under CI noise.
+	const perPartitionPauseMs = 30
+	count := 0
+	seenPartitions := map[string]bool{}
+	for r, err := range store.ReadIter(t.Context(),
+		[]s3pgstore.PartitionFilter{
+			s3pgstore.GE("customer", "alice"),
+		},
+		// readAheadPartitions large enough that the channel
+		// cap NEVER gates — we want the byte budget to be the
+		// only contention point.
+		s3pgstore.WithReadAheadPartitions(numPartitions),
+		s3pgstore.WithReadAheadBytes(1),
+	) {
+		if err != nil {
+			t.Fatalf("yield: %v", err)
+		}
+		// Pause once on the first record of each partition so
+		// the in-flight batch's reservation lingers long
+		// enough for the decoder to enter its waiting branch
+		// on the next partition.
+		if !seenPartitions[r.Customer] {
+			seenPartitions[r.Customer] = true
+			time.Sleep(perPartitionPauseMs * time.Millisecond)
+		}
+		count++
+	}
+	if count != numPartitions*10 {
+		t.Errorf("yielded %d records, want %d",
+			count, numPartitions*10)
+	}
+
+	got := counterValue(t, reader,
+		"s3pgstore.read.iter.byte_budget.exhausted")
+	if min := int64(numPartitions - 1); got < min {
+		t.Errorf("byte_budget.exhausted = %d, want >= %d "+
+			"(every partition past the first should have "+
+			"blocked on the 1-byte cap with the consumer "+
+			"holding releaseBytes for %dms per partition)",
+			got, min, perPartitionPauseMs)
+	}
+}
+
+// TestReadIter_WithReadAheadPartitions_Zero_NoDeadlock guards
+// the explicit-no-buffer mode. n=0 makes decodedCh unbuffered
+// — the decoder's sendBatch must rendezvous with the emit
+// loop's receive on every partition, never accumulating ahead.
+// A regression that broke handoff under cap=0 would deadlock
+// before the iter could yield the second partition.
+//
+// Setup is deliberately small (3 partitions, 1 record each)
+// so the test runs in well under a second: we're verifying
+// the deadlock-free path, not throughput. The 30-second test
+// timeout would catch a true deadlock.
+func TestReadIter_WithReadAheadPartitions_Zero_NoDeadlock(t *testing.T) {
+	f := newFixture(t)
+	store := newIterStore(t, f)
+
+	customers := []string{"alice", "bob", "carol"}
+	for i, c := range customers {
+		if _, err := store.Write(t.Context(),
+			[]iterRec{{Customer: c, Value: int64(i + 1)}},
+		); err != nil {
+			t.Fatalf("Write %s: %v", c, err)
+		}
+	}
+
+	count := 0
+	for r, err := range store.ReadIter(t.Context(),
+		[]s3pgstore.PartitionFilter{
+			s3pgstore.GE("customer", "alice"),
+		},
+		s3pgstore.WithReadAheadPartitions(0),
+	) {
+		if err != nil {
+			t.Fatalf("yield: %v", err)
+		}
+		_ = r
+		count++
+	}
+	if count != len(customers) {
+		t.Errorf("yielded %d records, want %d", count, len(customers))
 	}
 }

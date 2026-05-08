@@ -261,14 +261,21 @@ func (t *s3target) get(
 	return data, err
 }
 
-// put uploads data under key with the given content type.
-// Verifies the response ETag matches MD5(data) when ETag
-// equals MD5 by construction (single-part PUT, no SSE-KMS,
-// no SSE-C) — defends against the "PUT reported success but
-// the body that landed is not the body we passed in" failure
-// shape (e.g. caller-side reader EOF, proxy truncation).
+// put uploads data under key with the given content type and
+// optional user metadata. Verifies the response ETag matches
+// MD5(data) when ETag equals MD5 by construction (single-part
+// PUT, no SSE-KMS, no SSE-C) — defends against the "PUT
+// reported success but the body that landed is not the body we
+// passed in" failure shape (e.g. caller-side reader EOF, proxy
+// truncation).
+//
+// metadata is the user-metadata map AWS stores under
+// x-amz-meta-<key>. cmd/s3pgstore-rebuild reads it back via
+// HEAD to reconstruct the catalog row without GETting the
+// parquet body. nil/empty metadata is allowed.
 func (t *s3target) put(
-	ctx context.Context, key string, data []byte, contentType string,
+	ctx context.Context, key string, data []byte,
+	contentType string, metadata map[string]string,
 ) error {
 	if err := t.acquire(ctx); err != nil {
 		return err
@@ -294,6 +301,7 @@ func (t *s3target) put(
 			Key:         aws.String(key),
 			Body:        bytes.NewReader(data),
 			ContentType: aws.String(contentType),
+			Metadata:    metadata,
 		}
 		out, err := t.cfg.S3Client.PutObject(ctx, input)
 		if err != nil {

@@ -11,27 +11,41 @@ must preserve them — even when the change appears unrelated.
   read paths that bypass it.
 - **Orphan tracking via `s3pgstore_pending_writes`** — The S3 PUT
   side-effect cannot be undone by a transaction rollback. The
-  pending-writes row is INSERTed in its own pre-transaction (so it
-  commits *before* any S3 PUT runs), and DELETEd inside the catalog
-  write transaction (so a rollback of that tx restores the row).
-  The pre-tx INSERT goes through `Executor.Run(Executor.DetachTx(ctx), ...)`
-  so it lands on a fresh pool connection even when the caller
-  composed via `WithTx` — independence from the caller's tx is
-  load-bearing: a caller-rollback after a successful S3 PUT must
-  still leave a tracked orphan.
-  The catalog tx wraps the S3 PUT: encode + INSERT files + PUT +
-  DELETE pending_writes all happen between BEGIN and COMMIT, with
-  the file row INSERTed *before* the PUT so a token-race
-  unique-violation aborts before any S3 write. On rollback after a
-  successful PUT (PUT succeeded but COMMIT crashed, or any later
-  step in the tx failed), the S3 file exists with no catalog
-  reference and the pre-tx pending-writes row points at it;
-  `cmd/s3pgstore-gc` reclaims the orphan after a grace period.
+  pending-writes row is INSERTed via the `insertPendingWrite`
+  helper, which calls `Executor.Run(Executor.DetachTx(ctx), …)`
+  on a fresh pool connection, so it commits independently of both
+  the wrapping catalog tx and any caller-supplied tx (`WithTx`).
+  The matching DELETE runs inside the catalog tx, so a rollback
+  of that tx restores the orphan record.
+
+  The pre-tx INSERT lands *before* the wrapping tx is begun —
+  not inside its callback. This is load-bearing for concurrency:
+  each writer holds at most one pool connection at a time
+  (pre-tx connection released before the wrapping-tx connection
+  is acquired). Relocating the INSERT inside the wrapping tx
+  would make every writer hold two connections simultaneously,
+  deadlocking the pool whenever concurrency approaches its size
+  (verified empirically on `TestSequencer_GapFreeUnderConcurrentWriters`).
+
+  The catalog tx wraps the S3 PUT: UPSERT partitions → encode →
+  INSERT files → PUT → DELETE pending_writes → INSERT MV →
+  NOTIFY → COMMIT. The file row INSERT precedes the PUT so a
+  token-race unique-violation aborts before any S3 write. On
+  rollback after a successful PUT (PUT succeeded but COMMIT
+  crashed, or any later step failed), the S3 file exists with
+  no catalog reference and the pre-tx pending_writes row points
+  at it; `cmd/s3pgstore-gc` reclaims the orphan after a grace
+  period. Fail-fast paths (OCC, token race, encode error) leave
+  a pending_writes row pointing at an s3_key that was never PUT;
+  GC's DELETE on that key is a no-op, so the cost is one GC
+  cycle per fail-fast event.
+
   Refactors must not move the pending-writes DELETE outside the
-  catalog transaction, must not skip the pending-writes pre-tx
-  INSERT, must not commit the catalog row before the PUT
-  completes, and must not let the pre-tx INSERT participate in a
-  caller-supplied tx (always go through `Executor.DetachTx`).
+  catalog tx, must not commit the catalog row before the PUT
+  completes, must not let the pending-writes INSERT participate
+  in a caller-supplied tx (always go through `Executor.DetachTx`),
+  and must not relocate the pending-writes INSERT inside the
+  wrapping tx — see the pool-deadlock note above.
 - **Read stability — no library-driven deletion** — Two consecutive
   reads with no intervening writes return the same records. The
   library never deletes catalog rows, MV rows, or S3 objects on
@@ -326,6 +340,23 @@ detect or test for them at runtime.
   offline disaster-recovery tool and tolerates eventual
   consistency on LIST. The runtime read/write path never LISTs.
   Refactors must not introduce LIST on any runtime path.
+- **S3 user-metadata is self-describing for catalog rebuild.**
+  Every PUT carries a fixed user-metadata bag built by
+  `BuildS3Metadata` and emitted via the wrapping tx's
+  `s.target.put` call: `s3pgstore-token`, `s3pgstore-records`,
+  `s3pgstore-uncompressed`, `s3pgstore-version`, plus one
+  `s3pgstore-ext-<name>` per non-NULL ExtensionColumn.
+  `cmd/s3pgstore-rebuild` reads the bag from a HEAD response,
+  reconstructs the catalog row, and skips the body GET entirely;
+  for legacy files written before the metadata convention (no
+  bag), rebuild falls back to GET + parquet-footer parse so DR
+  still completes. The recovery path is HEAD-only, no LIST-only
+  variant — S3 LIST returns key + size + LastModified + ETag,
+  not user-metadata. Refactors must not drop fields from the
+  bag (would break recovery for files written under the new
+  convention) and must keep the bag under `S3MetadataMaxBytes`
+  (2 KiB; AWS rejects oversized metadata at PUT time, so we
+  validate at write time for a clean error).
 - **S3 PUT is atomic per object.** No partial-write states are
   observable to GET. The library never relies on multi-object
   atomicity from S3 — the catalog transaction provides that.

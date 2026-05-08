@@ -6,18 +6,18 @@ package main
 // the rebuild path without invoking the binary itself.
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/parquet-go/parquet-go"
 
+	"github.com/ueisele/s3pgstore"
 	"github.com/ueisele/s3pgstore/internal/catalog"
 )
 
@@ -29,6 +29,12 @@ import (
 // PartitionKeyParts must match the writer's configuration —
 // parsing the partition key out of an S3 object's path requires
 // knowing how many segments to expect and what each is named.
+//
+// ExtensionColumns must match the writer's configuration so
+// rebuild can recover ext_<name> values from S3 user-metadata
+// (written by the writer's S3 PUT). Columns declared here that
+// the original write didn't populate (no value in WithMetadata)
+// stay NULL on the rebuilt row, matching the original catalog.
 type RebuildConfig struct {
 	Pool              *pgxpool.Pool
 	S3Client          *s3.Client
@@ -37,6 +43,7 @@ type RebuildConfig struct {
 	SchemaName        string
 	TablePrefix       string
 	PartitionKeyParts []string
+	ExtensionColumns  []s3pgstore.ExtensionColumn
 }
 
 // RebuildResult captures the row counts produced by a Rebuild
@@ -57,14 +64,25 @@ type RebuildResult struct {
 //   - written_at is set from each object's S3 LastModified
 //     timestamp (best available proxy; the original written_at
 //     isn't recoverable from S3 alone).
-//   - written_at_version is computed as the per-partition row
-//     index in (s3_key lex) order — 1, 2, 3, ... This preserves
-//     CLAUDE.md's MAX(written_at_version) ==
-//     partitions.version invariant for the rebuilt catalog.
-//   - record_count is read from the parquet footer.
-//   - file_size is the S3 object size.
-//   - ext_<n>, idempotency_token are NULL — not recoverable
-//     from S3 alone.
+//   - written_at_version is recovered from S3 user-metadata
+//     (s3pgstore-version), preserving original version
+//     continuity for callers using OCC across DR.
+//   - record_count and uncompressed_size come from S3
+//     user-metadata (s3pgstore-records /
+//     s3pgstore-uncompressed). Missing values are a hard error
+//     — every s3pgstore-written object carries them.
+//   - file_size is the S3 object size (HEAD ContentLength).
+//   - idempotency_token is recovered from s3pgstore-token
+//     user-metadata when the original Write set one.
+//   - ext_<n> values are recovered from s3pgstore-ext-<name>
+//     user-metadata, parsed via s3pgstore.ParseExtFromS3 against
+//     RebuildConfig.ExtensionColumns. Missing metadata leaves the
+//     column NULL.
+//
+// Files lacking the s3pgstore user-metadata bag fail rebuild
+// (likely uploaded outside the library or by a pre-metadata
+// version). Operators must remove or re-upload such objects
+// before re-running rebuild.
 //
 // Idempotent on re-run: ON CONFLICT (s3_key) DO NOTHING for
 // files; partitions UPSERT to the recomputed (version,
@@ -103,16 +121,20 @@ func Rebuild(
 		sort.Strings(g.s3Keys)
 
 		filesAdded := 0
+		var maxVersion int64
 		for i, s3Key := range g.s3Keys {
-			version := int64(i + 1)
-			ok, err := insertFileRow(ctx, cfg, names,
-				s3Key, g.partitionKey, g.partValues, version)
+			fallback := int64(i + 1)
+			version, ok, err := insertFileRow(ctx, cfg, names,
+				s3Key, g.partitionKey, g.partValues, fallback)
 			if err != nil {
 				return res, fmt.Errorf("file %s: %w",
 					s3Key, err)
 			}
 			if ok {
 				filesAdded++
+			}
+			if version > maxVersion {
+				maxVersion = version
 			}
 		}
 		res.FilesInserted += filesAdded
@@ -121,8 +143,14 @@ func Rebuild(
 		// this partition, so a re-run after partial failure
 		// converges to the right (version, file_count)
 		// regardless of where the previous run stopped.
+		// version = MAX(written_at_version) preserves
+		// CLAUDE.md's MAX-equals-partition-version invariant
+		// even when written_at_version values were recovered
+		// from S3 metadata (which may not be 1..N if files
+		// were ever deleted from the original catalog).
 		ok, err := upsertPartitionRow(ctx, cfg, names,
-			g.partitionKey, g.partValues, len(g.s3Keys))
+			g.partitionKey, g.partValues,
+			maxVersion, len(g.s3Keys))
 		if err != nil {
 			return res, fmt.Errorf("partition %s: %w",
 				g.partitionKey, err)
@@ -258,57 +286,58 @@ func groupByPartition(
 	return out, nil
 }
 
-// insertFileRow builds the catalog file row for one S3 object:
-// HEAD for size + LastModified; GET for footer (record count);
-// INSERT with ON CONFLICT (s3_key) DO NOTHING so a partial-
-// failure re-run skips already-inserted rows.
+// insertFileRow builds the catalog file row for one S3 object.
+// Recovery flow:
 //
-// Returns (true, nil) if a new row was inserted; (false, nil)
-// if the row already existed.
+//  1. HEAD always — for ContentLength, LastModified, and the
+//     user-metadata bag.
+//  2. The metadata bag must carry the library's
+//     s3pgstore-records / s3pgstore-uncompressed /
+//     s3pgstore-version fields. If any are missing the file
+//     wasn't written by s3pgstore (or was written by a version
+//     predating the metadata convention) — return an error so
+//     the operator can investigate.
+//
+// fallbackVersion is used as written_at_version when the S3
+// metadata doesn't carry s3pgstore-version. Returns the
+// version actually used (recovered or fallback) so the caller
+// can compute MAX(version) for the partitions row.
+//
+// Returns (version, true, nil) if a new row was inserted;
+// (version, false, nil) if the row already existed (re-run on
+// partial-failure path).
 func insertFileRow(
 	ctx context.Context, cfg RebuildConfig,
 	names catalog.Names,
 	s3Key, partitionKey string, partValues []string,
-	writtenAtVersion int64,
-) (bool, error) {
+	fallbackVersion int64,
+) (int64, bool, error) {
 	head, err := cfg.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(cfg.Bucket),
 		Key:    aws.String(s3Key),
 	})
 	if err != nil {
-		return false, fmt.Errorf("HEAD: %w", err)
-	}
-
-	body, err := getObjectBytes(ctx, cfg.S3Client,
-		cfg.Bucket, s3Key)
-	if err != nil {
-		return false, fmt.Errorf("GET: %w", err)
-	}
-
-	pf, err := parquet.OpenFile(
-		bytes.NewReader(body), int64(len(body)))
-	if err != nil {
-		return false, fmt.Errorf(
-			"OpenFile (footer parse): %w", err)
-	}
-	recordCount := pf.NumRows()
-
-	// Sum TotalUncompressedSize across every column chunk in
-	// the footer — same derivation the writer pipeline uses.
-	var uncompressedSize int64
-	if md := pf.Metadata(); md != nil {
-		for _, rg := range md.RowGroups {
-			for _, c := range rg.Columns {
-				uncompressedSize += c.MetaData.TotalUncompressedSize
-			}
-		}
+		return 0, false, fmt.Errorf("HEAD: %w", err)
 	}
 
 	var fileSize int64
 	if head.ContentLength != nil {
 		fileSize = *head.ContentLength
-	} else {
-		fileSize = int64(len(body))
+	}
+
+	rec := newRecoveredFields(head.Metadata, cfg.ExtensionColumns,
+		fallbackVersion)
+	extValues, err := rec.parseExtValues(cfg.ExtensionColumns)
+	if err != nil {
+		return 0, false, err
+	}
+
+	if !rec.hasFooterFields() {
+		return 0, false, fmt.Errorf(
+			"s3 object %s: missing required user-metadata "+
+				"(s3pgstore-records / s3pgstore-uncompressed) — "+
+				"file was not written by s3pgstore or predates "+
+				"the metadata convention", s3Key)
 	}
 
 	cols := []string{
@@ -316,16 +345,28 @@ func insertFileRow(
 		"file_size", "uncompressed_size", "record_count",
 	}
 	args := []any{
-		partitionKey, s3Key, writtenAtVersion,
-		fileSize, uncompressedSize, recordCount,
+		partitionKey, s3Key, rec.version,
+		fileSize, rec.uncompressedSize, rec.recordCount,
 	}
 	if head.LastModified != nil {
 		cols = append(cols, "written_at")
 		args = append(args, head.LastModified.UTC())
 	}
+	if rec.token != "" {
+		cols = append(cols, "idempotency_token")
+		args = append(args, rec.token)
+	}
 	for i, p := range cfg.PartitionKeyParts {
 		cols = append(cols, "part_"+p)
 		args = append(args, partValues[i])
+	}
+	for _, c := range cfg.ExtensionColumns {
+		v, ok := extValues[c.Name]
+		if !ok {
+			continue
+		}
+		cols = append(cols, "ext_"+c.Name)
+		args = append(args, v)
 	}
 
 	placeholders := make([]string, len(cols))
@@ -341,16 +382,96 @@ func insertFileRow(
 
 	tag, err := cfg.Pool.Exec(ctx, q, args...)
 	if err != nil {
-		return false, err
+		return 0, false, err
 	}
-	return tag.RowsAffected() > 0, nil
+	return rec.version, tag.RowsAffected() > 0, nil
+}
+
+// recoveredFields holds the library-controlled values pulled
+// from a HEAD's user-metadata. token / extValues default to
+// empty when the original write didn't set them; recordCount /
+// uncompressedSize default to 0, signalling "metadata bag was
+// missing required fields" via hasFooterFields below — the
+// caller treats that as a hard error.
+type recoveredFields struct {
+	token            string
+	recordCount      int64
+	uncompressedSize int64
+	version          int64
+	rawExt           map[string]string
+}
+
+func newRecoveredFields(
+	md map[string]string, exts []s3pgstore.ExtensionColumn,
+	fallbackVersion int64,
+) recoveredFields {
+	rec := recoveredFields{
+		version: fallbackVersion,
+		rawExt:  make(map[string]string, len(exts)),
+	}
+	if v, ok := md[s3pgstore.S3MetaToken]; ok {
+		rec.token = v
+	}
+	if v, ok := md[s3pgstore.S3MetaRecordCount]; ok {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			rec.recordCount = n
+		}
+	}
+	if v, ok := md[s3pgstore.S3MetaUncompressedSize]; ok {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			rec.uncompressedSize = n
+		}
+	}
+	if v, ok := md[s3pgstore.S3MetaWrittenAtVersion]; ok {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			rec.version = n
+		}
+	}
+	for _, c := range exts {
+		if v, ok := md[s3pgstore.S3MetaExtPrefix+c.Name]; ok {
+			rec.rawExt[c.Name] = v
+		}
+	}
+	return rec
+}
+
+// hasFooterFields reports whether the metadata bag carried the
+// library's recordCount + uncompressedSize fields. Both are
+// always non-zero on real s3pgstore writes, so a zero is the
+// "metadata missing from this object" signal — the caller
+// errors when this returns false.
+func (r recoveredFields) hasFooterFields() bool {
+	return r.recordCount > 0 && r.uncompressedSize > 0
+}
+
+// parseExtValues converts the raw S3-metadata strings to the
+// Go-typed values pgx expects for each ExtensionColumn.
+func (r recoveredFields) parseExtValues(
+	exts []s3pgstore.ExtensionColumn,
+) (map[string]any, error) {
+	out := make(map[string]any, len(r.rawExt))
+	for _, c := range exts {
+		raw, ok := r.rawExt[c.Name]
+		if !ok {
+			continue
+		}
+		v, err := s3pgstore.ParseExtFromS3(c, raw)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"recover ext %q: %w", c.Name, err)
+		}
+		out[c.Name] = v
+	}
+	return out, nil
 }
 
 // upsertPartitionRow writes the s3pgstore_partitions row for a
-// reconstructed partition. version = file_count and matches
-// the highest written_at_version assigned by the file-row loop,
-// preserving CLAUDE.md's MAX(written_at_version) ==
-// partitions.version invariant for the rebuilt catalog.
+// reconstructed partition. version = max(written_at_version)
+// across the partition's recovered files, preserving CLAUDE.md's
+// MAX(written_at_version) == partitions.version invariant. When
+// every file's version was recovered from S3 metadata, this is
+// the original partition.version; when the rebuild fell back to
+// lex-order numbering, it equals the file_count.
 //
 // ON CONFLICT DO UPDATE so a re-run after partial failure
 // recomputes (version, file_count) against the now-complete
@@ -362,7 +483,8 @@ func insertFileRow(
 func upsertPartitionRow(
 	ctx context.Context, cfg RebuildConfig,
 	names catalog.Names,
-	partitionKey string, partValues []string, fileCount int,
+	partitionKey string, partValues []string,
+	maxVersion int64, fileCount int,
 ) (bool, error) {
 	cols := []string{"partition_key"}
 	args := []any{partitionKey}
@@ -371,7 +493,7 @@ func upsertPartitionRow(
 		args = append(args, partValues[i])
 	}
 	cols = append(cols, "version", "file_count")
-	args = append(args, int64(fileCount), fileCount)
+	args = append(args, maxVersion, fileCount)
 
 	placeholders := make([]string, len(cols))
 	for i := range cols {
@@ -393,27 +515,4 @@ func upsertPartitionRow(
 		return false, err
 	}
 	return tag.RowsAffected() > 0, nil
-}
-
-// getObjectBytes reads an entire S3 object into memory. Used by
-// the rebuild path to feed parquet.OpenFile a seekable reader.
-// Memory cost is one file at a time — the rebuild loop is
-// sequential.
-func getObjectBytes(
-	ctx context.Context, client *s3.Client,
-	bucket, key string,
-) ([]byte, error) {
-	resp, err := client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(resp.Body); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
 }

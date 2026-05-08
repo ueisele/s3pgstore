@@ -175,6 +175,20 @@ func TestWrite_OCCStaleVersionConflicts(t *testing.T) {
 	if !errors.Is(err, s3pgstore.ErrVersionConflict) {
 		t.Fatalf("OCC stale: want ErrVersionConflict, got %v", err)
 	}
+
+	// The OCC failure is a fail-fast path that never touched
+	// S3, so the pre-tx pending_writes row must have been
+	// proactively cleaned up — leaving GC nothing to do.
+	var pending int
+	if err := f.Pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM "`+f.Schema+`"."s3pgstore_pending_writes"`,
+	).Scan(&pending); err != nil {
+		t.Fatalf("count pending_writes: %v", err)
+	}
+	if pending != 0 {
+		t.Errorf("pending_writes after OCC fail-fast: want 0, got %d",
+			pending)
+	}
 }
 
 func TestWrite_OCCExpectedVersionOnNonExistent(t *testing.T) {

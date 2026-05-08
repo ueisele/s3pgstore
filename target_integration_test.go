@@ -110,7 +110,7 @@ func TestS3Target_PutGetRoundTrip(t *testing.T) {
 	}
 
 	want := []byte("hello s3pgstore")
-	if err := tgt.put(t.Context(), "data/x", want, "application/octet-stream"); err != nil {
+	if err := tgt.put(t.Context(), "data/x", want, "application/octet-stream", nil); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	got, err := tgt.get(t.Context(), "data/x")
@@ -154,7 +154,7 @@ func TestS3Target_DeleteIdempotent(t *testing.T) {
 		t.Fatalf("newS3Target: %v", err)
 	}
 
-	if err := tgt.put(t.Context(), "k", []byte("x"), ""); err != nil {
+	if err := tgt.put(t.Context(), "k", []byte("x"), "", nil); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if err := tgt.delete(t.Context(), "k"); err != nil {
@@ -192,7 +192,7 @@ func TestS3Target_ConcurrentPutsRespectSemaphore(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			key := fmt.Sprintf("data/%d", i)
-			if err := tgt.put(t.Context(), key, []byte{byte(i)}, ""); err != nil {
+			if err := tgt.put(t.Context(), key, []byte{byte(i)}, "", nil); err != nil {
 				t.Errorf("put %d: %v", i, err)
 			}
 		}(i)

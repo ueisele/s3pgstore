@@ -380,6 +380,132 @@ func TestRebuild_EmptyBucket(t *testing.T) {
 	}
 }
 
+// TestRebuild_RecoversTokenAndExtFromS3Metadata writes records
+// with WithIdempotencyToken + WithMetadata, drops the catalog,
+// and verifies rebuild recovers both fields from S3 user-
+// metadata (no parquet body GET needed).
+func TestRebuild_RecoversTokenAndExtFromS3Metadata(t *testing.T) {
+	f := newFixture(t)
+	cfg := s3pgstore.Config[rbRec]{
+		Executor:          s3pgstore.NewPoolExecutor(f.Pool),
+		Bucket:            f.Bucket,
+		Prefix:            "rebuild",
+		S3Client:          f.S3Client,
+		SchemaName:        f.Schema,
+		PartitionKeyParts: []string{"customer"},
+		PartitionKeyOf: func(r rbRec) string {
+			return "customer=" + r.Customer
+		},
+		ExtensionColumns: []s3pgstore.ExtensionColumn{
+			{Name: "tenant_id", Type: "TEXT"},
+			{Name: "shard", Type: "INT"},
+		},
+	}
+	mgr := s3pgstore.NewSchemaManager(cfg)
+	if err := mgr.Create(t.Context()); err != nil {
+		t.Fatalf("Create schema: %v", err)
+	}
+	t.Cleanup(func() { _ = mgr.Drop(t.Context()) })
+	store, err := s3pgstore.New(t.Context(), cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// One write with token + metadata so recovery has something
+	// non-trivial to assert against.
+	want, err := store.Write(t.Context(),
+		[]rbRec{{Customer: "alice", Value: 1}},
+		s3pgstore.WithIdempotencyToken("token-recovery"),
+		s3pgstore.WithMetadata(map[string]any{
+			"tenant_id": "acme-tenant",
+			"shard":     int(7),
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if len(want) != 1 || want[0].FileID == 0 {
+		t.Fatalf("Write returned unexpected result: %+v", want)
+	}
+
+	// Drop catalog rows; S3 stays.
+	for _, tbl := range []string{
+		"s3pgstore_files",
+		"s3pgstore_partitions",
+		"s3pgstore_pending_writes",
+	} {
+		if _, err := f.Pool.Exec(t.Context(),
+			fmt.Sprintf(`TRUNCATE %q.%q`, f.Schema, tbl),
+		); err != nil {
+			t.Fatalf("truncate %s: %v", tbl, err)
+		}
+	}
+
+	res, err := Rebuild(t.Context(), RebuildConfig{
+		Pool:              f.Pool,
+		S3Client:          f.S3Client,
+		Bucket:            f.Bucket,
+		S3Prefix:          "rebuild",
+		SchemaName:        f.Schema,
+		TablePrefix:       "s3pgstore_",
+		PartitionKeyParts: []string{"customer"},
+		ExtensionColumns:  cfg.ExtensionColumns,
+	})
+	if err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+	if res.FilesInserted != 1 {
+		t.Fatalf("FilesInserted: want 1, got %d", res.FilesInserted)
+	}
+
+	// Inspect the rebuilt catalog row directly — Read doesn't
+	// surface idempotency_token or ext_<n>.
+	var (
+		token            string
+		extTenant        string
+		extShard         int64
+		writtenAtVersion int64
+	)
+	if err := f.Pool.QueryRow(t.Context(),
+		`SELECT idempotency_token, ext_tenant_id, ext_shard,
+		        written_at_version
+		FROM "`+f.Schema+`"."s3pgstore_files"
+		WHERE partition_key = $1`,
+		"customer=alice",
+	).Scan(&token, &extTenant, &extShard, &writtenAtVersion); err != nil {
+		t.Fatalf("scan rebuilt row: %v", err)
+	}
+	if token != "token-recovery" {
+		t.Errorf("token: want %q, got %q", "token-recovery", token)
+	}
+	if extTenant != "acme-tenant" {
+		t.Errorf("ext_tenant_id: want %q, got %q", "acme-tenant", extTenant)
+	}
+	if extShard != 7 {
+		t.Errorf("ext_shard: want 7, got %d", extShard)
+	}
+	if writtenAtVersion != want[0].Version {
+		t.Errorf("written_at_version: want %d (recovered from S3), "+
+			"got %d", want[0].Version, writtenAtVersion)
+	}
+
+	// Idempotency lookup using the recovered token must return
+	// the rebuilt row — proves the partial UNIQUE index works
+	// across DR.
+	got, ok, err := store.LookupByToken(t.Context(),
+		want[0].PartitionKey, "token-recovery")
+	if err != nil {
+		t.Fatalf("LookupByToken: %v", err)
+	}
+	if !ok {
+		t.Fatalf("LookupByToken: want hit on recovered token")
+	}
+	if got.Version != want[0].Version {
+		t.Errorf("LookupByToken Version: want %d, got %d",
+			want[0].Version, got.Version)
+	}
+}
+
 // TestRebuild_RejectsMissingPartitionParts: no
 // PartitionKeyParts → validation error before any LIST.
 func TestRebuild_RejectsMissingPartitionParts(t *testing.T) {

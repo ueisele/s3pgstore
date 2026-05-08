@@ -259,7 +259,7 @@ func (s *Store[T]) insertMVRows(
 		if len(mv.rows) == 0 {
 			continue
 		}
-		insertSQL := s.names.MVInsertSQL(mv.name, mv.columns)
+		insertSQL := s.sql.mvInserts[mv.name]
 		for i, r := range mv.rows {
 			args := make([]any, len(r))
 			for j, v := range r {

@@ -61,7 +61,7 @@ func (s *Store[T]) lookupTokenWriteResult(
 	)
 	err := s.cfg.Executor.Run(ctx, func(d DBTX) error {
 		row := d.QueryRow(ctx,
-			s.names.IdempotencyLookupSQL(),
+			s.sql.idempotencyLookup,
 			partitionKey, token)
 		return row.Scan(
 			&fileID, &s3Key, &version,

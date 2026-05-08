@@ -174,29 +174,37 @@ func (s *Store[T]) WriteWithKey(
 //  1. Resolve the per-partition idempotency token (if any) and
 //     short-circuit on a hit against the partial UNIQUE index.
 //  2. Resolve MV rows up front (shape errors fail fast).
-//  3. Generate a fresh S3 key (UUIDv7 + dataKey).
-//  4. INSERT pending_writes via insertPendingWrite — independent
-//     commit on a fresh pool connection (DetachTx). The pre-tx
-//     position is load-bearing for concurrency: relocating this
-//     inside the wrapping tx would force two simultaneous pool
-//     connections per writer and deadlock under load.
-//  5. Wrapping tx via Executor.RunInTx:
+//  3. Encode parquet OUTSIDE the wrapping tx — the PG connection
+//     stays in the pool during compression. On the (rare) OCC
+//     mismatch later, the encoded bytes are wasted; the trade is
+//     deliberate (CLAUDE.md notes WithExpectedVersion writes are
+//     uncommon, the happy path is the hot path).
+//  4. Generate a fresh S3 key (UUIDv7 + dataKey).
+//  5. INSERT pending_writes via insertPendingWriteDetachedTx —
+//     independent commit on a fresh pool connection (DetachTx).
+//     The pre-tx position is load-bearing for concurrency:
+//     relocating this inside the wrapping tx would force two
+//     simultaneous pool connections per writer and deadlock
+//     under load.
+//  6. Wrapping tx via Executor.RunInTx:
 //     a. upsertPartition (returns version; ErrVersionConflict on
-//     OCC mismatch fails fast here).
-//     b. Encode parquet (file_size + uncompressed_size).
-//     c. insertFile (token UNIQUE violation surfaces as
+//     OCC mismatch fails fast here — encoded bytes wasted).
+//     b. insertFile (token UNIQUE violation surfaces as
 //     errTokenRaceLost).
+//     c. BuildS3Metadata (needs `version` from upsertPartition).
 //     d. S3 PUT — s3PutAttempted flips just before so the post-
-//     tx cleanup logic can tell pre-PUT failures apart.
+//     tx cleanup logic can tell pre-PUT failures apart. body
+//     reference is dropped right after to release the encoded
+//     buffer for GC during the trailing SQL.
 //     e. DELETE pending_writes on the wrapping-tx connection
 //     (rollback restores the row → GC sees the orphan).
 //     f. insertMVRows.
 //     g. notifySequencer (queued NOTIFY, delivered at COMMIT).
-//  6. Translate the wrapping-tx error: errTokenRaceLost →
+//  7. Translate the wrapping-tx error: errTokenRaceLost →
 //     re-lookup; ErrVersionConflict → propagate; else wrap.
 //     Pre-PUT failures additionally trigger a best-effort
-//     deletePendingWrite to reclaim the orphan row that GC
-//     would otherwise reap.
+//     deletePendingWriteDetachedTx to reclaim the orphan row
+//     that GC would otherwise reap.
 //
 // CLAUDE.md's invariants pin the ordering rules: the file row
 // before the PUT, the pending_writes pre-tx INSERT before the
@@ -230,29 +238,36 @@ func (s *Store[T]) writePartition(
 		return WriteResult{}, err
 	}
 
-	// 3. Fresh S3 key.
+	// 3. Encode parquet outside the wrapping tx. CPU-bound under
+	//    compression; running here keeps the PG connection pool
+	//    free for siblings.
+	body, uncompressedSize, err := s.encoder.encode(ctx, records)
+	if err != nil {
+		return WriteResult{}, fmt.Errorf("encode parquet: %w", err)
+	}
+	fileSize := len(body)
+
+	// 4. Fresh S3 key.
 	s3Key, err := s.newS3Key(partitionKey)
 	if err != nil {
 		return WriteResult{}, err
 	}
 
-	// 4. Pre-tx pending_writes (independent commit; see
+	// 5. Pre-tx pending_writes (independent commit; see
 	//    CLAUDE.md's orphan-tracking invariant).
-	if err := s.insertPendingWrite(ctx, s3Key); err != nil {
+	if err := s.insertPendingWriteDetachedTx(ctx, s3Key); err != nil {
 		return WriteResult{}, fmt.Errorf(
 			"insert pending_writes: %w", err)
 	}
 
-	// 5. Wrapping tx. s3PutAttempted is the pivot the post-tx
+	// 6. Wrapping tx. s3PutAttempted is the pivot the post-tx
 	//    cleanup uses to tell pre-PUT failures (safe to clean
 	//    up the orphan row) from PUT-or-later failures (PUT may
 	//    have committed; leave for GC).
 	var (
-		version          int64
-		fileID           int64
-		body             []byte
-		uncompressedSize int64
-		s3PutAttempted   bool
+		version        int64
+		fileID         int64
+		s3PutAttempted bool
 	)
 	err = s.cfg.Executor.RunInTx(ctx, func(d DBTX) error {
 		var err error
@@ -266,16 +281,11 @@ func (s *Store[T]) writePartition(
 			return err
 		}
 
-		body, uncompressedSize, err = s.encoder.encode(ctx, records)
-		if err != nil {
-			return fmt.Errorf("encode parquet: %w", err)
-		}
-
 		fileID, err = s.insertFile(ctx, d, fileInsertOpts{
 			PartitionKey:     partitionKey,
 			S3Key:            s3Key,
 			Version:          version,
-			FileSize:         int64(len(body)),
+			FileSize:         int64(fileSize),
 			UncompressedSize: uncompressedSize,
 			RecordCount:      int64(len(records)),
 			Token:            token,
@@ -304,9 +314,14 @@ func (s *Store[T]) writePartition(
 			"application/vnd.apache.parquet", s3Metadata); err != nil {
 			return fmt.Errorf("S3 PUT: %w", err)
 		}
+		// Drop the body reference now that the SDK has consumed
+		// it — under load this releases the encoded buffer for
+		// GC during the trailing DELETE / MV / NOTIFY round
+		// trips instead of holding it until function exit.
+		body = nil
 
 		if _, err := d.Exec(ctx,
-			s.names.PendingWriteDeleteSQL(), s3Key); err != nil {
+			s.sql.pendingWriteDelete, s3Key); err != nil {
 			return fmt.Errorf("delete pending_writes: %w", err)
 		}
 
@@ -316,10 +331,10 @@ func (s *Store[T]) writePartition(
 		return s.notifySequencer(ctx, d)
 	})
 
-	// 6. Error handling: optional pre-tx cleanup + translate.
+	// 7. Error handling: optional pre-tx cleanup + translate.
 	if err != nil {
 		if !s3PutAttempted {
-			if dErr := s.deletePendingWrite(ctx, s3Key); dErr != nil {
+			if dErr := s.deletePendingWriteDetachedTx(ctx, s3Key); dErr != nil {
 				slog.WarnContext(ctx,
 					"s3pgstore: pre-tx pending_writes cleanup failed",
 					"s3_key", s3Key, "err", dErr)
@@ -334,7 +349,7 @@ func (s *Store[T]) writePartition(
 		FileID:           fileID,
 		Version:          version,
 		RecordCount:      len(records),
-		FileSize:         len(body),
+		FileSize:         fileSize,
 		UncompressedSize: uncompressedSize,
 	}, nil
 }
@@ -378,7 +393,7 @@ func (s *Store[T]) upsertPartition(
 	var version int64
 	if opts.ExpectedVersionSet && opts.ExpectedVersion > 0 {
 		err := d.QueryRow(ctx,
-			s.names.PartitionUpdateOCCSQL(),
+			s.sql.partitionUpdateOCC,
 			opts.PartitionKey, opts.ExpectedVersion,
 		).Scan(&version)
 		if err != nil {
@@ -394,11 +409,11 @@ func (s *Store[T]) upsertPartition(
 	for _, v := range opts.PartValues {
 		args = append(args, v)
 	}
-	err := d.QueryRow(ctx,
-		s.names.PartitionUpsertSQL(s.resolved.PartitionKeyParts,
-			opts.ExpectedVersionSet),
-		args...,
-	).Scan(&version)
+	upsertSQL := s.sql.partitionUpsertNoExpect
+	if opts.ExpectedVersionSet {
+		upsertSQL = s.sql.partitionUpsertExpect
+	}
+	err := d.QueryRow(ctx, upsertSQL, args...).Scan(&version)
 	if err != nil {
 		if isNoRowsErr(err) && opts.ExpectedVersionSet {
 			return 0, ErrVersionConflict
@@ -429,11 +444,10 @@ type fileInsertOpts struct {
 // race window — is translated to errTokenRaceLost so the
 // caller can re-lookup the canonical row after rollback.
 //
-// Positional args are still required by the SQL but are built
-// once, in order, mirroring FilesInsertSQL's documented param
-// list ($1=partition_key, $2=s3_key, $3=written_at_version,
+// Positional args mirror s.sql.filesInsert's parameter list:
+// $1=partition_key, $2=s3_key, $3=written_at_version,
 // $4=file_size, $5=uncompressed_size, $6=record_count,
-// $7=idempotency_token, $8…=part_<n>, then ext_<n>).
+// $7=idempotency_token, $8…=part_<n>, then ext_<n>.
 func (s *Store[T]) insertFile(
 	ctx context.Context, d DBTX, row fileInsertOpts,
 ) (int64, error) {
@@ -441,24 +455,20 @@ func (s *Store[T]) insertFile(
 	if row.Token != "" {
 		tokenArg = row.Token
 	}
-	args := []any{
+	args := make([]any, 0,
+		7+len(row.PartValues)+len(s.resolved.ExtensionColumns))
+	args = append(args,
 		row.PartitionKey, row.S3Key, row.Version,
 		row.FileSize, row.UncompressedSize, row.RecordCount,
-		tokenArg,
-	}
+		tokenArg)
 	for _, v := range row.PartValues {
 		args = append(args, v)
 	}
-	extNames := make([]string, len(s.resolved.ExtensionColumns))
-	for i, e := range s.resolved.ExtensionColumns {
-		extNames[i] = e.Name
+	for _, e := range s.resolved.ExtensionColumns {
 		args = append(args, metadataValueFor(row.Metadata, e))
 	}
 	var fileID int64
-	err := d.QueryRow(ctx,
-		s.names.FilesInsertSQL(s.resolved.PartitionKeyParts, extNames),
-		args...,
-	).Scan(&fileID)
+	err := d.QueryRow(ctx, s.sql.filesInsert, args...).Scan(&fileID)
 	if err != nil {
 		if isUniqueViolation(err) && row.Token != "" {
 			return 0, errTokenRaceLost
@@ -518,41 +528,46 @@ func (s *Store[T]) translateWriteTxErr(
 	return WriteResult{}, fmt.Errorf("catalog tx: %w", err)
 }
 
-// insertPendingWrite writes the orphan-tracking row on a fresh
-// pool connection, bypassing any caller-supplied tx via
-// Executor.DetachTx so it commits independently of the
+// insertPendingWriteDetachedTx writes the orphan-tracking row
+// on a fresh pool connection, bypassing any caller-supplied tx
+// via Executor.DetachTx so it commits independently of the
 // surrounding wrapping tx and of any caller WithTx. The row's
 // purpose is to outlive a wrapping-tx rollback so GC can reap
 // the corresponding S3 object — that requires an independent
 // commit. A single-statement Exec auto-commits, so Run is
-// sufficient (no RunInTx needed).
-func (s *Store[T]) insertPendingWrite(
+// sufficient (no RunInTx needed). The DetachedTx suffix is
+// load-bearing in the name: callers MUST NOT reach for this
+// helper from inside a tx that's expected to govern its
+// visibility.
+func (s *Store[T]) insertPendingWriteDetachedTx(
 	ctx context.Context, s3Key string,
 ) error {
 	indCtx := s.cfg.Executor.DetachTx(ctx)
 	return s.cfg.Executor.Run(indCtx, func(d DBTX) error {
 		_, err := d.Exec(indCtx,
-			s.names.PendingWriteInsertSQL(), s3Key)
+			s.sql.pendingWriteInsert, s3Key)
 		return err
 	})
 }
 
-// deletePendingWrite removes a pre-tx pending_writes row on a
-// fresh pool connection (DetachTx, so independent of any
+// deletePendingWriteDetachedTx removes a pending_writes row on
+// a fresh pool connection (DetachTx, so independent of any
 // caller-supplied tx). Used by the writePartition error path
 // to proactively reclaim the orphan record on fail-fast cases
-// where no S3 PUT was attempted; on PUT-attempted paths the
-// row stays and GC handles it.
+// where no S3 PUT was attempted; the success-path DELETE on
+// the wrapping-tx connection lives inline so a rollback
+// restores the row. On PUT-attempted error paths the row stays
+// and GC handles it.
 //
 // Best-effort: the caller logs a warning and ignores any
 // error here, since cmd/s3pgstore-gc remains the safety net.
-func (s *Store[T]) deletePendingWrite(
+func (s *Store[T]) deletePendingWriteDetachedTx(
 	ctx context.Context, s3Key string,
 ) error {
 	indCtx := s.cfg.Executor.DetachTx(ctx)
 	return s.cfg.Executor.Run(indCtx, func(d DBTX) error {
 		_, err := d.Exec(indCtx,
-			s.names.PendingWriteDeleteSQL(), s3Key)
+			s.sql.pendingWriteDelete, s3Key)
 		return err
 	})
 }

@@ -22,6 +22,26 @@ type Store[T any] struct {
 	target   *s3target
 	encoder  *parquetEncoder[T]
 	metrics  *Metrics
+	sql      sqlCache
+}
+
+// sqlCache holds the SQL strings the hot write path renders on
+// every call. Built once in New() because PartitionKeyParts,
+// ExtensionColumns, and MaterializedViews are immutable after
+// Store construction; the underlying catalog.Names methods
+// fmt.Sprintf fresh every call, which would burn ~one alloc per
+// render per Write at hundreds-of-writes/sec.
+//
+// Read-only after New() returns.
+type sqlCache struct {
+	pendingWriteInsert      string
+	pendingWriteDelete      string
+	partitionUpdateOCC      string
+	partitionUpsertExpect   string // ExpectedVersionSet=true variant
+	partitionUpsertNoExpect string // ExpectedVersionSet=false variant
+	filesInsert             string
+	idempotencyLookup       string
+	mvInserts               map[string]string // MV.Name → INSERT SQL
 }
 
 // New constructs a Store[T] for cfg. Validates cfg, resolves
@@ -66,16 +86,36 @@ func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
 		return nil, fmt.Errorf("register metrics: %w", err)
 	}
 
+	names := catalog.NewNames(r.SchemaName, r.TablePrefix)
+	extNames := make([]string, len(r.ExtensionColumns))
+	for i, e := range r.ExtensionColumns {
+		extNames[i] = e.Name
+	}
+	sql := sqlCache{
+		pendingWriteInsert:      names.PendingWriteInsertSQL(),
+		pendingWriteDelete:      names.PendingWriteDeleteSQL(),
+		partitionUpdateOCC:      names.PartitionUpdateOCCSQL(),
+		partitionUpsertExpect:   names.PartitionUpsertSQL(r.PartitionKeyParts, true),
+		partitionUpsertNoExpect: names.PartitionUpsertSQL(r.PartitionKeyParts, false),
+		filesInsert:             names.FilesInsertSQL(r.PartitionKeyParts, extNames),
+		idempotencyLookup:       names.IdempotencyLookupSQL(),
+		mvInserts:               make(map[string]string, len(cfg.MaterializedViews)),
+	}
+	for _, mv := range cfg.MaterializedViews {
+		sql.mvInserts[mv.Name] = names.MVInsertSQL(mv.Name, mv.Columns)
+	}
+
 	return &Store[T]{
 		cfg:      cfg,
 		resolved: r,
-		names:    catalog.NewNames(r.SchemaName, r.TablePrefix),
+		names:    names,
 		target:   target,
 		encoder: newParquetEncoder[T](codec, bufCap, func(ctx context.Context) {
 			// Phase 16.x wires the encode_buf_dropped counter
 			// here once the metrics surface expands.
 		}),
 		metrics: metrics,
+		sql:     sql,
 	}, nil
 }
 

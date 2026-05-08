@@ -205,6 +205,20 @@ type mvWriteRows struct {
 // records and returns the per-MV tuple sets. Validates that
 // each emitted tuple's length matches len(Columns) — shape
 // errors surface here, before the catalog tx opens.
+//
+// Tuples are deduplicated within a single Write: if Of emits
+// the same tuple from N different records (or the same record
+// emits a tuple twice), only the first occurrence ships to
+// PostgreSQL. The MV's all-column primary key + ON CONFLICT DO
+// NOTHING gives the same end state either way, but client-side
+// dedup spares wire bytes and PG-side conflict checks
+// proportional to the duplicate rate. Cross-Write dedup is
+// already free via the PK; this only collapses intra-Write
+// duplicates.
+//
+// Dedup key uses NUL as the separator between column values,
+// which is collision-free because PostgreSQL TEXT forbids the
+// NUL byte at the protocol level.
 func (s *Store[T]) resolveMVRows(records []T) ([]mvWriteRows, error) {
 	if len(s.cfg.MaterializedViews) == 0 {
 		return nil, nil
@@ -212,6 +226,7 @@ func (s *Store[T]) resolveMVRows(records []T) ([]mvWriteRows, error) {
 	out := make([]mvWriteRows, 0, len(s.cfg.MaterializedViews))
 	for _, mv := range s.cfg.MaterializedViews {
 		rows := [][]string{}
+		seen := make(map[string]struct{})
 		for i, rec := range records {
 			emitted, err := mv.Of(rec)
 			if err != nil {
@@ -227,6 +242,11 @@ func (s *Store[T]) resolveMVRows(records []T) ([]mvWriteRows, error) {
 						mv.Name, j, i,
 						len(r), len(mv.Columns))
 				}
+				key := strings.Join(r, "\x00")
+				if _, dup := seen[key]; dup {
+					continue
+				}
+				seen[key] = struct{}{}
 				rows = append(rows, r)
 			}
 		}

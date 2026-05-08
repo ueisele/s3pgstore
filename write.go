@@ -124,7 +124,8 @@ func (s *Store[T]) Write(
 	// canonical row regardless of which partitions committed
 	// first.
 	out = make([]WriteResult, len(keys))
-	if err := fanOut(ctx, keys, s.target.effectiveConcurrency(), nil,
+	if err := fanOut(ctx, keys, s.target.effectiveConcurrency(),
+		s.metrics.fanOutObserverFor("Write"),
 		func(ctx context.Context, i int, key string) error {
 			res, err := s.writePartition(ctx, key,
 				keyValues[key], groups[key], o)
@@ -153,7 +154,9 @@ func (s *Store[T]) Write(
 func (s *Store[T]) WriteWithKey(
 	ctx context.Context, partitionKey string, records []T,
 	opts ...WriteOption,
-) (WriteResult, error) {
+) (res WriteResult, err error) {
+	defer s.metrics.methodScope(ctx, "WriteWithKey", &err).end()
+
 	if len(records) == 0 {
 		return WriteResult{}, errors.New(
 			"WriteWithKey: records is empty")
@@ -226,6 +229,7 @@ func (s *Store[T]) writePartition(
 			return WriteResult{}, fmt.Errorf(
 				"lookup token: %w", err)
 		}
+		s.metrics.recordLookupByToken(ctx, ok)
 		if ok {
 			return existing, nil
 		}
@@ -343,6 +347,8 @@ func (s *Store[T]) writePartition(
 		return s.translateWriteTxErr(ctx, err, partitionKey, token)
 	}
 
+	s.metrics.recordWriteVolume(ctx,
+		int64(fileSize), int64(len(records)))
 	return WriteResult{
 		PartitionKey:     partitionKey,
 		S3Key:            s3Key,
@@ -519,12 +525,14 @@ func (s *Store[T]) translateWriteTxErr(
 	ctx context.Context, err error, partitionKey, token string,
 ) (WriteResult, error) {
 	if errors.Is(err, errTokenRaceLost) {
+		s.metrics.recordTokenRaceRetry(ctx)
 		existing, ok, lookupErr := s.lookupTokenWriteResult(
 			ctx, partitionKey, token)
 		if lookupErr != nil {
 			return WriteResult{}, fmt.Errorf(
 				"token-race re-lookup: %w", lookupErr)
 		}
+		s.metrics.recordLookupByToken(ctx, ok)
 		if !ok {
 			return WriteResult{}, errors.New(
 				"token UNIQUE conflict but lookup " +
@@ -533,6 +541,7 @@ func (s *Store[T]) translateWriteTxErr(
 		return existing, nil
 	}
 	if errors.Is(err, ErrVersionConflict) {
+		s.metrics.recordOCCConflict(ctx)
 		return WriteResult{}, ErrVersionConflict
 	}
 	return WriteResult{}, fmt.Errorf("catalog tx: %w", err)

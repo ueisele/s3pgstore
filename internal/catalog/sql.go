@@ -170,6 +170,25 @@ func (n Names) MVInsertSQL(mvName string, columns []string) string {
 		tbl, colList, strings.Join(arrParams, ", "), colList)
 }
 
+// PollLagSQL returns the SELECT used by the
+// s3pgstore.poll.lag observable gauge: seconds since the most
+// recent feed_seq_at stamp on a sequenced row, or NULL when no
+// row is sequenced yet (caller treats NULL as "no observation").
+func (n Names) PollLagSQL() string {
+	return fmt.Sprintf(
+		`SELECT EXTRACT(EPOCH FROM (now() - MAX(feed_seq_at)))
+		FROM %s WHERE feed_seq IS NOT NULL`,
+		n.Files())
+}
+
+// PendingWritesDepthSQL returns the COUNT used by the
+// s3pgstore.pending_writes.depth observable gauge.
+// pending_writes is bounded by design (one row per failed
+// write), so a full table scan is fine.
+func (n Names) PendingWritesDepthSQL() string {
+	return fmt.Sprintf(`SELECT COUNT(*) FROM %s`, n.PendingWrites())
+}
+
 // FilesInsertSQL returns the INSERT statement for the catalog
 // row that anchors a written parquet file. The parameter list
 // is positional in this order:

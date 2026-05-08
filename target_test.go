@@ -57,7 +57,7 @@ func TestIsTransientS3Error(t *testing.T) {
 // TestRetry_FastPath: fn succeeds on first attempt, no retries.
 func TestRetry_FastPath(t *testing.T) {
 	calls := 0
-	err := retry(context.Background(), "test", nil, func() error {
+	attempts, err := retry(context.Background(), "test", nil, func() error {
 		calls++
 		return nil
 	})
@@ -67,6 +67,9 @@ func TestRetry_FastPath(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("calls: want 1, got %d", calls)
 	}
+	if attempts != 1 {
+		t.Fatalf("attempts: want 1, got %d", attempts)
+	}
 }
 
 // TestRetry_TransientThenSuccess: fn fails twice transient,
@@ -75,7 +78,7 @@ func TestRetry_FastPath(t *testing.T) {
 // test suite materially.
 func TestRetry_TransientThenSuccess(t *testing.T) {
 	var calls atomic.Int32
-	err := retry(context.Background(), "test", nil, func() error {
+	attempts, err := retry(context.Background(), "test", nil, func() error {
 		n := calls.Add(1)
 		if n < 3 {
 			return transientHTTP(503)
@@ -88,6 +91,9 @@ func TestRetry_TransientThenSuccess(t *testing.T) {
 	if calls.Load() != 3 {
 		t.Fatalf("calls: want 3, got %d", calls.Load())
 	}
+	if attempts != 3 {
+		t.Fatalf("attempts: want 3, got %d", attempts)
+	}
 }
 
 // TestRetry_TerminalError: a non-transient error returns
@@ -95,7 +101,7 @@ func TestRetry_TransientThenSuccess(t *testing.T) {
 func TestRetry_TerminalError(t *testing.T) {
 	calls := 0
 	want := transientHTTP(404) // 404 is not transient
-	err := retry(context.Background(), "test", nil, func() error {
+	attempts, err := retry(context.Background(), "test", nil, func() error {
 		calls++
 		return want
 	})
@@ -105,13 +111,16 @@ func TestRetry_TerminalError(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("calls: want 1, got %d", calls)
 	}
+	if attempts != 1 {
+		t.Fatalf("attempts: want 1, got %d", attempts)
+	}
 }
 
 // TestRetry_ExhaustedBudget: every attempt fails transient. The
 // caller sees the last error after retryMaxAttempts attempts.
 func TestRetry_ExhaustedBudget(t *testing.T) {
 	calls := 0
-	err := retry(context.Background(), "test", nil, func() error {
+	attempts, err := retry(context.Background(), "test", nil, func() error {
 		calls++
 		return transientHTTP(500)
 	})
@@ -121,6 +130,9 @@ func TestRetry_ExhaustedBudget(t *testing.T) {
 	if calls != retryMaxAttempts {
 		t.Fatalf("calls: want %d, got %d", retryMaxAttempts, calls)
 	}
+	if attempts != retryMaxAttempts {
+		t.Fatalf("attempts: want %d, got %d", retryMaxAttempts, attempts)
+	}
 }
 
 // TestRetry_ContextCancellation: ctx cancelled mid-backoff
@@ -128,7 +140,7 @@ func TestRetry_ExhaustedBudget(t *testing.T) {
 func TestRetry_ContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancelled immediately
-	err := retry(ctx, "test", nil, func() error {
+	_, err := retry(ctx, "test", nil, func() error {
 		return transientHTTP(500)
 	})
 	if !errors.Is(err, context.Canceled) {
@@ -138,12 +150,17 @@ func TestRetry_ContextCancellation(t *testing.T) {
 
 // TestRetry_OnTransientCallback fires once per masked transient
 // failure (every attempt that returns transient, even if a
-// later attempt succeeds).
+// later attempt succeeds). The callback receives the 1-based
+// attempt index of the failed attempt.
 func TestRetry_OnTransientCallback(t *testing.T) {
 	transients := 0
+	var lastAttempt int
 	calls := 0
-	err := retry(context.Background(), "test",
-		func(error) { transients++ },
+	_, err := retry(context.Background(), "test",
+		func(attempt int, _ error) {
+			transients++
+			lastAttempt = attempt
+		},
 		func() error {
 			calls++
 			if calls < 3 {
@@ -157,6 +174,12 @@ func TestRetry_OnTransientCallback(t *testing.T) {
 	}
 	if transients != 2 {
 		t.Fatalf("onTransient fire count: want 2, got %d", transients)
+	}
+	// lastAttempt is 1-based and corresponds to the index of the
+	// failed attempt — attempt 2 was the last one that returned
+	// transient before the third attempt succeeded.
+	if lastAttempt != 2 {
+		t.Fatalf("lastAttempt: want 2, got %d", lastAttempt)
 	}
 }
 

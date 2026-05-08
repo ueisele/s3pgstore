@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/ueisele/s3pgstore/internal/catalog"
 )
@@ -65,6 +66,12 @@ type Config struct {
 	// BatchSize bounds rows scanned per RunOnce call. Default
 	// DefaultBatchSize (1000).
 	BatchSize int
+
+	// Meter is the OTel meter the gc binary registers its
+	// instruments against. Nil resolves to a no-op meter so
+	// telemetry is opt-in. See gc/metrics.go for the registered
+	// instruments.
+	Meter metric.Meter
 }
 
 func (c Config) resolved() Config {
@@ -116,6 +123,16 @@ func RunOnce(ctx context.Context, cfg Config) (int, error) {
 		return 0, err
 	}
 	r := cfg.resolved()
+	m, err := newMetrics(r)
+	if err != nil {
+		return 0, fmt.Errorf("register gc metrics: %w", err)
+	}
+	return runOnceWithMetrics(ctx, r, m)
+}
+
+func runOnceWithMetrics(
+	ctx context.Context, r Config, m *Metrics,
+) (int, error) {
 	names := catalog.NewNames(r.SchemaName, r.TablePrefix)
 
 	cutoff := time.Now().Add(-r.Grace).UTC()
@@ -127,6 +144,7 @@ func RunOnce(ctx context.Context, cfg Config) (int, error) {
 	reclaimed := 0
 	for _, key := range rows {
 		if err := ctx.Err(); err != nil {
+			m.recordReclaimed(ctx, reclaimed)
 			return reclaimed, err
 		}
 		if err := reclaimOne(ctx, r, names, key); err != nil {
@@ -139,6 +157,7 @@ func RunOnce(ctx context.Context, cfg Config) (int, error) {
 		}
 		reclaimed++
 	}
+	m.recordReclaimed(ctx, reclaimed)
 	return reclaimed, nil
 }
 
@@ -153,9 +172,13 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	r := cfg.resolved()
+	m, err := newMetrics(r)
+	if err != nil {
+		return fmt.Errorf("register gc metrics: %w", err)
+	}
 
 	for {
-		n, err := RunOnce(ctx, r)
+		n, err := runOnceWithMetrics(ctx, r, m)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return err

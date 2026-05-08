@@ -3,6 +3,7 @@ package s3pgstore
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/parquet-go/parquet-go/compress"
 
@@ -41,6 +42,8 @@ type sqlCache struct {
 	partitionUpsertNoExpect string // ExpectedVersionSet=false variant
 	filesInsert             string
 	idempotencyLookup       string
+	pollLag                 string            // observable-gauge query
+	pendingWritesDepth      string            // observable-gauge query
 	mvInserts               map[string]string // MV.Name → INSERT SQL
 }
 
@@ -68,22 +71,8 @@ func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
 		bufCap = defaultEncodeBufPoolMaxBytes
 	}
 
-	target, err := newS3Target(s3TargetConfig{
-		S3Client: r.S3Client,
-		Bucket:   r.Bucket,
-		Prefix:   r.Prefix,
-	})
-	if err != nil {
-		return nil, err
-	}
-
 	if err := NewSchemaManager(cfg).Validate(ctx); err != nil {
 		return nil, err
-	}
-
-	metrics, err := newMetrics(cfg.Meter)
-	if err != nil {
-		return nil, fmt.Errorf("register metrics: %w", err)
 	}
 
 	names := catalog.NewNames(r.SchemaName, r.TablePrefix)
@@ -99,10 +88,52 @@ func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
 		partitionUpsertNoExpect: names.PartitionUpsertSQL(r.PartitionKeyParts, false),
 		filesInsert:             names.FilesInsertSQL(r.PartitionKeyParts, extNames),
 		idempotencyLookup:       names.IdempotencyLookupSQL(),
+		pollLag:                 names.PollLagSQL(),
+		pendingWritesDepth:      names.PendingWritesDepthSQL(),
 		mvInserts:               make(map[string]string, len(cfg.MaterializedViews)),
 	}
 	for _, mv := range cfg.MaterializedViews {
 		sql.mvInserts[mv.Name] = names.MVInsertSQL(mv.Name, mv.Columns)
+	}
+
+	// Observable-gauge data sources. Each closure runs once per
+	// OTel collection cycle on the executor's pool — bounded SQL
+	// against indexed columns; safe to invoke under load.
+	pollLagFn := func(ctx context.Context) (time.Duration, bool, error) {
+		var lagSec *float64
+		err := cfg.Executor.Run(ctx, func(d DBTX) error {
+			return d.QueryRow(ctx, sql.pollLag).Scan(&lagSec)
+		})
+		if err != nil || lagSec == nil {
+			return 0, false, err
+		}
+		return time.Duration(*lagSec * float64(time.Second)), true, nil
+	}
+	pendingWritesDepthFn := func(ctx context.Context) (int64, error) {
+		var n int64
+		err := cfg.Executor.Run(ctx, func(d DBTX) error {
+			return d.QueryRow(ctx, sql.pendingWritesDepth).Scan(&n)
+		})
+		return n, err
+	}
+
+	metrics, err := newMetrics(metricsConfig{
+		Meter:                cfg.Meter,
+		PollLagFn:            pollLagFn,
+		PendingWritesDepthFn: pendingWritesDepthFn,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("register metrics: %w", err)
+	}
+
+	target, err := newS3Target(s3TargetConfig{
+		S3Client: r.S3Client,
+		Bucket:   r.Bucket,
+		Prefix:   r.Prefix,
+		Metrics:  metrics,
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	return &Store[T]{
@@ -110,10 +141,8 @@ func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
 		resolved: r,
 		names:    names,
 		target:   target,
-		encoder: newParquetEncoder[T](codec, bufCap, func(ctx context.Context) {
-			// Phase 16.x wires the encode_buf_dropped counter
-			// here once the metrics surface expands.
-		}),
+		encoder: newParquetEncoder[T](codec, bufCap,
+			metrics.recordEncodeBufDropped),
 		metrics: metrics,
 		sql:     sql,
 	}, nil

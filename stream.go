@@ -87,7 +87,8 @@ func WithUntilOffset(until Offset) PollOption {
 // surviving entries to ReadEntriesIter for decoding.
 func (s *Store[T]) Poll(
 	ctx context.Context, since Offset, n int, opts ...PollOption,
-) ([]StreamEntry, Offset, error) {
+) (out []StreamEntry, next Offset, err error) {
+	defer s.metrics.methodScope(ctx, "Poll", &err).end()
 	if n <= 0 {
 		return nil, since, nil
 	}
@@ -113,9 +114,8 @@ func (s *Store[T]) Poll(
 		LIMIT $2`,
 		strings.Join(cols, ", "), s.names.Files(), where)
 
-	var out []StreamEntry
 	maxOffset := since
-	err := s.cfg.Executor.Run(ctx, func(d DBTX) error {
+	err = s.cfg.Executor.Run(ctx, func(d DBTX) error {
 		rows, err := d.Query(ctx, q, args...)
 		if err != nil {
 			return err
@@ -173,7 +173,9 @@ func (s *Store[T]) Poll(
 // database.
 func (s *Store[T]) PollRecords(
 	ctx context.Context, since Offset, n int, opts ...PollOption,
-) ([]T, Offset, error) {
+) (out []T, next Offset, err error) {
+	defer s.metrics.methodScope(ctx, "PollRecords", &err).end()
+
 	entries, next, err := s.Poll(ctx, since, n, opts...)
 	if err != nil {
 		return nil, since, err
@@ -183,7 +185,8 @@ func (s *Store[T]) PollRecords(
 	}
 
 	bodies := make([][]T, len(entries))
-	if err := fanOut(ctx, entries, s.target.effectiveConcurrency(), nil,
+	if err := fanOut(ctx, entries, s.target.effectiveConcurrency(),
+		s.metrics.fanOutObserverFor("PollRecords"),
 		func(ctx context.Context, i int, e StreamEntry) error {
 			data, err := s.target.get(ctx, e.DataPath)
 			if err != nil {
@@ -204,7 +207,7 @@ func (s *Store[T]) PollRecords(
 	for _, b := range bodies {
 		total += len(b)
 	}
-	out := make([]T, 0, total)
+	out = make([]T, 0, total)
 	for _, b := range bodies {
 		out = append(out, b...)
 	}
@@ -222,13 +225,14 @@ func (s *Store[T]) PollRecords(
 // treat 0 as "no result" without a separate not-found signal.
 func (s *Store[T]) OffsetAt(
 	ctx context.Context, t time.Time,
-) (Offset, error) {
+) (out Offset, err error) {
+	defer s.metrics.methodScope(ctx, "OffsetAt", &err).end()
 	q := fmt.Sprintf(
 		`SELECT MIN(feed_seq) FROM %s
 		WHERE feed_seq IS NOT NULL AND feed_seq_at >= $1`,
 		s.names.Files())
 	var off *int64
-	err := s.cfg.Executor.Run(ctx, func(d DBTX) error {
+	err = s.cfg.Executor.Run(ctx, func(d DBTX) error {
 		row := d.QueryRow(ctx, q, t.UTC())
 		return row.Scan(&off)
 	})

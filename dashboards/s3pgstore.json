@@ -3,10 +3,7 @@
     "list": [
       {
         "builtIn": 1,
-        "datasource": {
-          "type": "grafana",
-          "uid": "-- Grafana --"
-        },
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
         "enable": true,
         "hide": true,
         "iconColor": "rgba(0, 211, 255, 1)",
@@ -15,138 +12,321 @@
       }
     ]
   },
-  "description": "s3pgstore observability — starter dashboard. Phase 16 of the v2.0 plan calls for ~10 section rows and ~30 panels covering write/read volumes, S3 ops, sequencer state, iter pipeline saturation, and catalog locking. This file ships the foundation: section rows + panels for the two metrics wired in v2.0 (s3pgstore.method.duration and s3pgstore.method.calls). Operators should expand panels as additional metrics land per CLAUDE.md § Metrics ↔ dashboard sync.",
+  "description": "s3pgstore observability dashboard. Covers public-method timing, write volumes, S3 ops + transient-error ratio, target saturation, fan-out shape, sequencer & feed lag, catalog/locking, and GC. Each panel filters to the selected cluster/stage/namespace/bucket/prefix; quantile panels show P50+P95+P99, size+count histograms additionally show P100. The iter-pipeline saturation panels (body-slot wait, byte-budget wait, decode duration, stall counter) are reserved for the vendored chan-based pipeline (Phase 12.x); v2.0 ships a serial pipeline so those instruments do not yet emit.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
   "id": null,
   "links": [],
   "panels": [
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0}, "id": 100, "panels": [], "title": "Library methods — selected bucket/prefix", "type": "row"},
     {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 0
-      },
-      "id": 100,
-      "panels": [],
-      "title": "Library methods — selected bucket/prefix",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource_metrics}"
-      },
-      "description": "Per-method duration percentiles. Labels filtered to the selected bucket/prefix/cluster/stage. Min step 1m matches workload granularity (per s3store dashboard convention).",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisLabel": "",
-            "drawStyle": "line",
-            "lineWidth": 1
-          },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 1
-      },
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Per-method duration percentiles. Method labels include Write, WriteWithKey, Read, ReadIter, ReadPartitionIter, ReadRangeIter, ReadPartitionRangeIter, ReadEntriesIter, ReadPartitionEntriesIter, Poll, PollRecords, OffsetAt, LookupByToken, LockPartition, MaterializedView.Lookup. Min step 1m matches workload granularity.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisLabel": "", "drawStyle": "line", "lineWidth": 1}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 1},
       "id": 101,
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
       "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource_metrics}"
-          },
-          "expr": "histogram_quantile(0.50, sum by (le, method) (rate(s3pgstore_method_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))",
-          "legendFormat": "P50 {{method}}",
-          "interval": "1m",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource_metrics}"
-          },
-          "expr": "histogram_quantile(0.95, sum by (le, method) (rate(s3pgstore_method_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))",
-          "legendFormat": "P95 {{method}}",
-          "interval": "1m",
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource_metrics}"
-          },
-          "expr": "histogram_quantile(0.99, sum by (le, method) (rate(s3pgstore_method_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))",
-          "legendFormat": "P99 {{method}}",
-          "interval": "1m",
-          "refId": "C"
-        }
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.50, sum by (le, method) (rate(s3pgstore_method_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P50 {{method}}", "interval": "1m", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.95, sum by (le, method) (rate(s3pgstore_method_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P95 {{method}}", "interval": "1m", "refId": "B"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.99, sum by (le, method) (rate(s3pgstore_method_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P99 {{method}}", "interval": "1m", "refId": "C"}
       ],
       "title": "Method duration (P50/P95/P99)",
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource_metrics}"
-      },
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "description": "Method call rate by outcome. A non-zero rate of outcome=\"error\" indicates failures the application should investigate; outcome=\"canceled\" usually reflects caller-side ctx cancellation rather than library failure.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "unit": "ops"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 1
-      },
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 12, "y": 1},
       "id": 102,
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource_metrics}"
-          },
-          "expr": "sum by (method, outcome) (rate(s3pgstore_method_calls_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval]))",
-          "legendFormat": "{{method}} / {{outcome}}",
-          "interval": "1m",
-          "refId": "A"
-        }
-      ],
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum by (method, outcome) (rate(s3pgstore_method_calls_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval]))", "legendFormat": "{{method}} / {{outcome}}", "interval": "1m", "refId": "A"}],
       "title": "Method call rate by outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Method calls currently in flight. Real-time gauge — does not depend on rate-window estimation. Sustained climbs without a corresponding call-rate spike indicate the method is blocking longer than usual.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 4, "x": 20, "y": 1},
+      "id": 103,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum by (method) (s3pgstore_method_in_flight{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"})", "legendFormat": "{{method}}", "refId": "A"}],
+      "title": "Method in-flight",
+      "type": "timeseries"
+    },
+
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 9}, "id": 200, "panels": [], "title": "Write volumes", "type": "row"},
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Compressed parquet bytes per Write/WriteWithKey call. P100 is the load-bearing signal for EncodeBufPoolMaxBytes tuning — a sustained P100 above the cap means the encode buffer pool is dropping oversized buffers (see s3pgstore.write.encode_buf_dropped panel). Bucket boundaries include 8/32/64 MiB to resolve typical workload-tail sizing decisions.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "bytes"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 10},
+      "id": 201,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.50, sum by (le) (rate(s3pgstore_write_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P50", "interval": "1m", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.95, sum by (le) (rate(s3pgstore_write_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P95", "interval": "1m", "refId": "B"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.99, sum by (le) (rate(s3pgstore_write_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P99", "interval": "1m", "refId": "C"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(1.0, sum by (le) (rate(s3pgstore_write_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P100 (EncodeBufPoolMaxBytes tuning signal)", "interval": "1m", "refId": "D"}
+      ],
+      "title": "Bytes per write (P50/P95/P99/P100)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Records per Write/WriteWithKey call (total across all partitions for a multi-partition Write).",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 10},
+      "id": 202,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.50, sum by (le) (rate(s3pgstore_write_records_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P50", "interval": "1m", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.95, sum by (le) (rate(s3pgstore_write_records_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P95", "interval": "1m", "refId": "B"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.99, sum by (le) (rate(s3pgstore_write_records_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P99", "interval": "1m", "refId": "C"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(1.0, sum by (le) (rate(s3pgstore_write_records_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P100", "interval": "1m", "refId": "D"}
+      ],
+      "title": "Records per write (P50/P95/P99/P100)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Encode buffers dropped after exceeding EncodeBufPoolMaxBytes. Incident counter — non-zero rate means the cap is undersized for the workload (oversized buffers are discarded instead of pooled, defeating the encoder's amortisation). Pair with the bytes/write P100 panel above to size the cap.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.001}, {"color": "red", "value": 0.1}]}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 18},
+      "id": 203,
+      "options": {"colorMode": "background", "graphMode": "area"},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum (rate(s3pgstore_write_encode_buf_dropped_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval]))", "interval": "1m", "refId": "A"}],
+      "title": "Encode buffer dropped rate (incident — undersized cap)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Token-race re-lookups: a concurrent writer hit the (partition_key, idempotency_token) partial UNIQUE first, our INSERT bounced, and we re-fetched their canonical row. Sustained high rate = workload bug (shared token across producers) or bad token-derivation logic.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.001}, {"color": "red", "value": 0.1}]}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 18},
+      "id": 204,
+      "options": {"colorMode": "background", "graphMode": "area"},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum (rate(s3pgstore_write_token_race_retry_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval]))", "interval": "1m", "refId": "A"}],
+      "title": "Token-race retry rate (incident — workload contention)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "OCC version-conflict rate. Spikes indicate WithExpectedVersion writes are colliding — review write fan-in or partition strategy.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.001}, {"color": "red", "value": 0.1}]}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 18},
+      "id": 205,
+      "options": {"colorMode": "background", "graphMode": "area"},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum (rate(s3pgstore_occ_version_conflict_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval]))", "interval": "1m", "refId": "A"}],
+      "title": "OCC version-conflict rate (incident)",
+      "type": "stat"
+    },
+
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 24}, "id": 300, "panels": [], "title": "S3 ops + transient-error ratio", "type": "row"},
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "S3 wrapper call rate by op + outcome. The library's view: one increment per logical op (acquire + retry + release). For wire-level retry diagnostics enable AWS SDK middleware metrics (see README § Observability — they cover every retry separately).",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 25},
+      "id": 301,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum by (s3pgstore_operation, outcome) (rate(s3pgstore_s3_request_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval]))", "legendFormat": "{{s3pgstore_operation}} / {{outcome}}", "interval": "1m", "refId": "A"}],
+      "title": "S3 op call rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Share of S3 wrapper calls that hit a transient cause inside retry(), broken down by op × error.type. Numerator is rate(s3pgstore_s3_transient_error_count_total) — fires once per failed attempt (whether followed by another retry or the terminal one). Denominator is rate(s3pgstore_s3_request_count_total{s3pgstore_attempts!=\"0\"}) — total wrapper calls excluding the rare semaphore-cancelled exit. Ratio can exceed 100% when calls retry multiple times per call (every retry is one transient event against one call) — that's a sustained-pressure signal worth investigating. error.type=slowdown means S3 is throttling (HTTP 429 OR 503-with-SlowDown API code); error.type=server is a real outage; error.type=transport is a network-level failure.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 25},
+      "id": 302,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum by (s3pgstore_operation, error_type) (rate(s3pgstore_s3_transient_error_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])) / on (s3pgstore_operation) group_left sum by (s3pgstore_operation) (rate(s3pgstore_s3_request_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\", s3pgstore_attempts!=\"0\"}[$__rate_interval]))", "legendFormat": "{{s3pgstore_operation}} / {{error_type}}", "interval": "1m", "refId": "A"}],
+      "title": "S3 transient-error ratio (op × error.type)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "S3 wrapper duration percentiles per op (acquire + retry + release).",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 33},
+      "id": 303,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.50, sum by (le, s3pgstore_operation) (rate(s3pgstore_s3_request_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P50 {{s3pgstore_operation}}", "interval": "1m", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.95, sum by (le, s3pgstore_operation) (rate(s3pgstore_s3_request_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P95 {{s3pgstore_operation}}", "interval": "1m", "refId": "B"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.99, sum by (le, s3pgstore_operation) (rate(s3pgstore_s3_request_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P99 {{s3pgstore_operation}}", "interval": "1m", "refId": "C"}
+      ],
+      "title": "S3 op duration (P50/P95/P99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Wire-bytes per S3 PUT (compressed body) / GET (per-file fetch size). PUT samples sit alongside the uncompressed write.bytes metric; GET samples reflect per-file fetch size for capacity planning.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "bytes"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 33},
+      "id": 304,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.50, sum by (le, s3pgstore_operation) (rate(s3pgstore_s3_body_size_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P50 {{s3pgstore_operation}}", "interval": "1m", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.95, sum by (le, s3pgstore_operation) (rate(s3pgstore_s3_body_size_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P95 {{s3pgstore_operation}}", "interval": "1m", "refId": "B"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.99, sum by (le, s3pgstore_operation) (rate(s3pgstore_s3_body_size_bytes_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P99 {{s3pgstore_operation}}", "interval": "1m", "refId": "C"}
+      ],
+      "title": "S3 body size (P50/P95/P99)",
+      "type": "timeseries"
+    },
+
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 41}, "id": 400, "panels": [], "title": "Target saturation (MaxInflightRequests semaphore)", "type": "row"},
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Time waiting for an MaxInflightRequests semaphore slot before issuing an S3 request. Sustained non-zero P95 indicates the cap is undersized — operators tune via Config.MaxInflightRequests.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 42},
+      "id": 401,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.50, sum by (le, s3pgstore_operation) (rate(s3pgstore_target_sem_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P50 {{s3pgstore_operation}}", "interval": "1m", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.95, sum by (le, s3pgstore_operation) (rate(s3pgstore_target_sem_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P95 {{s3pgstore_operation}}", "interval": "1m", "refId": "B"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.99, sum by (le, s3pgstore_operation) (rate(s3pgstore_target_sem_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P99 {{s3pgstore_operation}}", "interval": "1m", "refId": "C"}
+      ],
+      "title": "Sem wait duration (P50/P95/P99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Real-time semaphore depth: in-flight = currently issued S3 requests; waiting = goroutines blocked acquiring a slot. waiting > 0 sustained = bump MaxInflightRequests.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 42},
+      "id": 402,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum by (s3pgstore_operation) (s3pgstore_target_sem_inflight{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"})", "legendFormat": "inflight {{s3pgstore_operation}}", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum by (s3pgstore_operation) (s3pgstore_target_sem_waiting{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"})", "legendFormat": "waiting {{s3pgstore_operation}}", "refId": "B"}
+      ],
+      "title": "Sem inflight / waiting",
+      "type": "timeseries"
+    },
+
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 50}, "id": 500, "panels": [], "title": "Fan-out shape", "type": "row"},
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Partitions per multi-partition Write call. Capacity planning — are users hitting the library with 10 partitions per call or 1000?",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 51},
+      "id": 501,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.50, sum by (le, method) (rate(s3pgstore_fanout_partitions_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P50 {{method}}", "interval": "1m", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.95, sum by (le, method) (rate(s3pgstore_fanout_partitions_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P95 {{method}}", "interval": "1m", "refId": "B"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.99, sum by (le, method) (rate(s3pgstore_fanout_partitions_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P99 {{method}}", "interval": "1m", "refId": "C"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(1.0, sum by (le, method) (rate(s3pgstore_fanout_partitions_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P100 {{method}}", "interval": "1m", "refId": "D"}
+      ],
+      "title": "Fanout partitions per call (P50/P95/P99/P100)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Items dispatched per fan-out call: Write = partitions, PollRecords = entries.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 51},
+      "id": 502,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.95, sum by (le, method) (rate(s3pgstore_fanout_items_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P95 {{method}}", "interval": "1m", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.99, sum by (le, method) (rate(s3pgstore_fanout_items_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P99 {{method}}", "interval": "1m", "refId": "B"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(1.0, sum by (le, method) (rate(s3pgstore_fanout_items_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P100 {{method}}", "interval": "1m", "refId": "C"}
+      ],
+      "title": "Fanout items per call (P95/P99/P100)",
+      "type": "timeseries"
+    },
+
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 59}, "id": 600, "panels": [], "title": "Sequencer & feed", "type": "row"},
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "End-to-end stream lag: now() − latest feed_seq_at. Sustained non-zero = sequencer not keeping up with write rate. Headline metric for stream consumers.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 60},
+      "id": 601,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "max (s3pgstore_poll_lag_seconds{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"})", "legendFormat": "lag", "refId": "A"}],
+      "title": "Poll lag (now − latest feed_seq_at)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Sequencer pending backlog: count of files with feed_seq IS NULL waiting for assignment. Sustained growth = sequencer falling behind. Reported by the sequencer process.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 60},
+      "id": 602,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "max (s3pgstore_sequencer_unsequenced{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\"})", "legendFormat": "unsequenced", "refId": "A"}],
+      "title": "Sequencer unsequenced backlog",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Sequencer assignment rate. Heartbeat: a flat-zero rate under sustained writes means the sequencer is alive but not making progress — investigate immediately.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "rps"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 60},
+      "id": 603,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum (rate(s3pgstore_sequencer_assigned_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\"}[$__rate_interval]))", "legendFormat": "assigned/s", "interval": "1m", "refId": "A"}],
+      "title": "Sequencer assignment rate (heartbeat)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Time spent acquiring the sequencer's pg_advisory_xact_lock before the assignment statement runs. Non-zero P95 = a duplicate sequencer is racing or another tx holds the same key.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 68},
+      "id": 604,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.50, sum by (le) (rate(s3pgstore_sequencer_lock_wait_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\"}[$__rate_interval])))", "legendFormat": "P50", "interval": "1m", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.95, sum by (le) (rate(s3pgstore_sequencer_lock_wait_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\"}[$__rate_interval])))", "legendFormat": "P95", "interval": "1m", "refId": "B"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.99, sum by (le) (rate(s3pgstore_sequencer_lock_wait_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\"}[$__rate_interval])))", "legendFormat": "P99", "interval": "1m", "refId": "C"}
+      ],
+      "title": "Sequencer lock wait (P50/P95/P99)",
+      "type": "timeseries"
+    },
+
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 76}, "id": 700, "panels": [], "title": "Catalog & locking", "type": "row"},
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "LookupByToken outcome breakdown: hit = caller's idempotency token already had a canonical row; miss = new write. The hit-rate baseline tells you whether your idempotency tokens are doing useful dedup work.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 77},
+      "id": 701,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum by (result) (rate(s3pgstore_lookup_by_token_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval]))", "legendFormat": "{{result}}", "interval": "1m", "refId": "A"}],
+      "title": "LookupByToken outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Current count of s3pgstore_pending_writes rows. Sustained growth = orphan creation outpacing GC reclaim — write-side bug or stuck GC. Pair with the gc.reclaimed counter (next row).",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 100}, {"color": "red", "value": 1000}]}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 77},
+      "id": 702,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "max (s3pgstore_pending_writes_depth{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"})", "legendFormat": "depth", "refId": "A"}],
+      "title": "Pending writes (orphan backlog)",
+      "type": "timeseries"
+    },
+
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 85}, "id": 800, "panels": [], "title": "GC", "type": "row"},
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Orphan rows reclaimed by the gc binary across every RunOnce call (S3 DELETE + catalog DELETE pair). Flat at zero with sustained pending_writes.depth growth = GC is not making progress.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "rps"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 86},
+      "id": 801,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum (rate(s3pgstore_gc_reclaimed_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\"}[$__rate_interval]))", "legendFormat": "reclaimed/s", "interval": "1m", "refId": "A"}],
+      "title": "GC reclaim rate",
       "type": "timeseries"
     }
   ],
@@ -155,143 +335,19 @@
   "tags": ["s3pgstore"],
   "templating": {
     "list": [
-      {
-        "current": {},
-        "hide": 0,
-        "label": "Datasource (metrics)",
-        "name": "datasource_metrics",
-        "options": [],
-        "query": "prometheus",
-        "refresh": 1,
-        "regex": "",
-        "skipUrlSync": false,
-        "type": "datasource"
-      },
-      {
-        "current": {},
-        "datasource": {
-          "type": "prometheus",
-          "uid": "${datasource_metrics}"
-        },
-        "definition": "label_values(s3pgstore_method_calls_total, cluster)",
-        "hide": 0,
-        "includeAll": true,
-        "label": "Cluster",
-        "multi": false,
-        "name": "cluster",
-        "options": [],
-        "query": {
-          "query": "label_values(s3pgstore_method_calls_total, cluster)",
-          "refId": "StandardVariableQuery"
-        },
-        "refresh": 1,
-        "regex": "",
-        "skipUrlSync": false,
-        "sort": 1,
-        "type": "query"
-      },
-      {
-        "current": {},
-        "datasource": {
-          "type": "prometheus",
-          "uid": "${datasource_metrics}"
-        },
-        "definition": "label_values(s3pgstore_method_calls_total, stage)",
-        "hide": 0,
-        "includeAll": true,
-        "label": "Stage",
-        "multi": false,
-        "name": "stage",
-        "options": [],
-        "query": {
-          "query": "label_values(s3pgstore_method_calls_total, stage)",
-          "refId": "StandardVariableQuery"
-        },
-        "refresh": 1,
-        "regex": "",
-        "skipUrlSync": false,
-        "sort": 1,
-        "type": "query"
-      },
-      {
-        "current": {},
-        "datasource": {
-          "type": "prometheus",
-          "uid": "${datasource_metrics}"
-        },
-        "definition": "label_values(s3pgstore_method_calls_total, k8s_namespace_name)",
-        "hide": 0,
-        "includeAll": true,
-        "label": "Namespace",
-        "multi": false,
-        "name": "namespace",
-        "options": [],
-        "query": {
-          "query": "label_values(s3pgstore_method_calls_total, k8s_namespace_name)",
-          "refId": "StandardVariableQuery"
-        },
-        "refresh": 1,
-        "regex": "",
-        "skipUrlSync": false,
-        "sort": 1,
-        "type": "query"
-      },
-      {
-        "current": {},
-        "datasource": {
-          "type": "prometheus",
-          "uid": "${datasource_metrics}"
-        },
-        "definition": "label_values(s3pgstore_method_calls_total, s3pgstore_bucket)",
-        "hide": 0,
-        "includeAll": true,
-        "label": "Bucket",
-        "multi": false,
-        "name": "bucket",
-        "options": [],
-        "query": {
-          "query": "label_values(s3pgstore_method_calls_total, s3pgstore_bucket)",
-          "refId": "StandardVariableQuery"
-        },
-        "refresh": 1,
-        "regex": "",
-        "skipUrlSync": false,
-        "sort": 1,
-        "type": "query"
-      },
-      {
-        "current": {},
-        "datasource": {
-          "type": "prometheus",
-          "uid": "${datasource_metrics}"
-        },
-        "definition": "label_values(s3pgstore_method_calls_total, s3pgstore_prefix)",
-        "hide": 0,
-        "includeAll": true,
-        "label": "Prefix",
-        "multi": false,
-        "name": "prefix",
-        "options": [],
-        "query": {
-          "query": "label_values(s3pgstore_method_calls_total, s3pgstore_prefix)",
-          "refId": "StandardVariableQuery"
-        },
-        "refresh": 1,
-        "regex": "",
-        "skipUrlSync": false,
-        "sort": 1,
-        "type": "query"
-      }
+      {"current": {}, "hide": 0, "label": "Datasource (metrics)", "name": "datasource_metrics", "options": [], "query": "prometheus", "refresh": 1, "regex": "", "skipUrlSync": false, "type": "datasource"},
+      {"current": {}, "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "definition": "label_values(s3pgstore_method_calls_total, cluster)", "hide": 0, "includeAll": true, "label": "Cluster", "multi": false, "name": "cluster", "options": [], "query": {"query": "label_values(s3pgstore_method_calls_total, cluster)", "refId": "StandardVariableQuery"}, "refresh": 1, "regex": "", "skipUrlSync": false, "sort": 1, "type": "query"},
+      {"current": {}, "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "definition": "label_values(s3pgstore_method_calls_total, stage)", "hide": 0, "includeAll": true, "label": "Stage", "multi": false, "name": "stage", "options": [], "query": {"query": "label_values(s3pgstore_method_calls_total, stage)", "refId": "StandardVariableQuery"}, "refresh": 1, "regex": "", "skipUrlSync": false, "sort": 1, "type": "query"},
+      {"current": {}, "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "definition": "label_values(s3pgstore_method_calls_total, k8s_namespace_name)", "hide": 0, "includeAll": true, "label": "Namespace", "multi": false, "name": "namespace", "options": [], "query": {"query": "label_values(s3pgstore_method_calls_total, k8s_namespace_name)", "refId": "StandardVariableQuery"}, "refresh": 1, "regex": "", "skipUrlSync": false, "sort": 1, "type": "query"},
+      {"current": {}, "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "definition": "label_values(s3pgstore_method_calls_total, s3pgstore_bucket)", "hide": 0, "includeAll": true, "label": "Bucket", "multi": false, "name": "bucket", "options": [], "query": {"query": "label_values(s3pgstore_method_calls_total, s3pgstore_bucket)", "refId": "StandardVariableQuery"}, "refresh": 1, "regex": "", "skipUrlSync": false, "sort": 1, "type": "query"},
+      {"current": {}, "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "definition": "label_values(s3pgstore_method_calls_total, s3pgstore_prefix)", "hide": 0, "includeAll": true, "label": "Prefix", "multi": false, "name": "prefix", "options": [], "query": {"query": "label_values(s3pgstore_method_calls_total, s3pgstore_prefix)", "refId": "StandardVariableQuery"}, "refresh": 1, "regex": "", "skipUrlSync": false, "sort": 1, "type": "query"}
     ]
   },
-  "time": {
-    "from": "now-1h",
-    "to": "now"
-  },
+  "time": {"from": "now-1h", "to": "now"},
   "timepicker": {},
   "timezone": "",
   "title": "s3pgstore",
   "uid": "s3pgstore",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }

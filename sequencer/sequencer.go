@@ -15,6 +15,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/ueisele/s3pgstore/internal/catalog"
 )
@@ -78,6 +79,12 @@ type Config struct {
 	// LISTEN — the sequencer falls back to interval polling
 	// only. Default DefaultNotifyChannel ("s3pgstore_writes").
 	NotifyChannel string
+
+	// Meter is the OTel meter the sequencer registers its
+	// instruments against. Nil resolves to a no-op meter so
+	// telemetry is opt-in. See sequencer/metrics.go for the
+	// registered instruments.
+	Meter metric.Meter
 }
 
 func (c Config) resolved() Config {
@@ -131,6 +138,16 @@ func RunOnce(ctx context.Context, cfg Config) (int, error) {
 		return 0, err
 	}
 	r := cfg.resolved()
+	m, err := newMetrics(r)
+	if err != nil {
+		return 0, fmt.Errorf("register sequencer metrics: %w", err)
+	}
+	return runOnceWithMetrics(ctx, r, m)
+}
+
+func runOnceWithMetrics(
+	ctx context.Context, r Config, m *Metrics,
+) (int, error) {
 	names := catalog.NewNames(r.SchemaName, r.TablePrefix)
 
 	var rowsAssigned int
@@ -141,12 +158,14 @@ func RunOnce(ctx context.Context, cfg Config) (int, error) {
 		// in the same database run independent sequencers
 		// without blocking each other.
 		key2 := scopeHash(r.SchemaName, r.TablePrefix)
+		lockStart := time.Now()
 		if _, err := tx.Exec(ctx,
 			"SELECT pg_advisory_xact_lock($1, $2)",
 			sequencerLockMagic, key2,
 		); err != nil {
 			return fmt.Errorf("acquire sequencer lock: %w", err)
 		}
+		m.recordLockWait(ctx, time.Since(lockStart).Seconds())
 		ct, err := tx.Exec(ctx, assignSQL(names), r.BatchSize)
 		if err != nil {
 			return fmt.Errorf("assign feed_seq: %w", err)
@@ -154,6 +173,9 @@ func RunOnce(ctx context.Context, cfg Config) (int, error) {
 		rowsAssigned = int(ct.RowsAffected())
 		return nil
 	})
+	if err == nil && rowsAssigned > 0 {
+		m.recordAssigned(ctx, rowsAssigned)
+	}
 	return rowsAssigned, err
 }
 
@@ -171,11 +193,20 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	r := cfg.resolved()
+	m, err := newMetrics(r)
+	if err != nil {
+		return fmt.Errorf("register sequencer metrics: %w", err)
+	}
+	// Observable gauge must register exactly once per process —
+	// see registerUnsequencedGauge.
+	if err := registerUnsequencedGauge(r); err != nil {
+		return fmt.Errorf("register sequencer.unsequenced gauge: %w", err)
+	}
 
 	// Initial drain: catch up any rows that landed between
 	// last shutdown and now. Failure here aborts startup —
 	// operator should see the error early.
-	if _, err := drainAll(ctx, r); err != nil {
+	if _, err := drainAll(ctx, r, m); err != nil {
 		return fmt.Errorf("initial drain: %w", err)
 	}
 
@@ -206,7 +237,7 @@ func Run(ctx context.Context, cfg Config) error {
 		case <-notify:
 		case <-ticker.C:
 		}
-		if _, err := drainAll(ctx, r); err != nil {
+		if _, err := drainAll(ctx, r, m); err != nil {
 			if errors.Is(err, context.Canceled) {
 				return err
 			}
@@ -218,12 +249,14 @@ func Run(ctx context.Context, cfg Config) error {
 
 // drainAll repeats RunOnce until a call assigns fewer than
 // BatchSize rows. Returns the total assigned and the first
-// error encountered (which short-circuits the drain).
-func drainAll(ctx context.Context, cfg Config) (int, error) {
+// error encountered (which short-circuits the drain). Reuses
+// one *Metrics across calls so the assigned counter and
+// lock_wait histogram aggregate across the whole drain.
+func drainAll(ctx context.Context, cfg Config, m *Metrics) (int, error) {
 	total := 0
 	r := cfg.resolved()
 	for {
-		n, err := RunOnce(ctx, r)
+		n, err := runOnceWithMetrics(ctx, r, m)
 		total += n
 		if err != nil {
 			return total, err

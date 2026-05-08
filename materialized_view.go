@@ -32,6 +32,7 @@ type MaterializedView[K any] struct {
 	executor Executor
 	tableSQL string
 	cols     []string // quoted SQL identifiers in select order
+	metrics  *Metrics
 }
 
 // NewMaterializedView returns a typed lookup handle for the MV
@@ -79,6 +80,7 @@ func NewMaterializedView[T, K any](
 		executor: store.cfg.Executor,
 		tableSQL: store.names.MV(def.Name),
 		cols:     cols,
+		metrics:  store.metrics,
 	}, nil
 }
 
@@ -100,7 +102,10 @@ func NewMaterializedView[T, K any](
 // appears exactly once.
 func (m *MaterializedView[K]) Lookup(
 	ctx context.Context, filters []PartitionFilter,
-) ([]K, error) {
+) (out []K, err error) {
+	defer m.metrics.methodScope(ctx,
+		"MaterializedView.Lookup", &err).end()
+
 	where, args, err := translateFilters(filters,
 		mvColResolver(m.def.Columns))
 	if err != nil {
@@ -116,7 +121,6 @@ func (m *MaterializedView[K]) Lookup(
 		q += " ORDER BY " + strings.Join(m.cols, ", ")
 	}
 
-	var out []K
 	err = m.executor.Run(ctx, func(d DBTX) error {
 		rows, err := d.Query(ctx, q, args...)
 		if err != nil {

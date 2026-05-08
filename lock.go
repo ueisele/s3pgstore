@@ -97,7 +97,9 @@ func WithLockTimeout(d time.Duration) LockOption {
 // one with code 40P01, but the situation is avoidable.
 func (s *Store[T]) LockPartition(
 	ctx context.Context, partitionKey string, opts ...LockOption,
-) error {
+) (err error) {
+	defer s.metrics.methodScope(ctx, "LockPartition", &err).end()
+
 	if txFromContext(ctx) == nil {
 		return ErrLockNotInTransaction
 	}

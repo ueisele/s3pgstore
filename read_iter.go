@@ -55,6 +55,8 @@ func (s *Store[T]) ReadIter(
 	opts ...ReadOption,
 ) iter.Seq2[T, error] {
 	return func(yield func(T, error) bool) {
+		var scopeErr error
+		defer s.metrics.methodScope(ctx, "ReadIter", &scopeErr).end()
 		o := resolveIterOpts(opts)
 		s.iterPartitions(ctx, filters,
 			func(_ string, records []T) bool {
@@ -69,6 +71,7 @@ func (s *Store[T]) ReadIter(
 				return true
 			},
 			func(err error) {
+				scopeErr = err
 				var zero T
 				yield(zero, err)
 			})
@@ -84,6 +87,8 @@ func (s *Store[T]) ReadPartitionIter(
 	opts ...ReadOption,
 ) iter.Seq2[PartitionResult[T], error] {
 	return func(yield func(PartitionResult[T], error) bool) {
+		var scopeErr error
+		defer s.metrics.methodScope(ctx, "ReadPartitionIter", &scopeErr).end()
 		o := resolveIterOpts(opts)
 		stop := false
 		s.iterPartitionsFull(ctx, filters,
@@ -98,6 +103,7 @@ func (s *Store[T]) ReadPartitionIter(
 				return true
 			},
 			func(err error) {
+				scopeErr = err
 				if !stop {
 					yield(PartitionResult[T]{}, err)
 				}
@@ -123,6 +129,8 @@ func (s *Store[T]) ReadRangeIter(
 	opts ...ReadOption,
 ) iter.Seq2[T, error] {
 	return func(yield func(T, error) bool) {
+		var scopeErr error
+		defer s.metrics.methodScope(ctx, "ReadRangeIter", &scopeErr).end()
 		o := resolveIterOpts(opts)
 		s.iterRange(ctx, since, until,
 			func(_ string, records []T) bool {
@@ -137,6 +145,7 @@ func (s *Store[T]) ReadRangeIter(
 				return true
 			},
 			func(err error) {
+				scopeErr = err
 				var zero T
 				yield(zero, err)
 			})
@@ -151,6 +160,8 @@ func (s *Store[T]) ReadPartitionRangeIter(
 	opts ...ReadOption,
 ) iter.Seq2[PartitionResult[T], error] {
 	return func(yield func(PartitionResult[T], error) bool) {
+		var scopeErr error
+		defer s.metrics.methodScope(ctx, "ReadPartitionRangeIter", &scopeErr).end()
 		o := resolveIterOpts(opts)
 		stop := false
 		s.iterRangeFull(ctx, since, until,
@@ -165,6 +176,7 @@ func (s *Store[T]) ReadPartitionRangeIter(
 				return true
 			},
 			func(err error) {
+				scopeErr = err
 				if !stop {
 					yield(PartitionResult[T]{}, err)
 				}
@@ -186,8 +198,11 @@ func (s *Store[T]) ReadEntriesIter(
 	opts ...ReadOption,
 ) iter.Seq2[T, error] {
 	return func(yield func(T, error) bool) {
+		var scopeErr error
+		defer s.metrics.methodScope(ctx, "ReadEntriesIter", &scopeErr).end()
 		o := resolveIterOpts(opts)
 		if err := s.validateEntries(entries); err != nil {
+			scopeErr = err
 			var zero T
 			yield(zero, err)
 			return
@@ -205,6 +220,7 @@ func (s *Store[T]) ReadEntriesIter(
 				return true
 			},
 			func(err error) {
+				scopeErr = err
 				var zero T
 				yield(zero, err)
 			})
@@ -218,8 +234,11 @@ func (s *Store[T]) ReadPartitionEntriesIter(
 	opts ...ReadOption,
 ) iter.Seq2[PartitionResult[T], error] {
 	return func(yield func(PartitionResult[T], error) bool) {
+		var scopeErr error
+		defer s.metrics.methodScope(ctx, "ReadPartitionEntriesIter", &scopeErr).end()
 		o := resolveIterOpts(opts)
 		if err := s.validateEntries(entries); err != nil {
+			scopeErr = err
 			yield(PartitionResult[T]{}, err)
 			return
 		}
@@ -236,6 +255,7 @@ func (s *Store[T]) ReadPartitionEntriesIter(
 				return true
 			},
 			func(err error) {
+				scopeErr = err
 				if !stop {
 					yield(PartitionResult[T]{}, err)
 				}

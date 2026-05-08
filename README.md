@@ -344,21 +344,182 @@ own MV-population pipelines after rebuild.
 
 ## Observability
 
+### Library metrics
+
 Pass `cfg.Meter` (an
 [`go.opentelemetry.io/otel/metric.Meter`](https://pkg.go.dev/go.opentelemetry.io/otel/metric))
-to enable telemetry:
+to enable telemetry on a Store:
 
 ```go
 cfg.Meter = otelProvider.Meter("s3pgstore")
 ```
 
-The Store registers `s3pgstore.method.duration` (histogram) and
-`s3pgstore.method.calls` (counter), both labeled by `method` and
-`outcome` (success / error / canceled). A starter Grafana
-dashboard ships at
-[dashboards/s3pgstore.json](dashboards/s3pgstore.json) with
-panels for the registered instruments. More metrics + panels
-land in v2.0.x as instrumentation hooks expand.
+The Store registers ~20 instruments covering public-method
+timing, write volumes, S3 ops, target saturation, fan-out
+shape, and orphan tracking. Highlights:
+
+| Instrument | Type | What it tells you |
+|---|---|---|
+| `s3pgstore.method.{duration,calls,in_flight}` | hist+ctr+gauge | Per-method P50/P95/P99 + call rate + real-time concurrency. |
+| `s3pgstore.write.{bytes,records}` | histograms | P100 on bytes drives `EncodeBufPoolMaxBytes` tuning. |
+| `s3pgstore.write.encode_buf_dropped` | counter | Incident — encoder dropped an oversized buffer; cap is undersized. |
+| `s3pgstore.write.token_race.retry.count` | counter | Incident — concurrent writers contending on the same idempotency token. |
+| `s3pgstore.s3.{request.count,request.duration,body_size}` | ctr+hist+hist | Library's view of S3 ops; one increment per logical op (acquire + retry + release). |
+| `s3pgstore.s3.transient_error.count` | counter | Fires *once per failed attempt* (every retry, even masked ones). Pair with `s3.request.count` for the percentage-error panel. Labels include `error.type` ∈ {slowdown, server, client, transport, ...}. |
+| `s3pgstore.target.{sem_wait_duration,sem_inflight,sem_waiting}` | hist+gauge+gauge | `MaxInflightRequests` saturation; `waiting > 0` sustained = bump the cap. |
+| `s3pgstore.fanout.{partitions,items}` | histograms | Per-call fan-out width — capacity planning. |
+| `s3pgstore.occ.version_conflict.count` | counter | Incident — OCC writes colliding. |
+| `s3pgstore.lookup_by_token.count{result}` | counter | Idempotency hit-rate. |
+| `s3pgstore.poll.lag` | observable gauge | End-to-end stream lag (`now - latest feed_seq_at`). |
+| `s3pgstore.pending_writes.depth` | observable gauge | Orphan-tracking backlog; sustained growth = stuck GC or write-side bug. |
+
+The sequencer registers its own instruments
+(`s3pgstore.sequencer.{assigned.count, unsequenced, lock_wait}`)
+under `sequencer.Config.Meter`; the gc binary registers
+`s3pgstore.gc.reclaimed.count` under `gc.Config.Meter`. Both
+default to a no-op meter so telemetry is opt-in.
+
+The Grafana dashboard at
+[dashboards/s3pgstore.json](dashboards/s3pgstore.json) ships
+panels for every registered instrument, organised into 8
+section rows (Library methods, Write volumes, S3 ops +
+transient-error ratio, Target saturation, Fan-out shape,
+Sequencer & feed, Catalog & locking, GC). The S3 transient-error
+ratio panel uses the same `rate(transient) / rate(request{attempts!=0})`
+shape as s3store's dashboard — values can exceed 100% when calls
+retry multiple times per call (every retry is one transient
+event against one call), which is the sustained-pressure signal.
+
+The iter pipeline saturation instruments (body-slot wait,
+byte-budget wait, decode duration, stall counter) are reserved
+for the vendored chan-based pipeline; v2.0 ships a serial
+pipeline so those instruments do not yet emit. They land
+alongside the pipeline vendor pass.
+
+### AWS SDK middleware metrics (request-level retry diagnostics)
+
+The library's `s3pgstore.s3.*` instruments measure logical
+operations: one increment per call, regardless of how many
+times the SDK retried internally. For wire-level diagnostics
+(per-attempt latencies, SDK retry-budget exhaustion, per-
+endpoint cardinality) enable AWS SDK v2's Smithy middleware
+metrics on your `aws.Config`:
+
+```go
+import (
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"go.opentelemetry.io/contrib/propagators/aws/xray"
+)
+
+awsCfg, err := config.LoadDefaultConfig(ctx,
+	config.WithAPIOptions([]func(*middleware.Stack) error{
+		awsmiddleware.AddRecordResponseTiming,
+	}),
+	// ... other options ...
+)
+```
+
+Configure the SDK's metric provider via the
+`AWS_SDK_GO_USE_OTEL_METRIC` environment variable (see the
+[SDK metrics docs](https://aws.github.io/aws-sdk-go-v2/docs/sdk-utilities/metrics/)
+for the current wiring). Smithy emits e.g.
+`smithy.client.call.duration`, `smithy.client.call.attempts`,
+`smithy.client.http.response.status` — these complement, not
+duplicate, our `s3pgstore.s3.*` surface:
+
+- "Did the library issue 5 PUTs or 1 PUT that the SDK retried 4
+  times?" → ours says 1, theirs says 5. Both true, both useful.
+- "Is S3 throttling us?" → ours via
+  `s3.transient_error.count{error.type=slowdown}`; theirs via
+  retry-count-per-call.
+- "Is latency in our code or in the SDK retry chain?" →
+  compare `s3pgstore.s3.request.duration` against
+  `smithy.client.call.duration`.
+
+Dashboards for the SDK metrics live with the SDK's own
+documentation; the s3pgstore dashboard does not bundle them
+because their cardinality and naming are SDK-version-specific.
+
+### PostgreSQL pool metrics (pgxpool)
+
+s3pgstore composes against any `Executor` adapter; the most
+common is the bundled `pgxpool` adapter
+([executor.go]). pgx exposes its own pool metrics via
+`*pgxpool.Pool.Stat()`, which returns a
+[`pgxpool.Stat`](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool#Stat)
+snapshot — operators wire these into OTel by registering
+observable gauges that call `Stat()` once per collection cycle:
+
+```go
+import (
+	"context"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/metric"
+)
+
+func registerPoolMetrics(meter metric.Meter, pool *pgxpool.Pool) error {
+	acquired, err := meter.Int64ObservableGauge(
+		"pgxpool.acquired",
+		metric.WithDescription("Connections currently in use."))
+	if err != nil {
+		return err
+	}
+	idle, err := meter.Int64ObservableGauge(
+		"pgxpool.idle",
+		metric.WithDescription("Idle pool connections."))
+	if err != nil {
+		return err
+	}
+	total, err := meter.Int64ObservableGauge(
+		"pgxpool.total",
+		metric.WithDescription("Total open pool connections."))
+	if err != nil {
+		return err
+	}
+	max, err := meter.Int64ObservableGauge(
+		"pgxpool.max",
+		metric.WithDescription("Pool capacity (MaxConns)."))
+	if err != nil {
+		return err
+	}
+	acquireDur, err := meter.Float64ObservableGauge(
+		"pgxpool.acquire_duration_total_ms",
+		metric.WithDescription("Cumulative wait time across all Acquire calls (ms)."))
+	if err != nil {
+		return err
+	}
+	_, err = meter.RegisterCallback(
+		func(ctx context.Context, o metric.Observer) error {
+			s := pool.Stat()
+			o.ObserveInt64(acquired, int64(s.AcquiredConns()))
+			o.ObserveInt64(idle, int64(s.IdleConns()))
+			o.ObserveInt64(total, int64(s.TotalConns()))
+			o.ObserveInt64(max, int64(s.MaxConns()))
+			o.ObserveFloat64(acquireDur,
+				float64(s.AcquireDuration().Milliseconds()))
+			return nil
+		},
+		acquired, idle, total, max, acquireDur)
+	return err
+}
+```
+
+Sustained `acquired ≈ max` with non-zero growth in
+`acquire_duration_total_ms` indicates the pool is undersized for
+the offered concurrency — bump `pgxpool.Config.MaxConns`. The
+library's own write-path concurrency is bounded by
+`Config.MaxInflightRequests` (the S3 semaphore) plus the pool
+size; CLAUDE.md § Orphan tracking notes that each writer holds
+**at most one** pool connection at a time, so the pool needs to
+size for `peak concurrent writers + readers + sequencer
+listeners + your own application`.
+
+The library does **not** register these metrics itself — the
+adapter (pgx, GORM, custom `database/sql` wrappers) is caller-
+supplied and not always backed by a concrete pool. Wire them
+once at startup in your application's main function.
 
 ## Architecture (one-line summary)
 

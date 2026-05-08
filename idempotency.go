@@ -93,7 +93,9 @@ func (s *Store[T]) lookupTokenWriteResult(
 // return distinguishes "missing" from "transport error."
 func (s *Store[T]) LookupByToken(
 	ctx context.Context, partitionKey, token string,
-) (WriteResult, bool, error) {
+) (res WriteResult, hit bool, err error) {
+	defer s.metrics.methodScope(ctx, "LookupByToken", &err).end()
+
 	if partitionKey == "" {
 		return WriteResult{}, false, errors.New(
 			"LookupByToken: partitionKey is empty")
@@ -106,7 +108,11 @@ func (s *Store[T]) LookupByToken(
 		s.resolved.PartitionKeyParts); err != nil {
 		return WriteResult{}, false, err
 	}
-	return s.lookupTokenWriteResult(ctx, partitionKey, token)
+	res, hit, err = s.lookupTokenWriteResult(ctx, partitionKey, token)
+	if err == nil {
+		s.metrics.recordLookupByToken(ctx, hit)
+	}
+	return res, hit, err
 }
 
 // isNoRowsErr reports whether err is pgx's pgx.ErrNoRows.

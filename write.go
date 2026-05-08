@@ -451,16 +451,13 @@ type fileInsertOpts struct {
 func (s *Store[T]) insertFile(
 	ctx context.Context, d DBTX, row fileInsertOpts,
 ) (int64, error) {
-	var tokenArg any
-	if row.Token != "" {
-		tokenArg = row.Token
-	}
+	hasToken := row.Token != ""
 	args := make([]any, 0,
 		7+len(row.PartValues)+len(s.resolved.ExtensionColumns))
 	args = append(args,
 		row.PartitionKey, row.S3Key, row.Version,
 		row.FileSize, row.UncompressedSize, row.RecordCount,
-		tokenArg)
+		nullableString(row.Token))
 	for _, v := range row.PartValues {
 		args = append(args, v)
 	}
@@ -470,12 +467,25 @@ func (s *Store[T]) insertFile(
 	var fileID int64
 	err := d.QueryRow(ctx, s.sql.filesInsert, args...).Scan(&fileID)
 	if err != nil {
-		if isUniqueViolation(err) && row.Token != "" {
+		if hasToken && isUniqueViolation(err) {
 			return 0, errTokenRaceLost
 		}
 		return 0, fmt.Errorf("insert files: %w", err)
 	}
 	return fileID, nil
+}
+
+// nullableString maps the empty-string sentinel to a SQL NULL
+// (pgx encodes a nil any as NULL), leaving non-empty values
+// untouched. Used for columns whose "absent" state must hit a
+// partial-index NULL branch — currently only
+// s3pgstore_files.idempotency_token, whose partial UNIQUE gates
+// on WHERE idempotency_token IS NOT NULL.
+func nullableString(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // notifySequencer issues the LISTEN/NOTIFY wake-up for the

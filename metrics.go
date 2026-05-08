@@ -18,6 +18,7 @@ package s3pgstore
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/aws/smithy-go"
@@ -446,15 +447,24 @@ func newMetrics(cfg metricsConfig) (*Metrics, error) {
 		_, err = meter.RegisterCallback(
 			func(ctx context.Context, o metric.Observer) error {
 				lag, ok, err := cfg.PollLagFn(ctx)
-				if err != nil || !ok {
-					// Errors / no-data are silent: sequencer is
-					// optional and an unattended database
-					// shouldn't spam logs every collection. The
-					// callback signature requires a non-nil
-					// return only on hard provider failure (we
-					// have no such case here), so swallowing the
-					// PG error is intentional.
-					return nil //nolint:nilerr
+				if err != nil {
+					// A real PG error (table missing, connection
+					// refused, syntax error after a refactor) is
+					// logged so operators can see something is
+					// wrong; the OTel callback still returns nil
+					// because a single broken gauge mustn't fail
+					// the whole collection cycle. At typical
+					// scrape intervals (15-60s) the log rate
+					// during a real outage is bounded and useful.
+					slog.Warn(
+						"s3pgstore: poll-lag gauge query failed",
+						"err", err)
+					return nil
+				}
+				if !ok {
+					// No-data (no sequenced rows yet) is the
+					// normal cold-start state and stays silent.
+					return nil
 				}
 				o.ObserveFloat64(pollLag, lag.Seconds())
 				return nil
@@ -480,10 +490,13 @@ func newMetrics(cfg metricsConfig) (*Metrics, error) {
 			func(ctx context.Context, o metric.Observer) error {
 				count, err := cfg.PendingWritesDepthFn(ctx)
 				if err != nil {
-					// Same rationale as PollLag: a PG hiccup
-					// shouldn't paint the OTel collector with
-					// errors every cycle — observe-or-skip.
-					return nil //nolint:nilerr
+					// Log so a real failure is visible; return
+					// nil so one broken gauge doesn't fail the
+					// whole collection cycle.
+					slog.Warn(
+						"s3pgstore: pending-writes-depth gauge query failed",
+						"err", err)
+					return nil
 				}
 				o.ObserveInt64(depth, count)
 				return nil

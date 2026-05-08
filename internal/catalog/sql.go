@@ -172,12 +172,24 @@ func (n Names) MVInsertSQL(mvName string, columns []string) string {
 
 // PollLagSQL returns the SELECT used by the
 // s3pgstore.poll.lag observable gauge: seconds since the most
-// recent feed_seq_at stamp on a sequenced row, or NULL when no
-// row is sequenced yet (caller treats NULL as "no observation").
+// recent feed_seq_at stamp on a sequenced row. Returns zero rows
+// when no row is sequenced yet — the caller treats pgx.ErrNoRows
+// as "no observation" rather than as a failure.
+//
+// ORDER BY feed_seq DESC LIMIT 1 hits the (feed_seq) WHERE
+// feed_seq IS NOT NULL partial index for an O(1) backward index
+// scan + one heap fetch, regardless of catalog size. The row
+// with MAX(feed_seq) carries MAX(feed_seq_at) by the sequencer
+// invariant: feed_seq is assigned monotonically under
+// pg_advisory_xact_lock and feed_seq_at is set in the same
+// statement, so the latest-numbered row also carries the latest
+// timestamp. Refactors that weaken that serialization (parallel
+// sequencers, deferred timestamping) would break this query.
 func (n Names) PollLagSQL() string {
 	return fmt.Sprintf(
-		`SELECT EXTRACT(EPOCH FROM (now() - MAX(feed_seq_at)))
-		FROM %s WHERE feed_seq IS NOT NULL`,
+		`SELECT EXTRACT(EPOCH FROM (now() - feed_seq_at))
+		FROM %s WHERE feed_seq IS NOT NULL
+		ORDER BY feed_seq DESC LIMIT 1`,
 		n.Files())
 }
 

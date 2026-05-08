@@ -2,9 +2,11 @@ package s3pgstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/parquet-go/parquet-go/compress"
 
 	"github.com/ueisele/s3pgstore/internal/catalog"
@@ -100,14 +102,22 @@ func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
 	// OTel collection cycle on the executor's pool — bounded SQL
 	// against indexed columns; safe to invoke under load.
 	pollLagFn := func(ctx context.Context) (time.Duration, bool, error) {
-		var lagSec *float64
+		var lagSec float64
 		err := cfg.Executor.Run(ctx, func(d DBTX) error {
 			return d.QueryRow(ctx, sql.pollLag).Scan(&lagSec)
 		})
-		if err != nil || lagSec == nil {
+		// Empty s3pgstore_files (no sequenced rows yet) is the
+		// cold-start state, not an error: the SELECT returns
+		// zero rows and pgx surfaces ErrNoRows. Surface it as
+		// "no observation" so the caller doesn't log a warning
+		// every collection cycle on a fresh deployment.
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, false, nil
+		}
+		if err != nil {
 			return 0, false, err
 		}
-		return time.Duration(*lagSec * float64(time.Second)), true, nil
+		return time.Duration(lagSec * float64(time.Second)), true, nil
 	}
 	pendingWritesDepthFn := func(ctx context.Context) (int64, error) {
 		var n int64

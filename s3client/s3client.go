@@ -51,6 +51,10 @@
 //     wrapped with httptrace + a tracking dialer to feed
 //     s3pgstore.s3.tcp.connections and
 //     s3pgstore.s3.connection.reuse.count.
+//   - UsePathStyle, when Options.UsePathStyle is true (default
+//     false leaves the SDK virtual-hosted-style behaviour
+//     untouched). No AWS env var exposes this knob; surfacing
+//     it on Options keeps the env-driven setup self-contained.
 //
 // Concurrency strategy:
 //
@@ -141,6 +145,20 @@ type Options struct {
 	// at +10% over the sustained limit. Only meaningful when
 	// MaxRequestsPerSecond > 0.
 	MaxRequestsPerSecondBurst int
+
+	// UsePathStyle selects path-style URLs
+	// (https://endpoint/bucket/key) over the SDK default
+	// virtual-hosted-style (https://bucket.endpoint/key).
+	// Required only when the endpoint hostname can't carry a
+	// bucket subdomain — local MinIO at localhost, IP-based
+	// endpoints, or backends that disable virtual-hosted-style.
+	// STACKIT, Cloudflare R2, StorageGRID, and AWS with proper
+	// DNS work over the SDK default; leave false there.
+	//
+	// On Options because no AWS env var exposes it (unlike
+	// region / endpoint / credentials, which AWS already wires
+	// via aws.Config and the LoadDefaultConfig env-var chain).
+	UsePathStyle bool
 
 	// Meter is the OTel meter the s3pgstore.s3.* instruments
 	// register against. Nil falls back to
@@ -239,6 +257,9 @@ func WithDefaults(opts Options) func(*awss3.Options) {
 		o.Retryer = newAdaptiveRetryer(opts.MaxRetryAttempts, m)
 		o.ResponseChecksumValidation =
 			aws.ResponseChecksumValidationWhenRequired
+		if opts.UsePathStyle {
+			o.UsePathStyle = true
+		}
 		o.APIOptions = append(o.APIOptions, mwFn)
 	}
 }

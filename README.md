@@ -77,7 +77,7 @@ back, and stream them via `Poll`.
 # docker-compose.yml
 services:
   postgres:
-    image: postgres:17.5-alpine
+    image: postgres:17.9-alpine
     environment:
       POSTGRES_USER: s3pgstore
       POSTGRES_PASSWORD: s3pgstore
@@ -101,10 +101,27 @@ docker compose up -d
 
 The `*s3.Client` you pass in must already carry the s3pgstore
 middleware (adaptive retry, rate limiting, metrics, connection
-pool tuning). Compose it via `s3client.WithDefaults` at
-construction time — this lets multiple Stores share one client
-(and therefore one rate limiter, one adaptive token bucket, one
-connection pool):
+pool tuning). Three ways to construct it, listed cheapest →
+most flexible:
+
+**Env-driven** (one call; matches the operator binaries):
+
+```go
+import (
+    "github.com/aws/aws-sdk-go-v2/service/s3"
+    "github.com/ueisele/s3pgstore/s3client"
+)
+
+// Reads AWS_REGION / AWS_ENDPOINT_URL_S3 / credentials via the
+// AWS SDK chain plus the S3PGSTORE_S3_* knobs (see godoc for
+// s3client.OptionsFromEnv). prefix "" → "S3PGSTORE".
+s3Client, err := s3client.NewClientFromEnv(ctx, "", meter)
+```
+
+**Programmatic** (when env vars don't fit, e.g. you compute
+limits at runtime). One s3.Client can be shared across multiple
+Stores — they then also share the rate limiter, adaptive token
+bucket, connection pool, and metrics:
 
 ```go
 import (
@@ -113,8 +130,7 @@ import (
     "github.com/ueisele/s3pgstore/s3client"
 )
 
-awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
-    awsconfig.WithRegion("us-east-1"))
+awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
 if err != nil { /* ... */ }
 
 s3Client := s3.NewFromConfig(awsCfg,
@@ -127,16 +143,18 @@ s3Client := s3.NewFromConfig(awsCfg,
 )
 ```
 
-For MinIO / StorageGRID / other S3-compatible backends, append
-another `func(*s3.Options)` after `WithDefaults` to set the
-endpoint:
+**Custom endpoint / path-style** for MinIO / StorageGRID / other
+S3-compatible backends — set them in a follow-up `func(*s3.Options)`,
+or use the `AWS_ENDPOINT_URL_S3` env var with `NewClientFromEnv`:
 
 ```go
 s3Client := s3.NewFromConfig(awsCfg,
-    s3client.WithDefaults(s3client.Options{ /* ... */ }),
+    s3client.WithDefaults(s3client.Options{
+        UsePathStyle: true, // local MinIO at localhost — no DNS subdomain available
+        /* ... */
+    }),
     func(o *s3.Options) {
         o.BaseEndpoint = aws.String("http://localhost:9000")
-        o.UsePathStyle = true // local MinIO at localhost — no DNS subdomain available
     },
 )
 ```
@@ -147,6 +165,11 @@ IP-based endpoints, or backends that disable virtual-hosted-style.
 For production STACKIT, Cloudflare R2, StorageGRID, or any
 S3-compatible backend with proper DNS, drop it — the SDK default
 (virtual-hosted-style, `https://<bucket>.<endpoint>/key`) works.
+
+The full env-var schema `NewClientFromEnv` reads (both the
+s3pgstore-namespaced knobs and the AWS-standard chain) is
+documented under [Environment variables](#environment-variables)
+below.
 
 ```go
 type CostRecord struct {
@@ -349,7 +372,9 @@ configuration and operational notes:
 ```sh
 S3PGSTORE_DATABASE_URL=postgres://s3pgstore:s3pgstore@localhost/s3pgstore?sslmode=disable \
 S3PGSTORE_S3_BUCKET=warehouse \
-S3PGSTORE_S3_ENDPOINT=http://localhost:9000 \
+S3PGSTORE_S3_USE_PATH_STYLE=1 \
+AWS_ENDPOINT_URL_S3=http://localhost:9000 \
+AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
   go run github.com/ueisele/s3pgstore/cmd/s3pgstore-gc
 ```
 
@@ -359,6 +384,60 @@ Reclaims S3 objects whose write transactions rolled back.
 (useful for cron-style scheduling). Full configuration and
 operational notes:
 [`cmd/s3pgstore-gc/README.md`](cmd/s3pgstore-gc/README.md).
+
+## Environment variables
+
+`s3client.NewClientFromEnv(ctx, prefix, meter)` and the
+operator binaries (`s3pgstore-gc`, `s3pgstore-rebuild`) read
+two namespaces. The s3pgstore-namespaced vars carry our
+middleware knobs; the AWS-standard vars are honoured via the
+SDK's normal resolution chain (no shadowing, no duplication).
+
+Pass `prefix=""` for the default `S3PGSTORE` prefix; pass any
+other value (e.g. `PRIMARY`, `ARCHIVE`) for per-Store scoping
+when one process constructs multiple clients with different
+tuning.
+
+### s3pgstore-namespaced (`<PREFIX>_S3_*`)
+
+| Variable                                      | Default                           | Description                                                                                                                                                                                            |
+| --------------------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `<PREFIX>_S3_MAX_OPEN_CONNECTIONS`            | `64`                              | Caps concurrent TCP connections to S3. Drives `MaxConnsPerHost` / `MaxIdleConnsPerHost` / `MaxIdleConns`. The global concurrency ceiling — set to your share of the backend's per-client limit.        |
+| `<PREFIX>_S3_MAX_RETRY_ATTEMPTS`              | `AWS_MAX_ATTEMPTS` or `5`         | SDK retry budget per logical S3 op (1 initial + retries). Equal-jitter backoff windows 100ms..10s. Honours the AWS-standard `AWS_MAX_ATTEMPTS` as fallback when the s3pgstore-namespaced var is unset. |
+| `<PREFIX>_S3_MAX_REQUESTS_PER_SECOND`         | _(unset = unlimited)_             | Pre-throttle outgoing S3 ops via a client-side token bucket. Set when the backend has a known per-second ceiling — STACKIT 2500 RPS, AWS S3 per-prefix 5500 GET / 3500 PUT.                            |
+| `<PREFIX>_S3_MAX_REQUESTS_PER_SECOND_BURST`   | `max(1, rate*0.1)`                | Token bucket burst — caps the post-idle 1-second excursion at +10% over the sustained rate. Only meaningful when `MAX_REQUESTS_PER_SECOND > 0`.                                                        |
+| `<PREFIX>_S3_USE_PATH_STYLE`                  | `false`                           | `1`/`true` → path-style URLs (`https://endpoint/bucket/key`). Required for local MinIO at `localhost` / IP-based endpoints. STACKIT, R2, StorageGRID with proper DNS use the SDK default. Strict `strconv.ParseBool` parsing — typos like `"tru"` error at startup. |
+
+### AWS-standard (consumed via `LoadDefaultConfig`)
+
+No shadowing — same env vars your other AWS tooling already
+uses. Anything `awsconfig.LoadDefaultConfig(ctx)` would honour
+in a stand-alone AWS SDK program works here too:
+
+| Variable                                                            | Purpose                                                                                  |
+| ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `AWS_REGION` (or `AWS_DEFAULT_REGION`)                              | AWS region.                                                                              |
+| `AWS_ENDPOINT_URL_S3` (or generic `AWS_ENDPOINT_URL`)               | S3 endpoint override. Use for MinIO / StorageGRID / Cloudflare R2 / STACKIT.             |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` | Static credentials.                                                                      |
+| `AWS_PROFILE`                                                       | Named profile from `~/.aws/credentials` / `~/.aws/config`.                               |
+| `AWS_ROLE_ARN` / `AWS_WEB_IDENTITY_TOKEN_FILE`                      | IRSA / web-identity STS — picked up automatically in EKS pods.                           |
+| `AWS_MAX_ATTEMPTS`                                                  | Fallback for `<PREFIX>_S3_MAX_RETRY_ATTEMPTS` (see above).                               |
+
+For non-AWS S3 deployments (MinIO, StorageGRID, on-prem), at
+minimum set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and
+`AWS_ENDPOINT_URL_S3`. The `AWS_REGION` value is required by
+the SDK but cosmetic for non-AWS backends — any value works.
+
+### Operator-binary env vars
+
+Each operator binary reads the `<PREFIX>_S3_*` schema above
+plus its own non-S3-client env vars (database URL, schema,
+grace period, partition key parts, etc.). See the per-binary
+READMEs for the full lists:
+
+- [`cmd/s3pgstore-sequencer/README.md`](cmd/s3pgstore-sequencer/README.md)
+- [`cmd/s3pgstore-gc/README.md`](cmd/s3pgstore-gc/README.md)
+- [`cmd/s3pgstore-rebuild/README.md`](cmd/s3pgstore-rebuild/README.md)
 
 ## Container images
 

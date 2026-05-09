@@ -7,11 +7,9 @@
 //
 //	S3PGSTORE_DATABASE_URL                       PostgreSQL DSN (required)
 //	S3PGSTORE_S3_BUCKET                          S3 bucket name (required)
-//	S3PGSTORE_S3_ENDPOINT                        Optional override for non-AWS S3 (e.g. MinIO)
 //	S3PGSTORE_S3_USE_PATH_STYLE                  "1" / "true" → path-style URLs (https://endpoint/bucket/key); needed for local MinIO at localhost / IP-based endpoints; STACKIT, R2, StorageGRID with proper DNS use the SDK default (virtual-hosted-style)
-//	S3PGSTORE_S3_REGION                          AWS region (default "us-east-1")
 //	S3PGSTORE_S3_MAX_OPEN_CONNECTIONS            Cap concurrent TCP connections to S3 (default 64)
-//	S3PGSTORE_S3_MAX_RETRY_ATTEMPTS              SDK retry budget per S3 op, 1 + retries (default 5)
+//	S3PGSTORE_S3_MAX_RETRY_ATTEMPTS              SDK retry budget per S3 op, 1 + retries (default = AWS_MAX_ATTEMPTS or 5)
 //	S3PGSTORE_S3_MAX_REQUESTS_PER_SECOND         Pre-throttle outgoing S3 ops to this rate (default 0 = unlimited)
 //	S3PGSTORE_S3_MAX_REQUESTS_PER_SECOND_BURST   Token bucket burst (default = max(1, rate*0.1))
 //	S3PGSTORE_SCHEMA                             Schema name (default "public")
@@ -20,6 +18,13 @@
 //	S3PGSTORE_INTERVAL                           Loop interval (default "1h")
 //	S3PGSTORE_BATCH_SIZE                         Rows per RunOnce (default 1000)
 //	S3PGSTORE_ONESHOT                            "1" / "true" → run RunOnce and exit
+//
+// AWS-side configuration (region, endpoint, credentials) follows
+// the standard AWS SDK env-var chain — AWS_REGION,
+// AWS_ENDPOINT_URL_S3 (or AWS_ENDPOINT_URL), AWS_ACCESS_KEY_ID,
+// AWS_PROFILE, IRSA, IMDS. AWS_MAX_ATTEMPTS is honoured as the
+// fallback for S3PGSTORE_S3_MAX_RETRY_ATTEMPTS when the
+// s3pgstore-namespaced var is unset.
 //
 // Telemetry (opt-in; see cmd/internal/otelinit for details):
 //
@@ -39,11 +44,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"go.opentelemetry.io/otel/metric"
 
 	"github.com/ueisele/s3pgstore/cmd/internal/otelinit"
 	"github.com/ueisele/s3pgstore/gc"
@@ -100,13 +101,15 @@ func run() error {
 	defer pool.Close()
 	cfg.Pool = pool
 
-	s3Client, err := loadS3Client(ctx, meter)
+	cfg.S3Client, err = s3client.NewClientFromEnv(ctx, "", meter)
 	if err != nil {
 		return err
 	}
-	cfg.S3Client = s3Client
 
-	oneshot := isTruthy(os.Getenv("S3PGSTORE_ONESHOT"))
+	oneshot, err := envBool("S3PGSTORE_ONESHOT")
+	if err != nil {
+		return err
+	}
 	slog.Info("s3pgstore-gc starting",
 		"schema", cfg.SchemaName,
 		"prefix", cfg.TablePrefix,
@@ -164,108 +167,18 @@ func loadConfig() (gc.Config, error) {
 	return cfg, nil
 }
 
-func loadS3Client(
-	ctx context.Context, meter metric.Meter,
-) (*s3.Client, error) {
-	maxOpen, err := envIntNonNeg(
-		"S3PGSTORE_S3_MAX_OPEN_CONNECTIONS")
-	if err != nil {
-		return nil, err
-	}
-	maxAttempts, err := envIntNonNeg(
-		"S3PGSTORE_S3_MAX_RETRY_ATTEMPTS")
-	if err != nil {
-		return nil, err
-	}
-	maxRPS, err := envFloatNonNeg(
-		"S3PGSTORE_S3_MAX_REQUESTS_PER_SECOND")
-	if err != nil {
-		return nil, err
-	}
-	maxBurst, err := envIntNonNeg(
-		"S3PGSTORE_S3_MAX_REQUESTS_PER_SECOND_BURST")
-	if err != nil {
-		return nil, err
-	}
-	region := os.Getenv("S3PGSTORE_S3_REGION")
-	if region == "" {
-		region = "us-east-1"
-	}
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
-		awsconfig.WithRegion(region))
-	if err != nil {
-		return nil, fmt.Errorf("aws config: %w", err)
-	}
-	endpoint := os.Getenv("S3PGSTORE_S3_ENDPOINT")
-	usePathStyle := isTruthy(os.Getenv("S3PGSTORE_S3_USE_PATH_STYLE"))
-	return s3.NewFromConfig(awsCfg,
-		s3client.WithDefaults(s3client.Options{
-			MaxOpenConnections:        maxOpen,
-			MaxRetryAttempts:          maxAttempts,
-			MaxRequestsPerSecond:      maxRPS,
-			MaxRequestsPerSecondBurst: maxBurst,
-			Meter:                     meter,
-		}),
-		func(o *s3.Options) {
-			if endpoint != "" {
-				o.BaseEndpoint = aws.String(endpoint)
-			}
-			if usePathStyle {
-				o.UsePathStyle = true
-			}
-		},
-	), nil
-}
-
-// envIntNonNeg parses a non-negative int env var. Empty → 0.
-// Negative or non-numeric values surface as a structured error.
-func envIntNonNeg(key string) (int, error) {
-	n, err := envInt(key)
-	if err != nil {
-		return 0, err
-	}
-	if n < 0 {
-		return 0, fmt.Errorf("%s %d: must be >= 0", key, n)
-	}
-	return n, nil
-}
-
-// envFloatNonNeg parses a non-negative float env var.
-// Empty → 0.
-func envFloatNonNeg(key string) (float64, error) {
+// envBool parses an optional bool env var via strconv.ParseBool.
+// Empty → false (no error). Unrecognised values surface so a
+// typo like "tru" fails at startup rather than silently flipping
+// the switch off.
+func envBool(key string) (bool, error) {
 	v := os.Getenv(key)
 	if v == "" {
-		return 0, nil
+		return false, nil
 	}
-	f, err := strconv.ParseFloat(v, 64)
+	b, err := strconv.ParseBool(v)
 	if err != nil {
-		return 0, fmt.Errorf("%s %q: %w", key, v, err)
+		return false, fmt.Errorf("%s %q: %w", key, v, err)
 	}
-	if f < 0 {
-		return 0, fmt.Errorf("%s %g: must be >= 0", key, f)
-	}
-	return f, nil
-}
-
-// envInt parses an env var as int. Returns (0, nil) when unset.
-// Negative-value validation is left to the caller so each
-// binary can frame the error message in its own terms.
-func envInt(key string) (int, error) {
-	v := os.Getenv(key)
-	if v == "" {
-		return 0, nil
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return 0, fmt.Errorf("%s %q: %w", key, v, err)
-	}
-	return n, nil
-}
-
-func isTruthy(s string) bool {
-	switch s {
-	case "1", "t", "T", "true", "TRUE", "True", "yes", "YES":
-		return true
-	}
-	return false
+	return b, nil
 }

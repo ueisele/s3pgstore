@@ -48,15 +48,33 @@ version. Remove or re-upload them before re-running.
 | Variable                 | Default       | Description                                              |
 | ------------------------ | ------------- | -------------------------------------------------------- |
 | `S3PGSTORE_S3_PREFIX`    | _(empty)_     | S3 prefix matching the writer's `Config.S3Prefix`.       |
-| `S3PGSTORE_S3_ENDPOINT`  | _(AWS)_       | Override for non-AWS S3 (e.g. `http://minio:9000`).      |
 | `S3PGSTORE_S3_USE_PATH_STYLE` | `false`  | Set to `1`/`true` for path-style URLs (`https://endpoint/bucket/key`). Required for local MinIO at `localhost` and other IP-/non-DNS endpoints. STACKIT, Cloudflare R2, and StorageGRID with proper DNS work over the SDK default (virtual-hosted-style); leave unset there. |
-| `S3PGSTORE_S3_REGION`    | `us-east-1`   | AWS region.                                              |
 | `S3PGSTORE_S3_MAX_OPEN_CONNECTIONS` | `64` | Caps concurrent TCP connections to S3 (drives the HTTP transport's connection pool). This is the global concurrency ceiling for the rebuild — higher values speed up multi-million-file runs at the cost of socket pressure on the bucket. For "effectively unlimited", set a large value like 1000. |
-| `S3PGSTORE_S3_MAX_RETRY_ATTEMPTS` | `5` | SDK retry budget per logical S3 op (1 initial + retries). Equal-jitter backoff windows 100ms..10s. |
+| `S3PGSTORE_S3_MAX_RETRY_ATTEMPTS` | `AWS_MAX_ATTEMPTS` or `5` | SDK retry budget per logical S3 op (1 initial + retries). Equal-jitter backoff windows 100ms..10s. Honours the AWS-standard `AWS_MAX_ATTEMPTS` as fallback. |
 | `S3PGSTORE_S3_MAX_REQUESTS_PER_SECOND` | _(unset = unlimited)_ | Pre-throttle outgoing S3 ops via a client-side token bucket. Crucial for backends with a known per-second ceiling — STACKIT 2500 RPS, AWS S3 per-prefix 5500 GET / 3500 PUT. At rebuild scale (100 ms typical HEAD latency, 400 concurrent connections → 4000 RPS via Little's Law) a connection cap alone won't keep you under 2500. |
 | `S3PGSTORE_S3_MAX_REQUESTS_PER_SECOND_BURST` | `max(1, rate*0.1)` | Token bucket burst — caps the post-idle 1-second excursion at +10% over the sustained rate. Only meaningful when `MAX_REQUESTS_PER_SECOND > 0`. |
 | `S3PGSTORE_SCHEMA`       | `public`      | Schema containing the s3pgstore tables.                  |
 | `S3PGSTORE_TABLE_PREFIX` | `s3pgstore_`  | Table-name prefix (must match the writer).               |
+
+### AWS env vars
+
+Region, endpoint, and credentials are not in the
+`S3PGSTORE_S3_*` namespace — they're picked up via the standard
+AWS SDK chain so existing AWS tooling (IRSA pod templates,
+shared k8s base configs, `aws-vault` setups) Just Works:
+
+| Variable                  | Purpose                                                                             |
+| ------------------------- | ----------------------------------------------------------------------------------- |
+| `AWS_REGION`              | AWS region (or `AWS_DEFAULT_REGION`).                                               |
+| `AWS_ENDPOINT_URL_S3`     | S3 endpoint override (or generic `AWS_ENDPOINT_URL`). Use for MinIO / StorageGRID. |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` | Static credentials. |
+| `AWS_PROFILE`             | Named profile from `~/.aws/credentials` / `~/.aws/config`.                          |
+| `AWS_ROLE_ARN` / `AWS_WEB_IDENTITY_TOKEN_FILE` | IRSA / web-identity STS.                                       |
+| `AWS_MAX_ATTEMPTS`        | Fallback for `S3PGSTORE_S3_MAX_RETRY_ATTEMPTS` when the s3pgstore var is unset.     |
+
+For non-AWS S3 (MinIO, StorageGRID), at minimum set
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and
+`AWS_ENDPOINT_URL_S3`.
 
 ### Telemetry (opt-in)
 

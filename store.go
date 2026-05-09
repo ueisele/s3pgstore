@@ -13,6 +13,13 @@ import (
 	"github.com/ueisele/s3pgstore/pool"
 )
 
+// defaultWorkerPoolSize is the slot count of the auto-installed
+// Config.WorkerPool when the caller doesn't supply one. Mirrors
+// s3client.defaultMaxOpenConnections so a single-Store
+// deployment that tunes neither knob still gets a self-consistent
+// configuration.
+const defaultWorkerPoolSize = 64
+
 // Store is the typed entry point for writing and reading
 // records. Construct via New[T]; New runs Config validation,
 // constructs the parquet encoder, builds the S3 target, and
@@ -149,10 +156,9 @@ func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
 	// owned entirely by s3client and registers against the
 	// caller-supplied meter at WithDefaults time.
 	target, err := newS3Target(s3TargetConfig{
-		S3Client:                    r.S3Client,
-		S3Bucket:                    r.S3Bucket,
-		S3Prefix:                    r.S3Prefix,
-		S3MaxConcurrentOpsPerMethod: r.S3MaxConcurrentOpsPerMethod,
+		S3Client: r.S3Client,
+		S3Bucket: r.S3Bucket,
+		S3Prefix: r.S3Prefix,
 	})
 	if err != nil {
 		return nil, err
@@ -161,12 +167,12 @@ func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
 	// WorkerPool default. Every fan-out call site routes through
 	// this pool — there is no per-method goroutine fallback. When
 	// the caller doesn't supply one, we install a private pool
-	// sized to defaultS3MaxConcurrentOpsPerMethod so a single
-	// Store's behavior matches the pre-pool defaults; multi-Store
-	// deployments share one pool across Stores by passing the
-	// same instance via Config.WorkerPool.
+	// sized to defaultWorkerPoolSize so a single Store's behavior
+	// matches the pre-pool defaults; multi-Store deployments
+	// share one pool across Stores by passing the same instance
+	// via Config.WorkerPool.
 	if r.WorkerPool == nil {
-		p, err := pool.New(defaultS3MaxConcurrentOpsPerMethod, cfg.Meter)
+		p, err := pool.New(defaultWorkerPoolSize, cfg.Meter)
 		if err != nil {
 			return nil, fmt.Errorf("default WorkerPool: %w", err)
 		}

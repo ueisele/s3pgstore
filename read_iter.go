@@ -360,16 +360,17 @@ func (s *Store[T]) downloadAndDecodeIter(
 	// bodyCap bounds the per-call in-memory compressed-body
 	// footprint: the submitter blocks on acquireBodySlot once
 	// cap slots are held; the decoder releases slots as it nils
-	// each body. The default ceiling is the per-method cap
-	// (target.effectiveConcurrency) so per-call body memory
-	// stays predictable regardless of pool size — the shared
-	// pool's MaxConcurrent caps in-flight S3 ops globally; this
-	// caps body memory locally. Floor at the largest partition's
+	// each body. Default ceiling tracks the shared pool's
+	// MaxConcurrent so per-call body memory scales with the
+	// concurrency budget the operator chose: small pool ⇒
+	// small per-call body buffer; large pool ⇒ enough lookahead
+	// to keep the decoder fed with many tiny partitions in
+	// flight in parallel. Floor at the largest partition's
 	// file count so a single oversized partition still fits in
 	// the pool — otherwise its last few files would block on
 	// the cap and the decoder would block on those files,
 	// producing a deadlock.
-	bodyCap := s.target.effectiveConcurrency()
+	bodyCap := s.resolved.WorkerPool.MaxConcurrent()
 	for _, p := range parts {
 		if n := len(p.files); n > bodyCap {
 			bodyCap = n

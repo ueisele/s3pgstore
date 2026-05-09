@@ -85,11 +85,6 @@ func TestNewS3Target_Validation(t *testing.T) {
 			name: "missing bucket",
 			cfg:  s3TargetConfig{S3Client: &s3.Client{}},
 		},
-		{
-			name: "negative inflight",
-			cfg: s3TargetConfig{S3Client: &s3.Client{}, S3Bucket: "b",
-				S3MaxConcurrentOpsPerMethod: -1},
-		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -105,39 +100,6 @@ func TestNewS3Target_Validation(t *testing.T) {
 			}
 			if err == nil {
 				t.Fatalf("want error, got nil")
-			}
-		})
-	}
-}
-
-func TestS3Target_EffectiveConcurrency(t *testing.T) {
-	cases := []struct {
-		name            string
-		cfg             s3TargetConfig
-		wantConcurrency int
-	}{
-		{
-			name: "default when zero",
-			cfg: s3TargetConfig{S3Client: &s3.Client{}, S3Bucket: "b",
-				S3MaxConcurrentOpsPerMethod: 0},
-			wantConcurrency: defaultS3MaxConcurrentOpsPerMethod,
-		},
-		{
-			name: "explicit value passes through",
-			cfg: s3TargetConfig{S3Client: &s3.Client{}, S3Bucket: "b",
-				S3MaxConcurrentOpsPerMethod: 64},
-			wantConcurrency: 64,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			tgt, err := newS3Target(tc.cfg)
-			if err != nil {
-				t.Fatalf("newS3Target: %v", err)
-			}
-			if got := tgt.effectiveConcurrency(); got != tc.wantConcurrency {
-				t.Errorf("effectiveConcurrency: want %d, got %d",
-					tc.wantConcurrency, got)
 			}
 		})
 	}

@@ -104,24 +104,6 @@ type Config[T any] struct {
 	S3Prefix string
 	S3Client *s3.Client
 
-	// S3MaxConcurrentOpsPerMethod is the per-call body-slot
-	// ceiling for the iter pipeline's compressed-body footprint.
-	// downloadAndDecodeIter holds at most this many in-memory
-	// parquet bodies per call (floored at the largest
-	// partition's file count so an oversized partition still
-	// fits — otherwise the decoder would deadlock).
-	//
-	// This is a *memory* bound, not a concurrency bound — the
-	// shared WorkerPool's MaxConcurrent caps in-flight S3 ops
-	// globally; this caps body memory locally. Lower it when
-	// per-call bodies are large; raise it when partitions tend
-	// to have many small files and the decoder would benefit
-	// from deeper download lookahead.
-	//
-	// Zero → 64 (the library default). Negative → Config.validate
-	// returns an error.
-	S3MaxConcurrentOpsPerMethod int
-
 	// WorkerPool is the shared I/O worker pool every fan-out
 	// call site (Write multi-partition, Read fetch+decode,
 	// PollRecords body fetch, ReadIter download) submits S3
@@ -218,11 +200,6 @@ func (c Config[T]) validate() error {
 	}
 	if c.S3Client == nil {
 		add("S3Client is required")
-	}
-	if c.S3MaxConcurrentOpsPerMethod < 0 {
-		add("S3MaxConcurrentOpsPerMethod %d must be >= 0 "+
-			"(zero → default 64)",
-			c.S3MaxConcurrentOpsPerMethod)
 	}
 	if len(c.PartitionKeyParts) == 0 {
 		add("PartitionKeyParts must be non-empty")

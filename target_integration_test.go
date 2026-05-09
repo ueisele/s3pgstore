@@ -171,20 +171,18 @@ func TestS3Target_DeleteIdempotent(t *testing.T) {
 // goroutines. After the middleware refactor s3target itself no
 // longer enforces a semaphore (concurrency is capped at the
 // HTTP transport's MaxConnsPerHost on the wrapped client and at
-// the per-method FanOut pool size in the library); this test
-// just smoke-tests that 30 simultaneous PUTs against a raw
-// MinIO client all complete and round-trip cleanly.
+// the shared Config.WorkerPool's MaxConcurrent in the library);
+// this test just smoke-tests that 30 simultaneous PUTs against
+// a raw MinIO client all complete and round-trip cleanly.
 func TestS3Target_ConcurrentPutsSmokeTest(t *testing.T) {
 	cli, err := itShareMinio(t.Context())
 	if err != nil {
 		t.Fatalf("MinIO: %v", err)
 	}
 	bucket := itNewBucket(t, cli)
-	const cap = 3
 	tgt, err := newS3Target(s3TargetConfig{
-		S3Client:                    cli,
-		S3Bucket:                    bucket,
-		S3MaxConcurrentOpsPerMethod: cap,
+		S3Client: cli,
+		S3Bucket: bucket,
 	})
 	if err != nil {
 		t.Fatalf("newS3Target: %v", err)

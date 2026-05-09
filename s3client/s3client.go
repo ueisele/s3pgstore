@@ -67,8 +67,8 @@
 //     MaxRequestsPerSecond > 0) plus adaptive retry's reactive
 //     token bucket.
 //   - Per-method goroutine pool sizing → caller's responsibility
-//     (s3pgstore Config.S3MaxConcurrentOpsPerMethod, used by the
-//     library's FanOut callers).
+//     (s3pgstore Config.WorkerPool, the shared pool every
+//     fan-out call site submits S3 ops to).
 package s3client
 
 import (

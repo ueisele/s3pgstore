@@ -60,7 +60,7 @@ jobs:
       - name: pre-pull container images
         # Keep in sync with fixture_test.go's postgresImage / minioImage
         run: |
-          docker pull postgres:17.5-alpine
+          docker pull postgres:17.9-alpine
           docker pull pgsty/minio:RELEASE.2026-04-17T00-00-00Z
       - name: test (integration)
         run: go test -tags=integration -count=1 -timeout=15m ./...

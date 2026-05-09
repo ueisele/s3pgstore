@@ -34,7 +34,7 @@ import (
 // across modules, so the sequencer subpackage gets its own copy.
 
 const (
-	postgresImage    = "postgres:17.5-alpine"
+	postgresImage    = "postgres:17.9-alpine"
 	postgresUsername = "s3pgstore"
 	postgresPassword = "s3pgstore"
 	postgresDatabase = "s3pgstore"

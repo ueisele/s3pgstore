@@ -81,16 +81,17 @@ var (
 // freely pass nil to the middleware / wraps to disable
 // telemetry without per-call branching.
 type s3metrics struct {
-	requestDuration metric.Float64Histogram
-	requestCount    metric.Int64Counter
-	attemptError    metric.Int64Counter
-	bodySize        metric.Int64Histogram
-	ratelimitWait   metric.Float64Histogram
-	tcpConnections  metric.Int64UpDownCounter
-	connectionReuse metric.Int64Counter
+	requestDuration   metric.Float64Histogram
+	requestCount      metric.Int64Counter
+	attemptError      metric.Int64Counter
+	bodySize          metric.Int64Histogram
+	ratelimitWait     metric.Float64Histogram
+	adaptiveRetryWait metric.Float64Histogram
+	tcpConnections    metric.Int64UpDownCounter
+	connectionReuse   metric.Int64Counter
 }
 
-// newS3Metrics registers the seven s3pgstore.s3.* instruments
+// newS3Metrics registers the eight s3pgstore.s3.* instruments
 // against meter and returns an s3metrics backed by them.
 //
 // meter == nil falls back to otel.GetMeterProvider().Meter(...) —
@@ -181,6 +182,25 @@ func newS3Metrics(meter metric.Meter) (*s3metrics, error) {
 				"is configured (MaxRequestsPerSecond > 0); "+
 				"recorded only on Wait success (cancelled waits "+
 				"skip)."),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(shortWaitBuckets...),
+	); err != nil {
+		return nil, err
+	}
+	if m.adaptiveRetryWait, err = meter.Float64Histogram(
+		"s3pgstore.s3.adaptive_retry.wait.duration",
+		metric.WithDescription(
+			"Wallclock the SDK's adaptive-mode token bucket held "+
+				"each attempt waiting for a token. Measured "+
+				"around RetryerV2.GetAttemptToken, *inside* "+
+				"s3.request.duration but isolated from "+
+				"server-side latency. Sub-microsecond when the "+
+				"bucket has tokens (steady state); rising p99 "+
+				"means the SDK has shrunk the bucket in response "+
+				"to recent SlowDown errors and is now actively "+
+				"throttling outgoing attempts. Pair with "+
+				"s3.attempt.error.count{error_type=\"slowdown\"} "+
+				"to confirm the cause."),
 		metric.WithUnit("s"),
 		metric.WithExplicitBucketBoundaries(shortWaitBuckets...),
 	); err != nil {
@@ -287,6 +307,24 @@ func (m *s3metrics) recordRatelimitWait(
 		return
 	}
 	m.ratelimitWait.Record(ctx, waited.Seconds(),
+		metric.WithAttributes(
+			attribute.String(attrKeyOperation, op)))
+}
+
+// recordAdaptiveRetryWait records the wallclock the SDK's
+// adaptive-mode token bucket held one attempt waiting for a
+// token. Steady state is sub-microsecond; rising p99 means the
+// adaptive retrier has shrunk the bucket and is now throttling.
+// Skips when waited <= 0 to avoid recording the no-op fast path
+// as a histogram observation that would skew low-percentile
+// buckets.
+func (m *s3metrics) recordAdaptiveRetryWait(
+	ctx context.Context, op string, waited time.Duration,
+) {
+	if m == nil || waited <= 0 {
+		return
+	}
+	m.adaptiveRetryWait.Record(ctx, waited.Seconds(),
 		metric.WithAttributes(
 			attribute.String(attrKeyOperation, op)))
 }

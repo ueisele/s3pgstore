@@ -174,16 +174,19 @@ type Options struct {
 
 // newAdaptiveRetryer constructs the SDK adaptive-mode retryer
 // configured with the s3pgstore equal-jitter backoff and the
-// supplied max-attempts budget. Used by BuildS3Client and
+// supplied max-attempts budget, wrapped with instrumentedRetryer
+// so the adaptive token bucket's wait time emits as
+// s3.adaptive_retry.wait.duration. Used by BuildS3Client and
 // WrapS3Client; exposed so that callers reconstructing the
 // retryer for tests / customisation get the same shape.
 //
-// maxAttempts <= 0 → defaultMaxRetryAttempts.
-func newAdaptiveRetryer(maxAttempts int) aws.Retryer {
+// maxAttempts <= 0 → defaultMaxRetryAttempts. m may be nil; the
+// recorder short-circuits on a nil receiver.
+func newAdaptiveRetryer(maxAttempts int, m *s3metrics) aws.Retryer {
 	if maxAttempts <= 0 {
 		maxAttempts = defaultMaxRetryAttempts
 	}
-	return retry.NewAdaptiveMode(func(o *retry.AdaptiveModeOptions) {
+	base := retry.NewAdaptiveMode(func(o *retry.AdaptiveModeOptions) {
 		o.StandardOptions = append(o.StandardOptions,
 			func(so *retry.StandardOptions) {
 				so.MaxAttempts = maxAttempts
@@ -194,6 +197,7 @@ func newAdaptiveRetryer(maxAttempts int) aws.Retryer {
 			},
 		)
 	})
+	return instrumentedRetryer{RetryerV2: base, m: m}
 }
 
 // middlewareOptions captures the per-client middleware-stack
@@ -328,7 +332,7 @@ func BuildS3Client(
 		// its keep — and it would cost one wasted default-
 		// retryer instantiation that we'd immediately
 		// overwrite.
-		o.Retryer = newAdaptiveRetryer(opts.MaxRetryAttempts)
+		o.Retryer = newAdaptiveRetryer(opts.MaxRetryAttempts, m)
 		o.ResponseChecksumValidation =
 			aws.ResponseChecksumValidationWhenRequired
 		if opts.Endpoint != "" {
@@ -388,7 +392,7 @@ func WrapS3Client(
 		MaxRequestsPerSecondBurst: opts.MaxRequestsPerSecondBurst,
 	})
 	return awss3.New(base.Options(), func(o *awss3.Options) {
-		o.Retryer = newAdaptiveRetryer(opts.MaxRetryAttempts)
+		o.Retryer = newAdaptiveRetryer(opts.MaxRetryAttempts, m)
 		o.APIOptions = append(o.APIOptions, mwFn)
 	}), nil
 }

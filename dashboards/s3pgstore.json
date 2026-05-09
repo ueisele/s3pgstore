@@ -182,7 +182,7 @@
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "description": "Wallclock spent in the client-side rate limiter (Config.S3MaxRequestsPerSecond) before the SDK ran the op. Measured *outside* s3.request.duration — so SDK-side latency stays clean and self-throttle saturation surfaces here. Sub-millisecond is normal when the configured rate has headroom; rising p99 means the per-second cap is now the bottleneck (raise it, or accept the cap and ensure callers throttle their fan-out). Empty when S3MaxRequestsPerSecond is unset.",
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "s"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 41},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 41},
       "id": 305,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
       "targets": [
@@ -191,6 +191,21 @@
         {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.99, sum by (le, s3pgstore_operation) (rate(s3pgstore_s3_ratelimit_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P99 {{s3pgstore_operation}}", "interval": "1m", "refId": "C"}
       ],
       "title": "S3 rate-limiter wait (P50/P95/P99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Wallclock the SDK's adaptive-mode token bucket held each attempt before letting it proceed. The only direct signal that the SDK is actively throttling: sub-microsecond in steady state, rising into the millisecond+ range once the bucket has shrunk in response to recent SlowDown errors. Pair with s3.attempt.error.count{error_type=\"slowdown\"} to confirm — non-zero slowdown rate followed by rising adaptive-retry wait = the SDK has measured the backend's ceiling and is keeping requests under it. Always fires (no opt-in knob); recorded around RetryerV2.GetAttemptToken inside s3.request.duration.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 41},
+      "id": 308,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.50, sum by (le, s3pgstore_operation) (rate(s3pgstore_s3_adaptive_retry_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P50 {{s3pgstore_operation}}", "interval": "1m", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.95, sum by (le, s3pgstore_operation) (rate(s3pgstore_s3_adaptive_retry_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P95 {{s3pgstore_operation}}", "interval": "1m", "refId": "B"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.99, sum by (le, s3pgstore_operation) (rate(s3pgstore_s3_adaptive_retry_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P99 {{s3pgstore_operation}}", "interval": "1m", "refId": "C"}
+      ],
+      "title": "S3 adaptive-retry wait (P50/P95/P99)",
       "type": "timeseries"
     },
     {

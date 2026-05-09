@@ -30,6 +30,7 @@ func TestNewS3Metrics_NilMeterFallsBackToGlobal(t *testing.T) {
 	m.recordAttemptError(ctx, "PutObject", 1, errors.New("x"), false)
 	m.recordBodySize(ctx, "PutObject", 123)
 	m.recordRatelimitWait(ctx, "PutObject", time.Millisecond)
+	m.recordAdaptiveRetryWait(ctx, "PutObject", time.Millisecond)
 	m.recordTCPConnOpen(ctx)
 	m.recordTCPConnClose(ctx)
 	m.recordConnectionReuse(ctx, true)
@@ -46,6 +47,7 @@ func TestS3Metrics_NilReceiverSafe(t *testing.T) {
 	m.recordAttemptError(ctx, "PutObject", 1, errors.New("x"), false)
 	m.recordBodySize(ctx, "PutObject", 123)
 	m.recordRatelimitWait(ctx, "PutObject", time.Millisecond)
+	m.recordAdaptiveRetryWait(ctx, "PutObject", time.Millisecond)
 	m.recordTCPConnOpen(ctx)
 	m.recordTCPConnClose(ctx)
 	m.recordConnectionReuse(ctx, true)
@@ -79,6 +81,8 @@ func TestS3Metrics_RecordedInstruments(t *testing.T) {
 		errors.New("server"))
 	// Rate-limiter wait sample.
 	m.recordRatelimitWait(ctx, "PutObject", 5*time.Millisecond)
+	// Adaptive-retry token-bucket wait sample.
+	m.recordAdaptiveRetryWait(ctx, "PutObject", 3*time.Millisecond)
 	// Connection-pool metrics.
 	m.recordTCPConnOpen(ctx)
 	m.recordTCPConnClose(ctx)
@@ -96,6 +100,7 @@ func TestS3Metrics_RecordedInstruments(t *testing.T) {
 		"s3pgstore.s3.attempt.error.count",
 		"s3pgstore.s3.body_size",
 		"s3pgstore.s3.ratelimit.wait.duration",
+		"s3pgstore.s3.adaptive_retry.wait.duration",
 		"s3pgstore.s3.tcp.connections",
 		"s3pgstore.s3.connection.reuse.count",
 	}

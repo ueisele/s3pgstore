@@ -52,7 +52,37 @@ const (
 	attrKeyErrorType = "error.type"
 	attrKeyReused    = "reused"
 	attrKeyTerminal  = "terminal"
+	// attrKeyBucket / attrKeyPrefix are added to per-op metrics
+	// when WithStoreLabels stashed values on ctx — lets multiple
+	// Stores sharing one *s3.Client surface as separate streams
+	// on the dashboard. Names match the existing OTEL_RESOURCE_
+	// ATTRIBUTES convention so dashboards work whether the labels
+	// come from resource attributes (single-Store-per-process) or
+	// instrument attributes (multi-Store-per-process).
+	attrKeyBucket = "s3pgstore.bucket"
+	attrKeyPrefix = "s3pgstore.prefix"
 )
+
+// storeAttrs returns the attribute.KeyValue pair carrying the
+// per-Store bucket/prefix labels stashed on ctx. Returns empty
+// slices when no labels were set or when an individual value is
+// empty — the metrics middleware appends only what's present,
+// keeping cardinality minimal for callers that don't
+// differentiate per-Store.
+func storeAttrs(ctx context.Context) []attribute.KeyValue {
+	bucket, prefix := storeLabelsFromContext(ctx)
+	if bucket == "" && prefix == "" {
+		return nil
+	}
+	out := make([]attribute.KeyValue, 0, 2)
+	if bucket != "" {
+		out = append(out, attribute.String(attrKeyBucket, bucket))
+	}
+	if prefix != "" {
+		out = append(out, attribute.String(attrKeyPrefix, prefix))
+	}
+	return out
+}
 
 // Bucket boundaries chosen so histogram_quantile resolves
 // percentiles within the realistic operating range.
@@ -245,6 +275,10 @@ func newS3Metrics(meter metric.Meter) (*s3metrics, error) {
 // recordOp records s3.request.duration + s3.request.count for
 // one logical S3 op. Per-attempt error.type lives in
 // s3.attempt.error.count, not here.
+//
+// When ctx carries WithStoreLabels values, they're emitted as
+// s3pgstore.bucket / s3pgstore.prefix attributes — lets multiple
+// Stores sharing one *s3.Client surface as separate streams.
 func (m *s3metrics) recordOp(
 	ctx context.Context, op string,
 	duration time.Duration, attempts int, err error,
@@ -253,20 +287,25 @@ func (m *s3metrics) recordOp(
 		return
 	}
 	outcome, _ := classifyS3Error(err)
-	opAttr := attribute.String(attrKeyOperation, op)
-	m.requestDuration.Record(ctx, duration.Seconds(),
-		metric.WithAttributes(opAttr))
-	m.requestCount.Add(ctx, 1, metric.WithAttributes(
-		opAttr,
+	store := storeAttrs(ctx)
+	durAttrs := append([]attribute.KeyValue{
+		attribute.String(attrKeyOperation, op),
+	}, store...)
+	countAttrs := append([]attribute.KeyValue{
+		attribute.String(attrKeyOperation, op),
 		attribute.String(attrKeyOutcome, outcome),
 		attribute.Int(attrKeyAttempts, attempts),
-	))
+	}, store...)
+	m.requestDuration.Record(ctx, duration.Seconds(),
+		metric.WithAttributes(durAttrs...))
+	m.requestCount.Add(ctx, 1, metric.WithAttributes(countAttrs...))
 }
 
 // recordAttemptError fires once per failed attempt — retried
 // OR terminal. Operators query a single counter for 'rate of
 // <error_type> events' without summing two metrics. attempt
-// is 1-based.
+// is 1-based. When ctx carries WithStoreLabels, emits
+// s3pgstore.bucket / s3pgstore.prefix.
 func (m *s3metrics) recordAttemptError(
 	ctx context.Context, op string, attempt int,
 	err error, terminal bool,
@@ -275,40 +314,48 @@ func (m *s3metrics) recordAttemptError(
 		return
 	}
 	_, errType := classifyS3Error(err)
-	m.attemptError.Add(ctx, 1, metric.WithAttributes(
+	attrs := append([]attribute.KeyValue{
 		attribute.String(attrKeyOperation, op),
 		attribute.String(attrKeyErrorType, errType),
 		attribute.Int(attrKeyAttempt, attempt),
 		attribute.Bool(attrKeyTerminal, terminal),
-	))
+	}, storeAttrs(ctx)...)
+	m.attemptError.Add(ctx, 1, metric.WithAttributes(attrs...))
 }
 
 // recordBodySize records the wire bytes for the op (PUT
 // request body or GET response body) on success. Skipped
-// when bytes <= 0 (DELETE has no body).
+// when bytes <= 0 (DELETE has no body). When ctx carries
+// WithStoreLabels, emits s3pgstore.bucket / s3pgstore.prefix.
 func (m *s3metrics) recordBodySize(
 	ctx context.Context, op string, bytes int64,
 ) {
 	if m == nil || bytes <= 0 {
 		return
 	}
-	m.bodySize.Record(ctx, bytes, metric.WithAttributes(
-		attribute.String(attrKeyOperation, op)))
+	attrs := append([]attribute.KeyValue{
+		attribute.String(attrKeyOperation, op),
+	}, storeAttrs(ctx)...)
+	m.bodySize.Record(ctx, bytes, metric.WithAttributes(attrs...))
 }
 
 // recordRatelimitWait records the time the client-side rate
 // limiter held this op before letting it proceed. Sub-ms
 // observations are normal at low load; rising p99 means the
 // configured MaxRequestsPerSecond cap is now the bottleneck.
+// When ctx carries WithStoreLabels, emits s3pgstore.bucket /
+// s3pgstore.prefix.
 func (m *s3metrics) recordRatelimitWait(
 	ctx context.Context, op string, waited time.Duration,
 ) {
 	if m == nil {
 		return
 	}
+	attrs := append([]attribute.KeyValue{
+		attribute.String(attrKeyOperation, op),
+	}, storeAttrs(ctx)...)
 	m.ratelimitWait.Record(ctx, waited.Seconds(),
-		metric.WithAttributes(
-			attribute.String(attrKeyOperation, op)))
+		metric.WithAttributes(attrs...))
 }
 
 // recordAdaptiveRetryWait records the wallclock the SDK's

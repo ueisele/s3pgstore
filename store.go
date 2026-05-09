@@ -150,6 +150,7 @@ func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
 	target, err := newS3Target(s3TargetConfig{
 		S3Client:                    r.S3Client,
 		S3Bucket:                    r.S3Bucket,
+		S3Prefix:                    r.S3Prefix,
 		S3MaxConcurrentOpsPerMethod: r.S3MaxConcurrentOpsPerMethod,
 	})
 	if err != nil {

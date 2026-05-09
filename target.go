@@ -28,6 +28,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+
+	"github.com/ueisele/s3pgstore/s3client"
 )
 
 // defaultS3MaxConcurrentOpsPerMethod is the FanOut goroutine
@@ -43,18 +45,22 @@ const defaultS3MaxConcurrentOpsPerMethod = 64
 type s3target struct {
 	s3                          *s3.Client
 	bucket                      string
-	s3MaxConcurrentOpsPerMethod int // resolved per-method FanOut pool size
+	prefix                      string // for s3client.WithStoreLabels emission
+	s3MaxConcurrentOpsPerMethod int    // resolved per-method FanOut pool size
 }
 
 // s3TargetConfig captures the small set of inputs s3target
 // needs after the middleware refactor — the wrapped *s3.Client,
-// the bucket, and the per-method FanOut pool size that callers
-// in read.go / write.go / read_iter.go / stream.go use to size
-// their goroutine pools.
+// the bucket, the prefix (used as a metric label so multiple
+// Stores sharing one *s3.Client surface as separate streams on
+// the dashboard), and the per-method FanOut pool size that
+// callers in read.go / write.go / read_iter.go / stream.go use
+// to size their goroutine pools.
 type s3TargetConfig struct {
 	S3Client                    *s3.Client
 	S3Bucket                    string
-	S3MaxConcurrentOpsPerMethod int // 0 → defaultS3MaxConcurrentOpsPerMethod
+	S3Prefix                    string // empty allowed; metrics label only
+	S3MaxConcurrentOpsPerMethod int    // 0 → defaultS3MaxConcurrentOpsPerMethod
 }
 
 func newS3Target(cfg s3TargetConfig) (*s3target, error) {
@@ -75,8 +81,18 @@ func newS3Target(cfg s3TargetConfig) (*s3target, error) {
 	return &s3target{
 		s3:                          cfg.S3Client,
 		bucket:                      cfg.S3Bucket,
+		prefix:                      cfg.S3Prefix,
 		s3MaxConcurrentOpsPerMethod: cap,
 	}, nil
+}
+
+// withLabels stamps the (bucket, prefix) tuple into ctx so the
+// s3client metrics middleware emits them as s3pgstore.bucket /
+// s3pgstore.prefix attributes. Centralising this in one helper
+// keeps the per-method call sites short and ensures we never
+// forget the labeling on a future code path.
+func (t *s3target) withLabels(ctx context.Context) context.Context {
+	return s3client.WithStoreLabels(ctx, t.bucket, t.prefix)
 }
 
 // effectiveConcurrency returns the resolved
@@ -100,6 +116,7 @@ func (t *s3target) effectiveConcurrency() int {
 func (t *s3target) get(
 	ctx context.Context, key string,
 ) ([]byte, error) {
+	ctx = t.withLabels(ctx)
 	resp, err := t.s3.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(t.bucket),
 		Key:    aws.String(key),
@@ -141,6 +158,7 @@ func (t *s3target) put(
 	ctx context.Context, key string, data []byte,
 	contentType string, metadata map[string]string,
 ) error {
+	ctx = t.withLabels(ctx)
 	expectedMD5 := md5.Sum(data) //nolint:gosec // integrity-only
 	expectedETagHex := hex.EncodeToString(expectedMD5[:])
 	out, err := t.s3.PutObject(ctx, &s3.PutObjectInput{
@@ -161,6 +179,7 @@ func (t *s3target) put(
 // (DELETE on a missing key returns 204, not 404), so the SDK's
 // retry layer can retry safely.
 func (t *s3target) delete(ctx context.Context, key string) error {
+	ctx = t.withLabels(ctx)
 	_, err := t.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(t.bucket),
 		Key:    aws.String(key),

@@ -19,6 +19,8 @@ import (
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
+
+	"github.com/ueisele/s3pgstore/pool"
 )
 
 // fanOutObserver is the optional metric/log hook fired exactly
@@ -149,6 +151,65 @@ func runOneRecover[I any](
 		}
 	}()
 	return work(ctx, i, item)
+}
+
+// fanOutOrPool routes the same fan-out shape (slot-indexed
+// per-item work, first-error-wins, sibling cancel, panic
+// recovery) through one of two backends:
+//
+//   - p == nil → the per-method fanOut helper (today's
+//     behavior). concurrency bounds workers locally.
+//   - p != nil → the shared pool's Group. Submissions
+//     compete for the pool's MaxConcurrent slots in FIFO
+//     order across every Store / call sharing this pool, so
+//     the global concurrency budget is the pool size, not a
+//     per-method × per-Store sum.
+//
+// Both backends preserve slot-indexed result writes (work
+// captures i in its closure to write into a caller-allocated
+// slice without coordination) and first-error-wins
+// semantics. The observer fires once per call with the same
+// (items, workers) shape; on the pool path workers is the
+// pool's MaxConcurrent (the upper bound), since per-call
+// worker count isn't a meaningful concept on a shared pool.
+//
+// Single-item fast path skips both backends and runs work
+// inline with panic recovery — same shape as fanOut's fast
+// path so the sugar-wrapper case stays free of scheduler
+// overhead either way.
+//
+// Empty input returns nil without invoking observer; matches
+// fanOut.
+func fanOutOrPool[I any](
+	ctx context.Context,
+	p *pool.Pool,
+	items []I,
+	concurrency int,
+	obs fanOutObserver,
+	work func(ctx context.Context, i int, item I) error,
+) error {
+	if p == nil {
+		return fanOut(ctx, items, concurrency, obs, work)
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	if len(items) == 1 {
+		if obs != nil {
+			obs(ctx, 1, 1)
+		}
+		return runOneRecover(ctx, 0, items[0], work)
+	}
+	if obs != nil {
+		obs(ctx, len(items), p.MaxConcurrent())
+	}
+	g, gctx := p.WithContext(ctx)
+	for i, item := range items {
+		g.Submit(gctx, func(ctx context.Context) error {
+			return work(ctx, i, item)
+		})
+	}
+	return g.Wait()
 }
 
 // fanOutMapReduce runs mapFn across items in parallel via fanOut,

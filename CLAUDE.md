@@ -299,6 +299,38 @@ coordinate. Properties recent regressions in s3store taught us
   Refactors must not promote the observer into a circuit
   breaker.
 
+- **Shared-pool workers must never block on per-call
+  coordination.** When `Config.WorkerPool` is set, every
+  fan-out call site routes through the shared `pool.Pool`. A
+  worker function that waits on a per-call resource (body
+  slot, byte budget, decoder backpressure signal) holds a
+  pool slot while waiting — and N waiting workers can starve
+  every other Group sharing the pool, including unrelated
+  Stores. Fix: hoist the wait to the *submitter* side
+  (acquire-then-Submit), so pool workers are guaranteed to
+  make progress without blocking. Today's three migrated
+  fan-out sites (Write multi-partition, Read fetch+decode,
+  PollRecords body fetch) have no per-call worker waits, so
+  this rule is currently latent; the `downloadAndDecodeIter`
+  pipeline does have such waits and must restructure them
+  before its migration to the shared pool. Refactors must not
+  introduce a worker function that calls `<-state.slotCh`,
+  `<-state.byteWake`, or any other per-call channel inside a
+  pool-submitted task.
+
+- **Same-pool reentrancy panics; cross-pool nesting is fine.**
+  A worker that calls `g.Submit(...)` on the same pool would
+  hold a slot while waiting for another slot it can't get,
+  wedging the pool. The `pool.Group.Submit` path injects a
+  per-pool ctx marker before invoking fn; a nested submit
+  with that marker present panics at submit time with a clear
+  message. Cross-pool nesting (Pool A worker submitting to
+  Pool B) is safe and does not panic. Spawning a fresh
+  goroutine that submits to the same pool is also safe (the
+  goroutine isn't a worker, doesn't carry the marker).
+  Refactors must not weaken the marker check or strip the
+  ctx marker on the worker path.
+
 # Backend assumptions
 
 Properties of PostgreSQL and S3 that the library's correctness

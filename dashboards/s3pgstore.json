@@ -433,6 +433,36 @@
       "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum (rate(s3pgstore_read_iter_stall_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval]))", "interval": "1m", "refId": "A"}],
       "title": "Iter pipeline stall rate (incident — deadlock or slow consumer)",
       "type": "stat"
+    },
+
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 127}, "id": 1000, "panels": [], "title": "Shared I/O worker pool (Config.WorkerPool — multi-Store deployments)", "type": "row"},
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Tasks currently executing on the shared pool. Approaches MaxConcurrent under saturation; sustained at MaxConcurrent means submitters are queueing on Acquire (see queue.wait.duration). Process-wide metric — no bucket/prefix filter, the pool is shared across Stores by construction.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "none"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 128},
+      "id": 1001,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "max (s3pgstore_pool_in_flight{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\"})", "legendFormat": "in-flight", "interval": "1m", "refId": "A"}
+      ],
+      "title": "Pool in-flight tasks",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
+      "description": "Time submitters spent waiting for a pool slot to free up. Sustained non-zero P95 = the pool is the bottleneck; raise pool.New(maxConcurrent), reduce concurrent callers, or make per-task work faster. Process-wide metric — no bucket/prefix filter.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 128},
+      "id": 1002,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.50, sum by (le) (rate(s3pgstore_pool_queue_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\"}[$__rate_interval])))", "legendFormat": "P50", "interval": "1m", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.95, sum by (le) (rate(s3pgstore_pool_queue_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\"}[$__rate_interval])))", "legendFormat": "P95", "interval": "1m", "refId": "B"},
+        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.99, sum by (le) (rate(s3pgstore_pool_queue_wait_duration_seconds_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\"}[$__rate_interval])))", "legendFormat": "P99", "interval": "1m", "refId": "C"}
+      ],
+      "title": "Pool queue wait duration (P50/P95/P99)",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",

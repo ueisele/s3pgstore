@@ -124,7 +124,8 @@ func (s *Store[T]) Write(
 	// canonical row regardless of which partitions committed
 	// first.
 	out = make([]WriteResult, len(keys))
-	if err := fanOut(ctx, keys, s.target.effectiveConcurrency(),
+	if err := fanOutOrPool(ctx, s.cfg.WorkerPool, keys,
+		s.target.effectiveConcurrency(),
 		s.metrics.fanOutObserverFor("Write"),
 		func(ctx context.Context, i int, key string) error {
 			res, err := s.writePartition(ctx, key,

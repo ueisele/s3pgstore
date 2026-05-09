@@ -8,6 +8,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"go.opentelemetry.io/otel/metric"
+
+	"github.com/ueisele/s3pgstore/pool"
 )
 
 // Default values for Config fields. Exported so tests and
@@ -102,16 +104,16 @@ type Config[T any] struct {
 	S3Prefix string
 	S3Client *s3.Client
 
-	// S3MaxConcurrentOpsPerMethod sizes the FanOut goroutine
-	// pool inside a single Read / Write / ReadIter / Poll call.
+	// S3MaxConcurrentOpsPerMethod sizes the per-method
+	// goroutine pool used inside a single Read / Write /
+	// ReadIter / Poll call when WorkerPool is nil. Ignored
+	// when WorkerPool is non-nil — the pool's concurrency
+	// budget supersedes this knob.
+	//
 	// Higher values speed up large fan-outs (Write with many
 	// partition keys, Read across many files); too high wastes
 	// goroutines that just block waiting on TCP sockets capped
 	// by the s3.Client's connection pool.
-	//
-	// This is the only S3-related cap that lives on Config —
-	// it is per-Store (per-method goroutine pool size for
-	// FanOut), not per-client.
 	//
 	// Sane defaults: same as the s3.Client's
 	// MaxOpenConnections when running one method at a time;
@@ -120,6 +122,28 @@ type Config[T any] struct {
 	// Zero → 64 (the library default). Negative → Config.validate
 	// returns an error.
 	S3MaxConcurrentOpsPerMethod int
+
+	// WorkerPool is an optional shared I/O worker pool. When
+	// non-nil, every fan-out call site (Write multi-partition,
+	// Read fetch+decode, PollRecords body fetch) submits S3
+	// ops to this pool instead of spawning per-method
+	// goroutines bounded by S3MaxConcurrentOpsPerMethod.
+	//
+	// Sharing one pool across multiple Store instances (which
+	// also share an *s3.Client and thus its connection pool,
+	// adaptive retryer, and rate limiter) gives a single
+	// global concurrency budget for S3 work — useful for
+	// multi-Store-per-process deployments where per-method
+	// caps × Stores × concurrent jobs would otherwise
+	// over-allocate goroutines and pre-built request bodies.
+	//
+	// Sized at construction; not tunable after the fact. Pool
+	// is owned by the caller (the library does not Close it).
+	//
+	// Nil (the default) preserves today's per-method FanOut
+	// behavior. The deadlock-detection panic (see
+	// pool.Group.Submit doc) protects same-pool reentrancy.
+	WorkerPool *pool.Pool
 
 	// Schema layout
 	SchemaName  string // default "public"

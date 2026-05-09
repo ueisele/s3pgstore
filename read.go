@@ -223,7 +223,8 @@ func (s *Store[T]) Read(
 	// callers needing per-partition memory bounds should use
 	// ReadPartitionIter (Phase 12).
 	out := make([]PartitionResult[T], len(groups))
-	if err := fanOut(ctx, groups, s.target.effectiveConcurrency(), nil,
+	if err := fanOutOrPool(ctx, s.cfg.WorkerPool, groups,
+		s.target.effectiveConcurrency(), nil,
 		func(ctx context.Context, i int, g group) error {
 			records, err := s.fetchAndDecode(ctx, g.files)
 			if err != nil {
@@ -372,7 +373,8 @@ func (s *Store[T]) fetchAndDecode(
 	}
 	bodies := make([][]T, len(files))
 
-	if err := fanOut(ctx, files, s.target.effectiveConcurrency(), nil,
+	if err := fanOutOrPool(ctx, s.cfg.WorkerPool, files,
+		s.target.effectiveConcurrency(), nil,
 		func(ctx context.Context, i int, f fileRow) error {
 			data, err := s.target.get(ctx, f.s3Key)
 			if err != nil {

@@ -10,6 +10,7 @@
 //	S3PGSTORE_S3_BUCKET                          S3 bucket (required)
 //	S3PGSTORE_S3_PREFIX                          S3 prefix (default "")
 //	S3PGSTORE_S3_ENDPOINT                        Optional non-AWS endpoint
+//	S3PGSTORE_S3_USE_PATH_STYLE                  "1" / "true" → path-style URLs (https://endpoint/bucket/key); needed for local MinIO at localhost / IP-based endpoints; STACKIT, R2, StorageGRID with proper DNS use the SDK default (virtual-hosted-style)
 //	S3PGSTORE_S3_REGION                          AWS region (default "us-east-1")
 //	S3PGSTORE_S3_MAX_OPEN_CONNECTIONS            Cap concurrent TCP connections to S3 (default 64)
 //	S3PGSTORE_S3_MAX_RETRY_ATTEMPTS              SDK retry budget per S3 op, 1 + retries (default 5)
@@ -48,12 +49,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/ueisele/s3pgstore/cmd/internal/otelinit"
-	"github.com/ueisele/s3pgstore/internal/s3client"
+	"github.com/ueisele/s3pgstore/s3client"
 )
 
 func main() {
@@ -168,15 +171,42 @@ func loadS3Client(
 	if err != nil {
 		return nil, err
 	}
-	return s3client.BuildS3Client(ctx, s3client.Options{
-		Region:                    os.Getenv("S3PGSTORE_S3_REGION"),
-		Endpoint:                  os.Getenv("S3PGSTORE_S3_ENDPOINT"),
-		MaxOpenConnections:        maxOpen,
-		MaxRetryAttempts:          maxAttempts,
-		MaxRequestsPerSecond:      maxRPS,
-		MaxRequestsPerSecondBurst: maxBurst,
-		Meter:                     meter,
-	})
+	region := os.Getenv("S3PGSTORE_S3_REGION")
+	if region == "" {
+		region = "us-east-1"
+	}
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
+		awsconfig.WithRegion(region))
+	if err != nil {
+		return nil, fmt.Errorf("aws config: %w", err)
+	}
+	endpoint := os.Getenv("S3PGSTORE_S3_ENDPOINT")
+	usePathStyle := isTruthy(os.Getenv("S3PGSTORE_S3_USE_PATH_STYLE"))
+	return s3.NewFromConfig(awsCfg,
+		s3client.WithDefaults(s3client.Options{
+			MaxOpenConnections:        maxOpen,
+			MaxRetryAttempts:          maxAttempts,
+			MaxRequestsPerSecond:      maxRPS,
+			MaxRequestsPerSecondBurst: maxBurst,
+			Meter:                     meter,
+		}),
+		func(o *s3.Options) {
+			if endpoint != "" {
+				o.BaseEndpoint = aws.String(endpoint)
+			}
+			if usePathStyle {
+				o.UsePathStyle = true
+			}
+		},
+	), nil
+}
+
+func isTruthy(s string) bool {
+	switch s {
+	case "1", "t", "T", "true", "TRUE", "True", "yes", "YES":
+		return true
+	}
+	return false
 }
 
 // envIntNonNeg parses a non-negative int env var. Empty → 0.

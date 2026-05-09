@@ -3,10 +3,10 @@ package s3client
 // metrics.go owns the s3pgstore.s3.* OTel surface. Defines the
 // per-client s3metrics handle that the SDK middleware (in
 // metrics_s3op.go) and the connection-pool wraps (in
-// metrics_connpool.go) call into. Self-contained: BuildS3Client
-// and WrapS3Client construct one of these from opts.Meter; the
-// library and operator binaries don't see the type, just pass
-// a meter (or nothing — fall back to OTel's global provider).
+// metrics_connpool.go) call into. Self-contained: WithDefaults
+// constructs one of these from opts.Meter; the library and
+// operator binaries don't see the type, just pass a meter (or
+// nothing — fall back to OTel's global provider).
 
 import (
 	"context"
@@ -24,7 +24,7 @@ import (
 // under. Operators see s3pgstore.s3.* as the metric *names*;
 // the *scope* is a separate field used by some exporters for
 // grouping.
-const scopeName = "github.com/ueisele/s3pgstore/internal/s3client"
+const scopeName = "github.com/ueisele/s3pgstore/s3client"
 
 // Outcome / error.type label values. Kept as constants so a
 // dashboard regex never has to chase a typo.

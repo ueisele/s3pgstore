@@ -161,7 +161,7 @@ func (o withReadAheadBytesOpt) applyRead(opts *readOpts) {
 // partition comes back, per CLAUDE.md). For each partition,
 // files are fetched in parallel from S3 (capped by
 // Config.S3MaxConcurrentOpsPerMethod inside this Read call,
-// and globally by Config.S3MaxOpenConnections), decoded, and
+// and globally by s3client.Options.MaxOpenConnections), decoded, and
 // concatenated; dedup runs once per partition.
 //
 // Empty filters slice returns (nil, nil) — no partitions
@@ -358,8 +358,8 @@ func (s *Store[T]) selectFileRows(
 // files by s3_key in the SELECT; per-index result slots
 // preserve that order while parallelising the GETs.
 //
-// The global TCP-connection cap (Config.S3MaxOpenConnections)
-// is enforced one level down by the wrapped s3.Client's HTTP
+// The global TCP-connection cap (s3client.Options.MaxOpenConnections)
+// is enforced one level down by the s3.Client's HTTP
 // transport. fanOut's shared-cancel ctx propagates
 // first-error-wins through the SDK's adaptive-retry loop, so a
 // failing GET unwinds in-flight siblings instead of running

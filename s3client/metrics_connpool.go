@@ -12,7 +12,7 @@ import (
 // increments the open-conn gauge and the returned net.Conn
 // decrements on Close. Lets the s3pgstore.s3.tcp.connections
 // gauge surface the real "current open TCP sockets to S3"
-// number — the saturation signal S3MaxOpenConnections is
+// number — the saturation signal Options.MaxOpenConnections is
 // intended to bound. Drift (open > Close ever) means a Conn
 // leak; that's a feature, not a bug.
 type trackedDialer struct {

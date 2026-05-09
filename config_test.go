@@ -53,13 +53,6 @@ func TestConfigValidate_RequiresS3Client(t *testing.T) {
 	requireErrContains(t, cfg.validate(), "S3Client is required")
 }
 
-func TestConfigValidate_S3MaxOpenConnectionsRejectsNegative(t *testing.T) {
-	cfg := validConfig()
-	cfg.S3MaxOpenConnections = -1
-	requireErrContains(t, cfg.validate(),
-		"S3MaxOpenConnections -1 must be >= 0")
-}
-
 func TestConfigValidate_S3MaxConcurrentOpsPerMethodRejectsNegative(t *testing.T) {
 	cfg := validConfig()
 	cfg.S3MaxConcurrentOpsPerMethod = -1
@@ -67,30 +60,12 @@ func TestConfigValidate_S3MaxConcurrentOpsPerMethodRejectsNegative(t *testing.T)
 		"S3MaxConcurrentOpsPerMethod -1 must be >= 0")
 }
 
-func TestConfigValidate_S3KnobsZeroOK(t *testing.T) {
+func TestConfigValidate_S3MaxConcurrentOpsPerMethodZeroOK(t *testing.T) {
 	cfg := validConfig()
-	cfg.S3MaxOpenConnections = 0        // sentinel for "use default"
 	cfg.S3MaxConcurrentOpsPerMethod = 0 // sentinel for "use default"
-	cfg.S3MaxRetryAttempts = 0          // sentinel for "use default"
-	cfg.S3MaxRequestsPerSecond = 0      // sentinel for "no rate limit"
-	cfg.S3MaxRequestBurst = 0           // sentinel for "10% of rate"
 	if err := cfg.validate(); err != nil {
-		t.Fatalf("zeros should be accepted (library defaults), got %v", err)
+		t.Fatalf("zero should be accepted (library default), got %v", err)
 	}
-}
-
-func TestConfigValidate_S3MaxRequestsPerSecondRejectsNegative(t *testing.T) {
-	cfg := validConfig()
-	cfg.S3MaxRequestsPerSecond = -1
-	requireErrContains(t, cfg.validate(),
-		"S3MaxRequestsPerSecond -1 must be >= 0")
-}
-
-func TestConfigValidate_S3MaxRequestBurstRejectsNegative(t *testing.T) {
-	cfg := validConfig()
-	cfg.S3MaxRequestBurst = -1
-	requireErrContains(t, cfg.validate(),
-		"S3MaxRequestBurst -1 must be >= 0")
 }
 
 func TestConfigValidate_RequiresPartitionKeyParts(t *testing.T) {

@@ -10,7 +10,7 @@ import (
 )
 
 // Tests for the retry policy + transient classification + sem
-// behavior moved to internal/s3client/ alongside the middleware
+// behavior live in s3client/ alongside the middleware
 // implementation. What remains here is the small surface area
 // s3target still owns post-middleware refactor: ETag verification
 // on PUT and constructor validation.

@@ -99,6 +99,55 @@ docker compose up -d
 
 ### 2. Construct a Store and write records
 
+The `*s3.Client` you pass in must already carry the s3pgstore
+middleware (adaptive retry, rate limiting, metrics, connection
+pool tuning). Compose it via `s3client.WithDefaults` at
+construction time — this lets multiple Stores share one client
+(and therefore one rate limiter, one adaptive token bucket, one
+connection pool):
+
+```go
+import (
+    awsconfig "github.com/aws/aws-sdk-go-v2/config"
+    "github.com/aws/aws-sdk-go-v2/service/s3"
+    "github.com/ueisele/s3pgstore/s3client"
+)
+
+awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
+    awsconfig.WithRegion("us-east-1"))
+if err != nil { /* ... */ }
+
+s3Client := s3.NewFromConfig(awsCfg,
+    s3client.WithDefaults(s3client.Options{
+        MaxOpenConnections:   200,   // global TCP cap
+        MaxRetryAttempts:     5,     // SDK retry budget
+        MaxRequestsPerSecond: 250,   // optional rate limit
+        Meter:                meter, // OTel meter for s3pgstore.s3.*
+    }),
+)
+```
+
+For MinIO / StorageGRID / other S3-compatible backends, append
+another `func(*s3.Options)` after `WithDefaults` to set the
+endpoint:
+
+```go
+s3Client := s3.NewFromConfig(awsCfg,
+    s3client.WithDefaults(s3client.Options{ /* ... */ }),
+    func(o *s3.Options) {
+        o.BaseEndpoint = aws.String("http://localhost:9000")
+        o.UsePathStyle = true // local MinIO at localhost — no DNS subdomain available
+    },
+)
+```
+
+`UsePathStyle = true` is needed only when the endpoint hostname
+can't carry a bucket subdomain — local MinIO at `localhost:9000`,
+IP-based endpoints, or backends that disable virtual-hosted-style.
+For production STACKIT, Cloudflare R2, StorageGRID, or any
+S3-compatible backend with proper DNS, drop it — the SDK default
+(virtual-hosted-style, `https://<bucket>.<endpoint>/key`) works.
+
 ```go
 type CostRecord struct {
     CustomerID   string    `parquet:"customer_id"`
@@ -414,10 +463,10 @@ shape, and orphan tracking. Highlights:
 | `s3pgstore.write.encode_buf_dropped` | counter | Incident — encoder dropped an oversized buffer; cap is undersized. |
 | `s3pgstore.write.token_race.retry.count` | counter | Incident — concurrent writers contending on the same idempotency token. |
 | `s3pgstore.s3.{request.count,request.duration,body_size}` | ctr+hist+hist | Library's view of S3 ops; one increment per logical op (one row per SDK call, including all adaptive-retry attempts). `request.count` carries an `attempts` label sourced from the SDK's AttemptResults metadata. Per-attempt error classification lives in `s3.attempt.error.count`, not here. |
-| `s3pgstore.s3.attempt.error.count{error_type, attempt, terminal}` | counter | Fires once per failed S3 attempt — retried (`terminal="false"`) OR terminal (`terminal="true"`). Single counter answers "rate of `<error_type>` events" without summing two metrics. `error_type="slowdown"` going non-zero in steady state means adaptive retry is throttling against your backend ceiling; lower `Config.S3MaxOpenConnections` to leave more headroom. |
-| `s3pgstore.s3.ratelimit.wait.duration` | histogram | Wallclock spent in the client-side rate limiter before the SDK ran the op. Measured outside `s3.request.duration`. Sub-ms when `S3MaxRequestsPerSecond` is unsaturated; rising p99 means the per-second cap is now the bottleneck. Only emits when `S3MaxRequestsPerSecond > 0`. |
+| `s3pgstore.s3.attempt.error.count{error_type, attempt, terminal}` | counter | Fires once per failed S3 attempt — retried (`terminal="false"`) OR terminal (`terminal="true"`). Single counter answers "rate of `<error_type>` events" without summing two metrics. `error_type="slowdown"` going non-zero in steady state means adaptive retry is throttling against your backend ceiling; lower `s3client.Options.MaxOpenConnections` to leave more headroom. |
+| `s3pgstore.s3.ratelimit.wait.duration` | histogram | Wallclock spent in the client-side rate limiter before the SDK ran the op. Measured outside `s3.request.duration`. Sub-ms when `s3client.Options.MaxRequestsPerSecond` is unsaturated; rising p99 means the per-second cap is now the bottleneck. Only emits when `MaxRequestsPerSecond > 0`. |
 | `s3pgstore.s3.adaptive_retry.wait.duration` | histogram | Wallclock the SDK's adaptive-mode token bucket held each attempt before letting it proceed. The only direct signal that the SDK's retrier is actively throttling — sub-µs in steady state, rising once SlowDown errors have shrunk the bucket. Pair with `s3.attempt.error.count{error_type="slowdown"}` to confirm cause. Always emits (no opt-in knob). |
-| `s3pgstore.s3.tcp.connections` | up-down counter | Current open TCP sockets to S3 (active + idle in pool). Saturation signal vs `S3MaxOpenConnections` — sitting at the cap during steady-state load means raise the cap. Drift upward without load = a Conn leak. Operator binaries only (the wraps live in `BuildS3Client`'s HTTP transport). |
+| `s3pgstore.s3.tcp.connections` | up-down counter | Current open TCP sockets to S3 (active + idle in pool). Saturation signal vs `s3client.Options.MaxOpenConnections` — sitting at the cap during steady-state load means raise the cap. Drift upward without load = a Conn leak. The dialer/transport tracking lives in `s3client.WithDefaults`'s HTTP transport, so any caller composing it gets these metrics. |
 | `s3pgstore.s3.connection.reuse.count{reused}` | counter | Per-request idle-pool outcome from `httptrace.GotConn`. Rate ratio (`reused="true"` / total) is the idle-pool hit rate — high (>0.95) under steady load = pool sized well; low = `MaxIdleConns` starving the pool, or workload bursts faster than `IdleConnTimeout`. |
 | `s3pgstore.fanout.{partitions,items}` | histograms | Per-call fan-out width — capacity planning. |
 | `s3pgstore.occ.version_conflict.count` | counter | Incident — OCC writes colliding. |
@@ -562,13 +611,16 @@ Sustained `acquired ≈ max` with non-zero growth in
 `acquire_duration_total_ms` indicates the pool is undersized for
 the offered concurrency — bump `pgxpool.Config.MaxConns`. The
 library's own write-path concurrency is bounded by
-`Config.S3MaxConcurrentOpsPerMethod` (FanOut goroutine pool) +
-`Config.S3MaxOpenConnections` (HTTP transport TCP cap, the
-global concurrency ceiling) +
-`Config.S3MaxRequestsPerSecond` (optional client-side token
-bucket — set when the backend has a known per-second ceiling
-that concurrency alone can't enforce, e.g. STACKIT 2500 RPS or
-AWS S3 per-prefix 5500 GET / 3500 PUT) plus the pool
+`Config.S3MaxConcurrentOpsPerMethod` (per-Store FanOut goroutine
+pool) +
+`s3client.Options.MaxOpenConnections` (HTTP transport TCP cap,
+the global concurrency ceiling — applied at `s3client.WithDefaults`
+construction time, shared across every Store sharing the
+`*s3.Client`) +
+`s3client.Options.MaxRequestsPerSecond` (optional client-side
+token bucket — set when the backend has a known per-second
+ceiling that concurrency alone can't enforce, e.g. STACKIT 2500
+RPS or AWS S3 per-prefix 5500 GET / 3500 PUT) plus the pool
 size; CLAUDE.md § Orphan tracking notes that each writer holds
 **at most one** pool connection at a time, so the pool needs to
 size for `peak concurrent writers + readers + sequencer

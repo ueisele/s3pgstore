@@ -2,12 +2,11 @@ package s3pgstore
 
 // target.go is the thin typed wrapper around an *s3.Client that
 // the read/write/stream paths call into for PUT/GET/DELETE. The
-// load-bearing behavior — semaphore concurrency cap, retry with
-// jittered backoff + SlowDown classification, per-op metrics
-// (request.duration/count, attempt.error.count, body_size)
-// — lives in the middleware stack on the *s3.Client
-// itself; see internal/s3client. This wrapper exists for two
-// things only:
+// load-bearing behavior — adaptive retry + rate limiting +
+// per-op metrics (request.duration/count, attempt.error.count,
+// body_size) — lives in the middleware stack the caller
+// installed on the *s3.Client via s3client.WithDefaults. This
+// wrapper exists for two things only:
 //
 //  1. ergonomic typed signatures (put/get/delete take primitive
 //     args, not s3.PutObjectInput-shaped structs);
@@ -33,15 +32,14 @@ import (
 
 // defaultS3MaxConcurrentOpsPerMethod is the FanOut goroutine
 // pool size when Config.S3MaxConcurrentOpsPerMethod is unset.
-// Mirrors internal/s3client.defaultMaxOpenConnections so a
-// caller who tunes neither knob still gets a self-consistent
-// configuration.
+// Mirrors s3client.defaultMaxOpenConnections so a caller who
+// tunes neither knob still gets a self-consistent configuration.
 const defaultS3MaxConcurrentOpsPerMethod = 64
 
-// s3target wraps an *s3.Client (typically one produced by
-// internal/s3client.WrapS3Client, carrying the adaptive-retry +
-// metrics middleware stack) with the typed Put/Get/Delete
-// shapes the library's read/write paths consume.
+// s3target wraps an *s3.Client (one composed via
+// s3client.WithDefaults so it carries the adaptive-retry +
+// rate-limit + metrics middleware stack) with the typed
+// Put/Get/Delete shapes the library's read/write paths consume.
 type s3target struct {
 	s3                          *s3.Client
 	bucket                      string
@@ -88,10 +86,10 @@ func newS3Target(cfg s3TargetConfig) (*s3target, error) {
 // the per-method cap allows.
 //
 // Note: this is the *per-method* cap, not the global one. The
-// global cap on TCP sockets to S3 is enforced by the wrapped
-// *s3.Client's HTTP transport (MaxConnsPerHost in
-// internal/s3client.buildHTTPClient sized to
-// Config.S3MaxOpenConnections).
+// global cap on TCP sockets to S3 is enforced by the *s3.Client's
+// HTTP transport (MaxConnsPerHost in s3client.buildHTTPClient,
+// sized to s3client.Options.MaxOpenConnections at
+// s3client.WithDefaults construction time).
 func (t *s3target) effectiveConcurrency() int {
 	return t.s3MaxConcurrentOpsPerMethod
 }

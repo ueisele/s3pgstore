@@ -34,8 +34,8 @@ const scopeName = "github.com/ueisele/s3pgstore"
 
 // Outcome label values for method-scope instrumentation. Kept
 // as constants so a dashboard regex never has to chase a typo.
-// (s3.* outcome / error.type constants live in
-// internal/s3client — the s3 surface is self-contained there.)
+// (s3.* outcome / error.type constants live in s3client — the
+// s3 surface is self-contained there.)
 const (
 	outcomeSuccess  = "success"
 	outcomeError    = "error"
@@ -43,9 +43,8 @@ const (
 )
 
 // Attribute keys for library-internal instrumentation
-// (method.*, write.*, fanout.*, lookup.*, iter.*). The
-// internal/s3client package owns its own attribute keys for
-// the s3.* surface.
+// (method.*, write.*, fanout.*, lookup.*, iter.*). The s3client
+// package owns its own attribute keys for the s3.* surface.
 const (
 	attrKeyMethod  = "method"
 	attrKeyOutcome = "outcome"
@@ -77,8 +76,8 @@ type metricsConfig struct {
 // metrics is the per-Store instrumentation handle. Unexported
 // because no external caller needs to hold one — store.go
 // constructs it via newMetrics. The s3.* metrics surface lives
-// entirely in internal/s3client; this struct does not own it.
-// All methods are safe for concurrent use; a nil receiver makes
+// entirely in s3client; this struct does not own it. All
+// methods are safe for concurrent use; a nil receiver makes
 // every scope/record call a no-op.
 type metrics struct {
 	// Public-method instrumentation (every Store[T] entry point
@@ -267,10 +266,10 @@ func newMetrics(cfg metricsConfig) (*metrics, error) {
 		return nil, err
 	}
 
-	// s3pgstore.s3.* instruments live in internal/s3client —
-	// constructed inside s3client.WrapS3Client / BuildS3Client
-	// from the caller's Meter. The library metrics struct
-	// deliberately owns nothing under the s3.* namespace.
+	// s3pgstore.s3.* instruments live in s3client — constructed
+	// inside s3client.WithDefaults from the caller's Meter. The
+	// library metrics struct deliberately owns nothing under the
+	// s3.* namespace.
 
 	if m.fanoutPartitions, err = mustHistInt(
 		"s3pgstore.fanout.partitions",

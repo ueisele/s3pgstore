@@ -43,7 +43,7 @@ type fanOutObserver func(ctx context.Context, items, workers int)
 // nested fan-out (e.g. write partitions × MV inserts per
 // partition) where the older one-goroutine-per-item shape could
 // spawn N×K goroutines that mostly parked waiting for an HTTP
-// transport socket (capped by Config.S3MaxOpenConnections).
+// transport socket (capped by s3client.Options.MaxOpenConnections).
 //
 // Error semantics: the first real (non-cancellation) error wins
 // and cancels the rest. context.Canceled errors from siblings

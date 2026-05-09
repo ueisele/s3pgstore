@@ -10,7 +10,6 @@ import (
 	"github.com/parquet-go/parquet-go/compress"
 
 	"github.com/ueisele/s3pgstore/internal/catalog"
-	"github.com/ueisele/s3pgstore/internal/s3client"
 )
 
 // Store is the typed entry point for writing and reading
@@ -137,28 +136,19 @@ func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
 		return nil, fmt.Errorf("register metrics: %w", err)
 	}
 
-	// Wrap the user's *s3.Client with our middleware stack
-	// (adaptive retry + metrics). The user's original client is
-	// not mutated — wrapping is by-value via the SDK's
-	// Options(). This is the client the read/write paths
-	// actually call PutObject/GetObject/DeleteObject on.
-	//
-	// The s3.* metrics surface lives entirely in
-	// internal/s3client — store doesn't carry it. WrapS3Client
-	// registers its instruments against the same OTel meter
-	// the library uses, so operators see s3pgstore.s3.*
-	// alongside s3pgstore.method.* etc. on one dashboard.
-	wrappedS3, err := s3client.WrapS3Client(r.S3Client, s3client.WrapOptions{
-		MaxRetryAttempts:          r.S3MaxRetryAttempts,
-		MaxRequestsPerSecond:      r.S3MaxRequestsPerSecond,
-		MaxRequestsPerSecondBurst: r.S3MaxRequestBurst,
-		Meter:                     cfg.Meter,
-	})
-	if err != nil {
-		return nil, err
-	}
+	// The caller's S3Client must already carry the s3pgstore
+	// middleware stack (adaptive retry + rate limit + metrics +
+	// connection pool tuning) — install it via
+	// s3client.WithDefaults at construction time. This shifts
+	// the four client-level tuning knobs (max-open-connections,
+	// retry budget, RPS, burst) to the s3.Client construction
+	// site so multiple Stores sharing one client also share
+	// one rate limiter, one adaptive token bucket, and one
+	// connection pool. The s3pgstore.s3.* metric surface is
+	// owned entirely by s3client and registers against the
+	// caller-supplied meter at WithDefaults time.
 	target, err := newS3Target(s3TargetConfig{
-		S3Client:                    wrappedS3,
+		S3Client:                    r.S3Client,
 		S3Bucket:                    r.S3Bucket,
 		S3MaxConcurrentOpsPerMethod: r.S3MaxConcurrentOpsPerMethod,
 	})

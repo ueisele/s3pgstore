@@ -49,6 +49,7 @@ version. Remove or re-upload them before re-running.
 | ------------------------ | ------------- | -------------------------------------------------------- |
 | `S3PGSTORE_S3_PREFIX`    | _(empty)_     | S3 prefix matching the writer's `Config.S3Prefix`.       |
 | `S3PGSTORE_S3_ENDPOINT`  | _(AWS)_       | Override for non-AWS S3 (e.g. `http://minio:9000`).      |
+| `S3PGSTORE_S3_USE_PATH_STYLE` | `false`  | Set to `1`/`true` for path-style URLs (`https://endpoint/bucket/key`). Required for local MinIO at `localhost` and other IP-/non-DNS endpoints. STACKIT, Cloudflare R2, and StorageGRID with proper DNS work over the SDK default (virtual-hosted-style); leave unset there. |
 | `S3PGSTORE_S3_REGION`    | `us-east-1`   | AWS region.                                              |
 | `S3PGSTORE_S3_MAX_OPEN_CONNECTIONS` | `64` | Caps concurrent TCP connections to S3 (drives the HTTP transport's connection pool). This is the global concurrency ceiling for the rebuild — higher values speed up multi-million-file runs at the cost of socket pressure on the bucket. For "effectively unlimited", set a large value like 1000. |
 | `S3PGSTORE_S3_MAX_RETRY_ATTEMPTS` | `5` | SDK retry budget per logical S3 op (1 initial + retries). Equal-jitter backoff windows 100ms..10s. |

@@ -127,8 +127,8 @@ func TestMetrics_RecordedInstruments(t *testing.T) {
 	if obs := m.fanOutObserverFor("Write"); obs != nil {
 		obs(ctx, 5, 2)
 	}
-	// (s3.* metrics live in internal/s3client now — covered by
-	// internal/s3client/metrics_test.go.)
+	// (s3.* metrics live in s3client now — covered by
+	// s3client/metrics_test.go.)
 
 	// Iter pipeline saturation/observer signals.
 	m.recordIterBodySlotWait(ctx, 5*time.Millisecond)
@@ -172,7 +172,7 @@ func TestMetrics_RecordedInstruments(t *testing.T) {
 }
 
 // (TestClassifyS3Error_APICodeBeforeStatus moved with the
-// classifier itself to internal/s3client/metrics_test.go.)
+// classifier itself to s3client/metrics_test.go.)
 
 func collectedMetricNames(rm metricdata.ResourceMetrics) []string {
 	var out []string

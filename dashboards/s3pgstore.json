@@ -180,7 +180,7 @@
     },
     {
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "description": "Wallclock spent in the client-side rate limiter (Config.S3MaxRequestsPerSecond) before the SDK ran the op. Measured *outside* s3.request.duration — so SDK-side latency stays clean and self-throttle saturation surfaces here. Sub-millisecond is normal when the configured rate has headroom; rising p99 means the per-second cap is now the bottleneck (raise it, or accept the cap and ensure callers throttle their fan-out). Empty when S3MaxRequestsPerSecond is unset.",
+      "description": "Wallclock spent in the client-side rate limiter (s3client.Options.MaxRequestsPerSecond) before the SDK ran the op. Measured *outside* s3.request.duration — so SDK-side latency stays clean and self-throttle saturation surfaces here. Sub-millisecond is normal when the configured rate has headroom; rising p99 means the per-second cap is now the bottleneck (raise it, or accept the cap and ensure callers throttle their fan-out). Empty when MaxRequestsPerSecond is unset.",
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "s"}, "overrides": []},
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 41},
       "id": 305,
@@ -210,7 +210,7 @@
     },
     {
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "description": "Current open TCP sockets to S3 (active + idle in pool). Up-down counter driven by the wrapped Dialer (+1 per dial) and wrapped Conn.Close (-1). Direct saturation signal vs Config.S3MaxOpenConnections — when this gauge sits at the cap during steady-state load, raise the cap (or accept it and ensure callers throttle their fan-out). Drift upward without proportional load = a Conn leak. Only emitted on operator binaries that use BuildS3Client (s3pgstore-{gc,rebuild}); library callers wrapping their own *s3.Client retain their own transport.",
+      "description": "Current open TCP sockets to S3 (active + idle in pool). Up-down counter driven by the wrapped Dialer (+1 per dial) and wrapped Conn.Close (-1). Direct saturation signal vs s3client.Options.MaxOpenConnections — when this gauge sits at the cap during steady-state load, raise the cap (or accept it and ensure callers throttle their fan-out). Drift upward without proportional load = a Conn leak. Emitted whenever the *s3.Client was constructed via s3client.WithDefaults (which installs the dialer/transport tracking); callers that override o.HTTPClient after WithDefaults lose this signal.",
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "short"}, "overrides": []},
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 49},
       "id": 306,

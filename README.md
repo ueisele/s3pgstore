@@ -291,7 +291,9 @@ S3PGSTORE_DATABASE_URL=postgres://s3pgstore:s3pgstore@localhost/s3pgstore?sslmod
 
 The sequencer assigns gap-free `feed_seq` to committed catalog
 rows. Wakes on NOTIFY (the writer emits one inside the catalog
-tx) or on `S3PGSTORE_POLL_INTERVAL` ticks (default 1s).
+tx) or on `S3PGSTORE_POLL_INTERVAL` ticks (default 1s). Full
+configuration and operational notes:
+[`cmd/s3pgstore-sequencer/README.md`](cmd/s3pgstore-sequencer/README.md).
 
 ### 5. Run garbage collection (recommended, for orphan reclaim)
 
@@ -305,7 +307,54 @@ S3PGSTORE_S3_ENDPOINT=http://localhost:9000 \
 Reclaims S3 objects whose write transactions rolled back.
 `S3PGSTORE_GRACE` controls the minimum age before reclaim
 (default 24h); `S3PGSTORE_ONESHOT=1` runs once and exits
-(useful for cron-style scheduling).
+(useful for cron-style scheduling). Full configuration and
+operational notes:
+[`cmd/s3pgstore-gc/README.md`](cmd/s3pgstore-gc/README.md).
+
+## Container images
+
+The three operator binaries ship as multi-stage, multi-arch
+distroless images. Dockerfiles live next to each binary; a
+per-cmd README documents configuration, env vars, and
+`docker run` examples.
+
+| Binary                | Image                                    | Purpose                                                       | README                                                              |
+| --------------------- | ---------------------------------------- | ------------------------------------------------------------- | ------------------------------------------------------------------- |
+| `s3pgstore-sequencer` | `ueisele/s3pgstore-sequencer:<tag>`      | Assigns gap-free `feed_seq` to committed rows.                | [`cmd/s3pgstore-sequencer/`](cmd/s3pgstore-sequencer/README.md)     |
+| `s3pgstore-gc`        | `ueisele/s3pgstore-gc:<tag>`             | Reclaims S3 orphans from rolled-back writes.                  | [`cmd/s3pgstore-gc/`](cmd/s3pgstore-gc/README.md)                   |
+| `s3pgstore-rebuild`   | `ueisele/s3pgstore-rebuild:<tag>`        | Reconstructs the catalog from S3 alone (disaster recovery).   | [`cmd/s3pgstore-rebuild/`](cmd/s3pgstore-rebuild/README.md)         |
+
+Build a single-arch image locally (e.g. for testing):
+
+```sh
+docker buildx build \
+  -f cmd/s3pgstore-sequencer/Dockerfile \
+  -t ueisele/s3pgstore-sequencer:dev \
+  --load .
+```
+
+Build and publish a multi-arch (amd64 + arm64) manifest to
+Docker Hub — replace the `--push` recipe with your release
+pipeline of choice:
+
+```sh
+docker login
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -f cmd/s3pgstore-sequencer/Dockerfile \
+  -t ueisele/s3pgstore-sequencer:latest \
+  -t ueisele/s3pgstore-sequencer:$(git describe --tags --always) \
+  --push .
+```
+
+Repeat for `s3pgstore-gc` and `s3pgstore-rebuild`.
+
+Telemetry on every binary is opt-in via the standard OTel
+environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`,
+`OTEL_METRICS_EXPORTER`, etc.). With none set, the binaries
+emit no metrics. See
+[`cmd/internal/otelinit/`](cmd/internal/otelinit/otelinit.go)
+for the full env-var contract.
 
 ## Concurrency strategies
 
@@ -366,7 +415,7 @@ shape, and orphan tracking. Highlights:
 | `s3pgstore.write.token_race.retry.count` | counter | Incident — concurrent writers contending on the same idempotency token. |
 | `s3pgstore.s3.{request.count,request.duration,body_size}` | ctr+hist+hist | Library's view of S3 ops; one increment per logical op (acquire + retry + release). |
 | `s3pgstore.s3.transient_error.count` | counter | Fires *once per failed attempt* (every retry, even masked ones). Pair with `s3.request.count` for the percentage-error panel. Labels include `error.type` ∈ {slowdown, server, client, transport, ...}. |
-| `s3pgstore.target.{sem_wait_duration,sem_inflight,sem_waiting}` | hist+gauge+gauge | `MaxInflightRequests` saturation; `waiting > 0` sustained = bump the cap. |
+| `s3pgstore.target.{sem_wait_duration,sem_inflight,sem_waiting}` | hist+gauge+gauge | `Config.MaxInflightS3Requests` saturation (default 32); `waiting > 0` sustained = bump the cap (and size the `*s3.Client`'s `*http.Client` pool to match). |
 | `s3pgstore.fanout.{partitions,items}` | histograms | Per-call fan-out width — capacity planning. |
 | `s3pgstore.occ.version_conflict.count` | counter | Incident — OCC writes colliding. |
 | `s3pgstore.lookup_by_token.count{result}` | counter | Idempotency hit-rate. |

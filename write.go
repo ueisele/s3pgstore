@@ -108,13 +108,12 @@ func (s *Store[T]) Write(
 	}
 	sort.Strings(keys)
 
-	// Multi-partition fan-out: one worker per partition, slot-
-	// indexed results preserve lex order regardless of completion
-	// order. Concurrency caps at the s3target's effective
-	// concurrency — extra partition workers would just queue on
-	// the inner S3 semaphore.
+	// Multi-partition fan-out: one task per partition through the
+	// shared Config.WorkerPool, slot-indexed results preserve lex
+	// order regardless of completion order. Concurrency caps at
+	// the pool's MaxConcurrent slot count.
 	//
-	// Partial-failure semantics: on first error fanOut cancels
+	// Partial-failure semantics: on first error fanOutPool cancels
 	// in-flight siblings, but partitions whose catalog tx already
 	// committed before cancel reaches them stay committed. The
 	// returned slice has length len(keys); failed partitions
@@ -124,8 +123,7 @@ func (s *Store[T]) Write(
 	// canonical row regardless of which partitions committed
 	// first.
 	out = make([]WriteResult, len(keys))
-	if err := fanOutOrPool(ctx, s.cfg.WorkerPool, keys,
-		s.target.effectiveConcurrency(),
+	if err := fanOutPool(ctx, s.resolved.WorkerPool, keys,
 		s.metrics.fanOutObserverFor("Write"),
 		func(ctx context.Context, i int, key string) error {
 			res, err := s.writePartition(ctx, key,

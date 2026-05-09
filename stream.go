@@ -185,8 +185,7 @@ func (s *Store[T]) PollRecords(
 	}
 
 	bodies := make([][]T, len(entries))
-	if err := fanOutOrPool(ctx, s.cfg.WorkerPool, entries,
-		s.target.effectiveConcurrency(),
+	if err := fanOutPool(ctx, s.resolved.WorkerPool, entries,
 		s.metrics.fanOutObserverFor("PollRecords"),
 		func(ctx context.Context, i int, e StreamEntry) error {
 			data, err := s.target.get(ctx, e.DataPath)

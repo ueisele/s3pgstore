@@ -10,6 +10,7 @@ import (
 	"github.com/parquet-go/parquet-go/compress"
 
 	"github.com/ueisele/s3pgstore/internal/catalog"
+	"github.com/ueisele/s3pgstore/pool"
 )
 
 // Store is the typed entry point for writing and reading
@@ -155,6 +156,21 @@ func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	// WorkerPool default. Every fan-out call site routes through
+	// this pool — there is no per-method goroutine fallback. When
+	// the caller doesn't supply one, we install a private pool
+	// sized to defaultS3MaxConcurrentOpsPerMethod so a single
+	// Store's behavior matches the pre-pool defaults; multi-Store
+	// deployments share one pool across Stores by passing the
+	// same instance via Config.WorkerPool.
+	if r.WorkerPool == nil {
+		p, err := pool.New(defaultS3MaxConcurrentOpsPerMethod, cfg.Meter)
+		if err != nil {
+			return nil, fmt.Errorf("default WorkerPool: %w", err)
+		}
+		r.WorkerPool = p
 	}
 
 	return &Store[T]{

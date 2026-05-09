@@ -575,7 +575,7 @@ func (m *metrics) fanOutObserverFor(method string) fanOutObserver {
 	if m == nil {
 		return nil
 	}
-	return func(ctx context.Context, items, _ int) {
+	return func(ctx context.Context, items int) {
 		attrs := metric.WithAttributes(
 			attribute.String(attrKeyMethod, method))
 		m.fanoutItems.Record(ctx, int64(items), attrs)

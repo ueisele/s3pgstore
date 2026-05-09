@@ -104,34 +104,30 @@ type Config[T any] struct {
 	S3Prefix string
 	S3Client *s3.Client
 
-	// S3MaxConcurrentOpsPerMethod sizes the per-method
-	// goroutine pool used inside a single Read / Write /
-	// ReadIter / Poll call when WorkerPool is nil. Ignored
-	// when WorkerPool is non-nil — the pool's concurrency
-	// budget supersedes this knob.
+	// S3MaxConcurrentOpsPerMethod is the per-call body-slot
+	// ceiling for the iter pipeline's compressed-body footprint.
+	// downloadAndDecodeIter holds at most this many in-memory
+	// parquet bodies per call (floored at the largest
+	// partition's file count so an oversized partition still
+	// fits — otherwise the decoder would deadlock).
 	//
-	// Higher values speed up large fan-outs (Write with many
-	// partition keys, Read across many files); too high wastes
-	// goroutines that just block waiting on TCP sockets capped
-	// by the s3.Client's connection pool.
-	//
-	// Sane defaults: same as the s3.Client's
-	// MaxOpenConnections when running one method at a time;
-	// lower (e.g. /N) when expecting N concurrent methods.
+	// This is a *memory* bound, not a concurrency bound — the
+	// shared WorkerPool's MaxConcurrent caps in-flight S3 ops
+	// globally; this caps body memory locally. Lower it when
+	// per-call bodies are large; raise it when partitions tend
+	// to have many small files and the decoder would benefit
+	// from deeper download lookahead.
 	//
 	// Zero → 64 (the library default). Negative → Config.validate
 	// returns an error.
 	S3MaxConcurrentOpsPerMethod int
 
-	// WorkerPool is an optional shared I/O worker pool. When
-	// non-nil, every fan-out call site (Write multi-partition,
-	// Read fetch+decode, PollRecords body fetch) submits S3
-	// ops to this pool instead of spawning per-method
-	// goroutines bounded by S3MaxConcurrentOpsPerMethod.
-	//
-	// Sharing one pool across multiple Store instances (which
-	// also share an *s3.Client and thus its connection pool,
-	// adaptive retryer, and rate limiter) gives a single
+	// WorkerPool is the shared I/O worker pool every fan-out
+	// call site (Write multi-partition, Read fetch+decode,
+	// PollRecords body fetch, ReadIter download) submits S3
+	// ops to. Sharing one pool across multiple Store instances
+	// (which also share an *s3.Client and thus its connection
+	// pool, adaptive retryer, and rate limiter) gives a single
 	// global concurrency budget for S3 work — useful for
 	// multi-Store-per-process deployments where per-method
 	// caps × Stores × concurrent jobs would otherwise
@@ -140,8 +136,9 @@ type Config[T any] struct {
 	// Sized at construction; not tunable after the fact. Pool
 	// is owned by the caller (the library does not Close it).
 	//
-	// Nil (the default) preserves today's per-method FanOut
-	// behavior. The deadlock-detection panic (see
+	// Nil (the default) installs a private pool sized to 64
+	// slots so a single Store's behavior matches the pre-pool
+	// defaults. The deadlock-detection panic (see
 	// pool.Group.Submit doc) protects same-pool reentrancy.
 	WorkerPool *pool.Pool
 

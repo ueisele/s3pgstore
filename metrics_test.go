@@ -125,7 +125,7 @@ func TestMetrics_RecordedInstruments(t *testing.T) {
 	m.recordLookupByToken(ctx, true)
 	m.recordLookupByToken(ctx, false)
 	if obs := m.fanOutObserverFor("Write"); obs != nil {
-		obs(ctx, 5, 2)
+		obs(ctx, 5)
 	}
 	// (s3.* metrics live in s3client now — covered by
 	// s3client/metrics_test.go.)

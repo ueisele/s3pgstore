@@ -59,6 +59,8 @@ import (
 	"time"
 
 	"github.com/parquet-go/parquet-go"
+
+	"github.com/ueisele/s3pgstore/pool"
 )
 
 // ReadIter returns an iter.Seq2[T, error] that yields every
@@ -307,24 +309,23 @@ func (s *Store[T]) partitionEmit(
 //
 // Three concurrent stages plus the caller's emit loop:
 //
-//  1. Producer goroutine: walks partitions in lex order and
-//     pushes (partIdx, fileIdx) jobs into a download queue.
+//  1. Submitter goroutine: walks partitions in lex order,
+//     acquires one body-pool slot per file (submitter-side
+//     back-pressure — see CLAUDE.md "Shared-pool workers must
+//     never block on per-call coordination"), then submits one
+//     download task per file to the Store's shared *pool.Pool.
+//     Cross-partition lookahead happens here — pool tasks are
+//     not partition-bound, so partition P+1's downloads can run
+//     in parallel with partition P being yielded.
 //
-//  2. Downloader workers (target.effectiveConcurrency()
-//     goroutines): pull jobs, fetch parquet bodies, deposit
-//     into per-partition slots. Cross-partition lookahead
-//     happens here — workers are not partition-bound, so
-//     partition P+1's downloads can run in parallel with
-//     partition P being yielded.
-//
-//  3. Decoder goroutine: walks partitions in order; for each,
+//  2. Decoder goroutine: walks partitions in order; for each,
 //     waits until all its files are downloaded, parses each
 //     parquet footer to compute the partition's exact
 //     uncompressed total, gates on (ReadAheadPartitions,
 //     ReadAheadBytes), decodes records, sort+dedup's them
 //     in-place, and pushes a decodedBatch to the emitter.
 //
-//  4. Emit loop (this goroutine): pulls decoded partitions in
+//  3. Emit loop (this goroutine): pulls decoded partitions in
 //     order, hands each to emitOne (record-by-record yield or
 //     PartitionResult yield), and frees the partition's
 //     reserved bytes on completion so the decoder can proceed.
@@ -333,6 +334,15 @@ func (s *Store[T]) partitionEmit(
 // and the emit callback receives a non-nil err — it should
 // yield the error to the consumer, set iterErr, and return
 // false. On success, emit returns true to keep going.
+//
+// Pool-worker shape: the submitted task does only the S3 GET
+// and a markComplete / state.releaseBodySlots / recordHardErr
+// update. It never blocks on per-call coordination — body-slot
+// acquire is on the submitter, decoder back-pressure is in the
+// (non-pool) decoder goroutine. This satisfies the shared-pool
+// rule that pool tasks must always make progress, so a slow
+// consumer of one ReadIter cannot starve unrelated Stores
+// sharing the pool.
 func (s *Store[T]) downloadAndDecodeIter(
 	ctx context.Context, method string, rows []fileRow,
 	opts *readOpts, emitOne func(decodedBatch[T]) bool,
@@ -346,17 +356,20 @@ func (s *Store[T]) downloadAndDecodeIter(
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
-	concurrency := s.target.effectiveConcurrency()
 
-	// bodyCap bounds the in-memory compressed-body footprint:
-	// downloaders block before fetching the next file once cap
-	// slots are held; the decoder releases slots as it nils each
-	// body. Floor at the largest partition's file count so a
-	// single oversized partition still fits in the pool —
-	// otherwise its last few files would block on the cap and
-	// the decoder would block on those files, producing a
-	// deadlock.
-	bodyCap := concurrency
+	// bodyCap bounds the per-call in-memory compressed-body
+	// footprint: the submitter blocks on acquireBodySlot once
+	// cap slots are held; the decoder releases slots as it nils
+	// each body. The default ceiling is the per-method cap
+	// (target.effectiveConcurrency) so per-call body memory
+	// stays predictable regardless of pool size — the shared
+	// pool's MaxConcurrent caps in-flight S3 ops globally; this
+	// caps body memory locally. Floor at the largest partition's
+	// file count so a single oversized partition still fits in
+	// the pool — otherwise its last few files would block on
+	// the cap and the decoder would block on those files,
+	// producing a deadlock.
+	bodyCap := s.target.effectiveConcurrency()
 	for _, p := range parts {
 		if n := len(p.files); n > bodyCap {
 			bodyCap = n
@@ -380,27 +393,53 @@ func (s *Store[T]) downloadAndDecodeIter(
 		wg.Wait()
 	}()
 
-	// Stage 1+2: producer feeds jobs; workers download into
-	// slots.
-	jobsCh := make(chan downloadJob, concurrency)
+	// Stage 1: submitter. Acquires body slots and submits per-file
+	// download tasks to the shared pool. Calls g.Wait() before
+	// exiting so all in-flight pool tasks drain before
+	// downloadAndDecodeIter returns.
+	//
+	// On any pool task error, the pool's errgroup cancels gctx.
+	// The submitter sees that on its next acquireBodySlot and
+	// exits early; in-flight tasks observe gctx.Done in
+	// s.target.get and bail. Files past the submitter's exit
+	// point — including the rest of the current partition and
+	// every later partition — are deliberately NOT
+	// markComplete'd. Their partitions' done channels would
+	// block waitForPartition forever, except we cancel the
+	// outer ctx below so waitForPartition's ctx.Done branch
+	// fires and the decoder forwards the hardErr that the
+	// failing pool task recorded. Old design called the outer
+	// cancel from inside the downloader on each hard err; the
+	// new design routes the same signal via g.Wait()'s return
+	// value (errgroup gives us the first task error; we just
+	// translate it into an outer-ctx cancel).
+	//
+	// recordHardErr on g.Wait err covers the case where
+	// every task succeeded but the parent ctx was cancelled
+	// (Group.Wait returns parentCtx.Err() in that case): no
+	// task recorded a hardErr, the submitter's cancel-detected
+	// path may not have fired (if all submissions were
+	// already in flight), so without this the decoder might
+	// see an outer-ctx-cancel with hardErr nil and exit
+	// silently. With this, the consumer always sees a
+	// context.Canceled (or the wrapped task error) when the
+	// pipeline exits abnormally.
+	g, gctx := s.resolved.WorkerPool.WithContext(ctx)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runProducer(ctx, jobsCh, parts)
+		s.runDownloadSubmitter(gctx, g, state)
+		if err := g.Wait(); err != nil {
+			state.recordHardErr(err)
+			cancel()
+		}
 	}()
-	for range concurrency {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s.runDownloader(ctx, jobsCh, state, cancel)
-		}()
-	}
 	// No cancel-broadcast helper goroutine: every blocking
 	// primitive in streamState (slotCh acquire, partState.done
 	// wait, byteWake bell) selects on ctx.Done() natively. See
 	// CLAUDE.md "Concurrency invariants".
 
-	// Stage 3: decoder. Channel cap = readAheadPartitions so the
+	// Stage 2: decoder. Channel cap = readAheadPartitions so the
 	// pipeline buffers up to N decoded partitions ahead. The
 	// pointer-typed option distinguishes "not supplied" (nil →
 	// default 1, the minimum useful pipeline shape — decode of
@@ -429,7 +468,7 @@ func (s *Store[T]) downloadAndDecodeIter(
 			stallTickInterval, stallThreshold)
 	}()
 
-	// Stage 4: emit loop. Drains decodedCh, hands each batch to
+	// Stage 3: emit loop. Drains decodedCh, hands each batch to
 	// the per-method emit callback (record-by-record yield or
 	// PartitionResult yield), signals on each completed
 	// partition so the decoder can release the byte-budget
@@ -525,13 +564,6 @@ func (s *Store[T]) preparePartitions(
 		parts = append(parts, ps)
 	}
 	return parts
-}
-
-// downloadJob is one (partition, file) tuple flowing through
-// the producer → downloader queue.
-type downloadJob struct {
-	partIdx int
-	fileIdx int
 }
 
 // partState holds per-partition download progress. partitionKey,
@@ -861,65 +893,83 @@ func (s *streamState) releaseBytes(uncomp int64) {
 	}
 }
 
-// runProducer walks partitions in order and pushes one download
-// job per file. Closes jobsCh when done so workers can exit.
-func runProducer(
-	ctx context.Context, jobsCh chan<- downloadJob,
-	parts []*partState,
-) {
-	defer close(jobsCh)
-	for pi, p := range parts {
-		for fi := range p.files {
-			select {
-			case jobsCh <- downloadJob{partIdx: pi, fileIdx: fi}:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}
-}
-
-// runDownloader is one worker in the download pool. Each job
-// acquires one body-pool slot (back-pressuring the producer
-// when the pool is full), fetches the parquet body via
-// s.target.get, and stores it in the per-partition slot. The
-// slot stays held until the decoder nils the body. Hard errors
-// release the slot immediately since no body is materialised.
+// runDownloadSubmitter walks partitions in order and submits
+// one download task per file to the shared pool. The body-slot
+// acquire happens here on the submitter side rather than inside
+// the pool task — pool workers must never block on per-call
+// coordination (CLAUDE.md "Shared-pool workers must never block
+// on per-call coordination"), or N waiting workers could starve
+// every other Group sharing the pool, including unrelated
+// Stores.
+//
+// Concurrency model:
+//
+//   - Submitter is one goroutine; acquireBodySlot blocks here
+//     when the per-call slot pool is full, so the submitter
+//     itself paces the pipeline.
+//   - g.Submit blocks when the shared pool has no free slot.
+//     Both back-pressure points run on the submitter, never
+//     on the pool worker.
+//   - In flight: at most min(bodyCap, pool.MaxConcurrent) S3
+//     GETs at any time across this call's submitted tasks.
 //
 // All errors are strict: a NoSuchKey from S3 is treated as a
 // hard error (the catalog points at it; missing means
-// operator-driven prune or a torn write — incident-class).
-// First-error-wins via state.recordHardErr; the worker then
-// calls cancel() to stop the rest of the pipeline.
-func (s *Store[T]) runDownloader(
-	ctx context.Context, jobsCh <-chan downloadJob,
-	state *streamState, cancel context.CancelFunc,
+// operator-driven prune or a torn write — incident-class). The
+// task records hardErr and returns the wrapped error so the
+// pool's errgroup cancels gctx — sibling tasks observe ctx.Done
+// in s.target.get and bail.
+//
+// Body-slot leak on submit-skip is harmless. If gctx is
+// cancelled between our acquireBodySlot and pool.Group.Submit's
+// internal Acquire, the task fn never runs and the body slot
+// stays held — but slotCh is per-call state torn down by
+// downloadAndDecodeIter's deferred wg.Wait, and waitForPartition
+// for files we never markComplete'd observes ctx.Done and
+// returns false. No deadlock, no observable leak.
+func (s *Store[T]) runDownloadSubmitter(
+	ctx context.Context, g *pool.Group, state *streamState,
 ) {
-	for job := range jobsCh {
-		if !state.acquireBodySlot(ctx) {
-			// Cascade ctx.Err() — not a hard error, just
-			// shutdown. markComplete with nil body keeps the
-			// partition's completed counter advancing so
-			// waitForPartition can observe full completion (and
-			// the decoder, in turn, can consult firstHardErr
-			// for the real cause).
-			state.markComplete(job.partIdx, job.fileIdx, nil)
-			continue
+	for pi := range state.parts {
+		for fi := range state.parts[pi].files {
+			if !state.acquireBodySlot(ctx) {
+				// Set hardErr BEFORE markComplete so the
+				// decoder, on observing this partition's done
+				// channel close, sees the cancel signal and
+				// bails before decoding a partition that may
+				// have a mix of present and nil bodies (would
+				// otherwise silently emit a partial
+				// PartitionResult). Both calls go through the
+				// same mu in streamState; close(p.done) happens
+				// after the markComplete unlock, so a decoder
+				// that observes p.done closed and then
+				// mu.Locks for hardErr is guaranteed to see
+				// the value we wrote here.
+				//
+				// recordHardErr is no-op if hardErr is already
+				// set — preserving "first task error wins"
+				// when an in-flight task errored before us.
+				state.recordHardErr(ctx.Err())
+				state.markComplete(pi, fi, nil)
+				return
+			}
+			key := state.parts[pi].files[fi].s3Key
+			g.Submit(ctx, func(ctx context.Context) error {
+				body, err := s.target.get(ctx, key)
+				if err != nil {
+					// No body materialised — return the slot.
+					state.releaseBodySlots(1)
+					wrapped := fmt.Errorf("get %s: %w", key, err)
+					state.recordHardErr(wrapped)
+					state.markComplete(pi, fi, nil)
+					return wrapped
+				}
+				// Slot stays held; decoder releases it when
+				// bodies are nil'd in decodePartition.
+				state.markComplete(pi, fi, body)
+				return nil
+			})
 		}
-		key := state.parts[job.partIdx].files[job.fileIdx].s3Key
-		body, err := s.target.get(ctx, key)
-		if err != nil {
-			// No body materialised — return the slot.
-			state.releaseBodySlots(1)
-			wrapped := fmt.Errorf("get %s: %w", key, err)
-			state.recordHardErr(wrapped)
-			state.markComplete(job.partIdx, job.fileIdx, nil)
-			cancel()
-			continue
-		}
-		// Slot stays held; decoder releases it when bodies are
-		// nil'd in decodePartition.
-		state.markComplete(job.partIdx, job.fileIdx, body)
 	}
 }
 

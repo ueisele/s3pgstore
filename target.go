@@ -32,10 +32,12 @@ import (
 	"github.com/ueisele/s3pgstore/s3client"
 )
 
-// defaultS3MaxConcurrentOpsPerMethod is the FanOut goroutine
-// pool size when Config.S3MaxConcurrentOpsPerMethod is unset.
-// Mirrors s3client.defaultMaxOpenConnections so a caller who
-// tunes neither knob still gets a self-consistent configuration.
+// defaultS3MaxConcurrentOpsPerMethod is the per-call body-slot
+// ceiling for the iter pipeline, AND the slot count of the
+// auto-installed Config.WorkerPool when the caller doesn't
+// supply one. Mirrors s3client.defaultMaxOpenConnections so a
+// caller who tunes neither knob still gets a self-consistent
+// configuration.
 const defaultS3MaxConcurrentOpsPerMethod = 64
 
 // s3target wraps an *s3.Client (one composed via
@@ -46,16 +48,16 @@ type s3target struct {
 	s3                          *s3.Client
 	bucket                      string
 	prefix                      string // for s3client.WithStoreLabels emission
-	s3MaxConcurrentOpsPerMethod int    // resolved per-method FanOut pool size
+	s3MaxConcurrentOpsPerMethod int    // resolved iter body-slot ceiling
 }
 
 // s3TargetConfig captures the small set of inputs s3target
 // needs after the middleware refactor — the wrapped *s3.Client,
 // the bucket, the prefix (used as a metric label so multiple
 // Stores sharing one *s3.Client surface as separate streams on
-// the dashboard), and the per-method FanOut pool size that
-// callers in read.go / write.go / read_iter.go / stream.go use
-// to size their goroutine pools.
+// the dashboard), and the iter pipeline's per-call body-slot
+// ceiling (read_iter.go's downloadAndDecodeIter is the only
+// in-tree caller of effectiveConcurrency).
 type s3TargetConfig struct {
 	S3Client                    *s3.Client
 	S3Bucket                    string
@@ -96,16 +98,17 @@ func (t *s3target) withLabels(ctx context.Context) context.Context {
 }
 
 // effectiveConcurrency returns the resolved
-// S3MaxConcurrentOpsPerMethod cap. Callers in read.go /
-// read_iter.go / stream.go / write.go use this to size their
-// FanOut goroutine pool — no point spawning more workers than
-// the per-method cap allows.
+// S3MaxConcurrentOpsPerMethod cap. Used by read_iter.go's
+// downloadAndDecodeIter to size its per-call body-slot pool —
+// the iter pipeline's compressed-body memory ceiling, NOT a
+// concurrency cap. The shared Config.WorkerPool caps in-flight
+// S3 ops globally; this caps body memory locally.
 //
-// Note: this is the *per-method* cap, not the global one. The
-// global cap on TCP sockets to S3 is enforced by the *s3.Client's
-// HTTP transport (MaxConnsPerHost in s3client.buildHTTPClient,
-// sized to s3client.Options.MaxOpenConnections at
-// s3client.WithDefaults construction time).
+// Note: the global cap on TCP sockets to S3 is enforced by the
+// *s3.Client's HTTP transport (MaxConnsPerHost in
+// s3client.buildHTTPClient, sized to
+// s3client.Options.MaxOpenConnections at s3client.WithDefaults
+// construction time).
 func (t *s3target) effectiveConcurrency() int {
 	return t.s3MaxConcurrentOpsPerMethod
 }

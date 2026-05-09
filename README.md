@@ -548,7 +548,7 @@ shape, and orphan tracking. Highlights:
 | `s3pgstore.s3.tcp.connections` | up-down counter | Current open TCP sockets to S3 (active + idle in pool). Saturation signal vs `s3client.Options.MaxOpenConnections` — sitting at the cap during steady-state load means raise the cap. Drift upward without load = a Conn leak. The dialer/transport tracking lives in `s3client.WithDefaults`'s HTTP transport, so any caller composing it gets these metrics. **No per-Store labels** — the connection pool is shared. |
 | `s3pgstore.s3.connection.reuse.count{reused}` | counter | Per-request idle-pool outcome from `httptrace.GotConn`. Rate ratio (`reused="true"` / total) is the idle-pool hit rate — high (>0.95) under steady load = pool sized well; low = `MaxIdleConns` starving the pool, or workload bursts faster than `IdleConnTimeout`. **No per-Store labels** — the pool is shared. |
 | `s3pgstore.fanout.{partitions,items}` | histograms | Per-call fan-out width — capacity planning. |
-| `s3pgstore.pool.{in_flight,queue.wait.duration}` | gauge+histogram | Shared `Config.WorkerPool` saturation: in-flight tasks (approaches `MaxConcurrent` under load) + time submitters waited for a slot. **No per-Store labels** — the pool is shared by construction. Both emit only when `Config.WorkerPool` is set. |
+| `s3pgstore.pool.{in_flight,queue.wait.duration}` | gauge+histogram | Shared `Config.WorkerPool` saturation: in-flight tasks (approaches `MaxConcurrent` under load) + time submitters waited for a slot. **No per-Store labels** — the pool is shared by construction. Always emitted (the library installs a private 64-slot pool when `Config.WorkerPool` is nil). |
 | `s3pgstore.occ.version_conflict.count` | counter | Incident — OCC writes colliding. |
 | `s3pgstore.lookup_by_token.count{result}` | counter | Idempotency hit-rate. |
 | `s3pgstore.poll.lag` | observable gauge | End-to-end stream lag (`now - latest feed_seq_at`). |
@@ -691,9 +691,9 @@ func registerPoolMetrics(meter metric.Meter, pool *pgxpool.Pool) error {
 Sustained `acquired ≈ max` with non-zero growth in
 `acquire_duration_total_ms` indicates the pool is undersized for
 the offered concurrency — bump `pgxpool.Config.MaxConns`. The
-library's own write-path concurrency is bounded by
-`Config.S3MaxConcurrentOpsPerMethod` (per-Store FanOut goroutine
-pool, ignored when `Config.WorkerPool` is set — see below) +
+library's own write-path concurrency is bounded by the shared
+`Config.WorkerPool` (defaulted to 64 slots when nil; see
+"Shared I/O worker pool" below) +
 `s3client.Options.MaxOpenConnections` (HTTP transport TCP cap,
 the global concurrency ceiling — applied at `s3client.WithDefaults`
 construction time, shared across every Store sharing the
@@ -701,25 +701,26 @@ construction time, shared across every Store sharing the
 `s3client.Options.MaxRequestsPerSecond` (optional client-side
 token bucket — set when the backend has a known per-second
 ceiling that concurrency alone can't enforce, e.g. STACKIT 2500
-RPS or AWS S3 per-prefix 5500 GET / 3500 PUT) plus the pool
+RPS or AWS S3 per-prefix 5500 GET / 3500 PUT) plus the pgxpool
 size; CLAUDE.md § Orphan tracking notes that each writer holds
-**at most one** pool connection at a time, so the pool needs to
-size for `peak concurrent writers + readers + sequencer
+**at most one** pool connection at a time, so the pgxpool needs
+to size for `peak concurrent writers + readers + sequencer
 listeners + your own application`.
 
 #### Shared I/O worker pool — multi-Store deployments
 
-For deployments running multiple Stores in one process (typical:
-N parallel jobs × M Stores), the per-method `S3MaxConcurrentOpsPerMethod`
-cap multiplies — `M × N × cap` goroutines could be in flight,
-each holding a pre-built parquet body waiting for a connection-
-pool slot. The result is bytes-in-memory pressure that scales
-with deployment topology rather than the actual S3 op budget.
+Every per-Store fan-out call site — Write multi-partition, Read
+fetch+decode, PollRecords body fetch, and the ReadIter download
+pipeline — submits S3 ops through one shared `*pool.Pool`. When
+`Config.WorkerPool` is nil, the library installs a private pool
+sized to 64 slots so a single Store's behavior matches the
+pre-pool defaults.
 
-`Config.WorkerPool` accepts an optional shared `*pool.Pool`
-that supersedes the per-method cap. Submissions across every
-Store sharing the pool compete for one global concurrency
-budget — usually sized to the same number as
+For deployments running multiple Stores in one process (typical:
+N parallel jobs × M Stores), pass one explicitly-shared pool so
+the global concurrency budget is one pool, not `M × N × per-method
+cap`. Submissions across every Store sharing the pool compete
+for one budget — usually sized to the same number as
 `s3client.Options.MaxOpenConnections` so the goroutine count
 matches the TCP socket count.
 
@@ -768,9 +769,9 @@ Properties:
   semaphore + errgroup), but the lifetime is yours.
 
 Leave `WorkerPool` nil for single-Store-per-process deployments
-— the per-method `S3MaxConcurrentOpsPerMethod` cap is sufficient
-and avoids the global-budget tradeoff of cross-Store contention
-under bursts.
+— the auto-installed 64-slot default matches the pre-pool
+behavior and avoids the global-budget tradeoff of cross-Store
+contention under bursts.
 
 The library does **not** register these metrics itself — the
 adapter (pgx, GORM, custom `database/sql` wrappers) is caller-

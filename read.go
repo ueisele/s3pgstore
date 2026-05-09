@@ -158,11 +158,13 @@ func (o withReadAheadBytesOpt) applyRead(opts *readOpts) {
 //
 // Single SQL query against s3pgstore_files (no per-file
 // filtering, no LIMIT — every file row for every matched
-// partition comes back, per CLAUDE.md). For each partition,
-// files are fetched in parallel from S3 (capped by
-// Config.S3MaxConcurrentOpsPerMethod inside this Read call,
-// and globally by s3client.Options.MaxOpenConnections), decoded, and
-// concatenated; dedup runs once per partition.
+// partition comes back, per CLAUDE.md). Every (partition,
+// file) pair across the result set is fetched + decoded in
+// parallel through the shared Config.WorkerPool (defaulted to
+// 64 slots; bounded globally by s3client.Options.MaxOpenConnections
+// at the HTTP transport). Records are then concatenated per
+// partition in s3_key order and deduplicated once per
+// partition on the calling goroutine.
 //
 // Empty filters slice returns (nil, nil) — no partitions
 // matched, no S3 traffic.
@@ -206,64 +208,92 @@ func (s *Store[T]) Read(
 	}
 	groups = append(groups, current)
 
-	// Outer fan-out across partitions — each worker decodes
-	// one partition (and internally fan-outs across that
-	// partition's files via fetchAndDecode). Slot-indexed
-	// writes preserve lex order of partition keys regardless
-	// of completion order. Concurrency caps at the s3target's
-	// effective concurrency: extra partition workers would
-	// just queue on the inner semaphore.
+	// Flat fan-out across every (partition, file) pair. The
+	// shared pool's deadlock detector forbids same-pool
+	// reentrancy (a pool task that calls g.Submit on the same
+	// pool would hold a slot while waiting for another), so we
+	// can't nest "fan-out partitions × fan-out files" — flatten
+	// to a single fan-out and group bodies back together
+	// afterward.
 	//
-	// Memory note: with N outer × N inner workers, N²
-	// goroutines may exist concurrently. Most park on the
-	// inner s3target semaphore so the actual S3 fan-out
-	// stays bounded. Decode buffers are the real memory
-	// pressure — Read is already a buffered API ("everything
-	// in RAM"), so the trade is acceptable. Streaming
-	// callers needing per-partition memory bounds should use
-	// ReadPartitionIter (Phase 12).
-	out := make([]PartitionResult[T], len(groups))
-	if err := fanOutOrPool(ctx, s.cfg.WorkerPool, groups,
-		s.target.effectiveConcurrency(), nil,
-		func(ctx context.Context, i int, g group) error {
-			records, err := s.fetchAndDecode(ctx, g.files)
+	// Slot-indexed writes preserve per-group + per-file order:
+	// each task writes to bodies[gi][fi] without coordination.
+	// Concatenation + dedup runs once on the main goroutine
+	// after all GETs complete; decode is done in-task to
+	// parallelise the parquet decode across pool workers.
+	bodies := make([][][]T, len(groups))
+	type job struct {
+		gi, fi int
+		f      fileRow
+	}
+	totalFiles := 0
+	for gi := range groups {
+		bodies[gi] = make([][]T, len(groups[gi].files))
+		totalFiles += len(groups[gi].files)
+	}
+	jobs := make([]job, 0, totalFiles)
+	for gi, g := range groups {
+		for fi, f := range g.files {
+			jobs = append(jobs, job{gi: gi, fi: fi, f: f})
+		}
+	}
+	if err := fanOutPool(ctx, s.resolved.WorkerPool, jobs, nil,
+		func(ctx context.Context, _ int, j job) error {
+			data, err := s.target.get(ctx, j.f.s3Key)
 			if err != nil {
-				return fmt.Errorf("read partition %q: %w", g.key, err)
+				return fmt.Errorf("GET %s: %w", j.f.s3Key, err)
 			}
-
-			var version int64
-			exts := make([]FileExtensions, 0, len(g.files))
-			for _, f := range g.files {
-				if f.writtenAtVersion > version {
-					version = f.writtenAtVersion
-				}
-				extMap := make(map[string]any,
-					len(s.resolved.ExtensionColumns))
-				for j, c := range s.resolved.ExtensionColumns {
-					if j < len(f.extValues) && f.extValues[j] != nil {
-						extMap[c.Name] = f.extValues[j]
-					}
-				}
-				exts = append(exts, FileExtensions{
-					FileID:     f.fileID,
-					Extensions: extMap,
-				})
+			recs, err := decodeParquet[T](data)
+			if err != nil {
+				return fmt.Errorf("decode %s: %w", j.f.s3Key, err)
 			}
-
-			records = sortAndDedup(records,
-				s.resolved.EntityKeyOf, s.resolved.VersionOf,
-				o.includeHistory)
-
-			out[i] = PartitionResult[T]{
-				PartitionKey:   g.key,
-				Records:        records,
-				Version:        version,
-				FileExtensions: exts,
-			}
+			bodies[j.gi][j.fi] = recs
 			return nil
 		},
 	); err != nil {
 		return nil, err
+	}
+
+	out := make([]PartitionResult[T], len(groups))
+	for gi, g := range groups {
+		total := 0
+		for _, b := range bodies[gi] {
+			total += len(b)
+		}
+		records := make([]T, 0, total)
+		for _, b := range bodies[gi] {
+			records = append(records, b...)
+		}
+
+		var version int64
+		exts := make([]FileExtensions, 0, len(g.files))
+		for _, f := range g.files {
+			if f.writtenAtVersion > version {
+				version = f.writtenAtVersion
+			}
+			extMap := make(map[string]any,
+				len(s.resolved.ExtensionColumns))
+			for j, c := range s.resolved.ExtensionColumns {
+				if j < len(f.extValues) && f.extValues[j] != nil {
+					extMap[c.Name] = f.extValues[j]
+				}
+			}
+			exts = append(exts, FileExtensions{
+				FileID:     f.fileID,
+				Extensions: extMap,
+			})
+		}
+
+		records = sortAndDedup(records,
+			s.resolved.EntityKeyOf, s.resolved.VersionOf,
+			o.includeHistory)
+
+		out[gi] = PartitionResult[T]{
+			PartitionKey:   g.key,
+			Records:        records,
+			Version:        version,
+			FileExtensions: exts,
+		}
 	}
 	return out, nil
 }
@@ -345,59 +375,6 @@ func (s *Store[T]) selectFileRows(
 	})
 	if err != nil {
 		return nil, fmt.Errorf("SELECT files: %w", err)
-	}
-	return out, nil
-}
-
-// fetchAndDecode pulls every parquet file in files from S3 in
-// parallel via a fanOut goroutine pool sized to
-// Config.S3MaxConcurrentOpsPerMethod, decodes each into []T,
-// and concatenates the partition's records in s3_key lex order.
-//
-// Lex ordering matters for dedup tie-break (last wins on
-// equal max version, per CLAUDE.md). The caller pre-sorted
-// files by s3_key in the SELECT; per-index result slots
-// preserve that order while parallelising the GETs.
-//
-// The global TCP-connection cap (s3client.Options.MaxOpenConnections)
-// is enforced one level down by the s3.Client's HTTP
-// transport. fanOut's shared-cancel ctx propagates
-// first-error-wins through the SDK's adaptive-retry loop, so a
-// failing GET unwinds in-flight siblings instead of running
-// them to completion.
-func (s *Store[T]) fetchAndDecode(
-	ctx context.Context, files []fileRow,
-) ([]T, error) {
-	if len(files) == 0 {
-		return nil, nil
-	}
-	bodies := make([][]T, len(files))
-
-	if err := fanOutOrPool(ctx, s.cfg.WorkerPool, files,
-		s.target.effectiveConcurrency(), nil,
-		func(ctx context.Context, i int, f fileRow) error {
-			data, err := s.target.get(ctx, f.s3Key)
-			if err != nil {
-				return fmt.Errorf("GET %s: %w", f.s3Key, err)
-			}
-			recs, err := decodeParquet[T](data)
-			if err != nil {
-				return fmt.Errorf("decode %s: %w", f.s3Key, err)
-			}
-			bodies[i] = recs
-			return nil
-		},
-	); err != nil {
-		return nil, err
-	}
-
-	total := 0
-	for _, b := range bodies {
-		total += len(b)
-	}
-	out := make([]T, 0, total)
-	for _, b := range bodies {
-		out = append(out, b...)
 	}
 	return out, nil
 }

@@ -90,6 +90,23 @@ type Config[T any] struct {
 	Prefix   string
 	S3Client *s3.Client
 
+	// MaxInflightS3Requests caps net in-flight S3 requests through
+	// the library's target. The cap drives the
+	// s3pgstore.target.sem_inflight / sem_waiting / sem_wait_duration
+	// gauges — operators tune this against the bucket's per-second
+	// ceiling and the upstream S3 client's connection-pool limits.
+	// Zero → 32 (the library default). Negative → Config.validate
+	// returns an error.
+	//
+	// This is the library-level cap; if the underlying *s3.Client
+	// uses an *http.Client with a smaller MaxConnsPerHost, that
+	// transport-level limit dominates. Best practice is to size
+	// both knobs together: the HTTP client's MaxConnsPerHost (and
+	// MaxIdleConnsPerHost / MaxIdleConns) typically equals
+	// MaxInflightS3Requests so a saturated semaphore drains
+	// without TCP-level churn.
+	MaxInflightS3Requests int
+
 	// Schema layout
 	SchemaName  string // default "public"
 	TablePrefix string // default "s3pgstore_"; must end in "_"
@@ -166,6 +183,10 @@ func (c Config[T]) validate() error {
 	}
 	if c.S3Client == nil {
 		add("S3Client is required")
+	}
+	if c.MaxInflightS3Requests < 0 {
+		add("MaxInflightS3Requests %d must be >= 0 (zero → default 32)",
+			c.MaxInflightS3Requests)
 	}
 	if len(c.PartitionKeyParts) == 0 {
 		add("PartitionKeyParts must be non-empty")

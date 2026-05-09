@@ -137,10 +137,11 @@ func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
 	}
 
 	target, err := newS3Target(s3TargetConfig{
-		S3Client: r.S3Client,
-		Bucket:   r.Bucket,
-		Prefix:   r.Prefix,
-		Metrics:  metrics,
+		S3Client:            r.S3Client,
+		Bucket:              r.Bucket,
+		Prefix:              r.Prefix,
+		MaxInflightRequests: r.MaxInflightS3Requests,
+		Metrics:             metrics,
 	})
 	if err != nil {
 		return nil, err

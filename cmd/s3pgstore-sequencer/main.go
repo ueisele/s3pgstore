@@ -11,6 +11,12 @@
 //	                          set empty to disable LISTEN)
 //	S3PGSTORE_POLL_INTERVAL   Fallback poll cadence (default "1s")
 //	S3PGSTORE_BATCH_SIZE      Rows per RunOnce batch (default 1000)
+//
+// Telemetry (opt-in; see cmd/internal/otelinit for details):
+//
+//	OTEL_METRICS_EXPORTER, OTEL_EXPORTER_OTLP_ENDPOINT,
+//	OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, OTEL_SERVICE_NAME,
+//	OTEL_RESOURCE_ATTRIBUTES, OTEL_METRIC_EXPORT_INTERVAL, ...
 package main
 
 import (
@@ -26,6 +32,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/ueisele/s3pgstore/cmd/internal/otelinit"
 	"github.com/ueisele/s3pgstore/sequencer"
 )
 
@@ -51,6 +58,24 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(),
 		syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	meter, otelShutdown, err := otelinit.Setup(ctx,
+		"s3pgstore-sequencer")
+	if err != nil {
+		return fmt.Errorf("otel setup: %w", err)
+	}
+	// Use a detached background context for shutdown — the signal
+	// ctx is already canceled by the time we get here, which would
+	// cause ForceFlush/Shutdown to bail before flushing.
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(
+			context.Background(), 5*time.Second)
+		defer cancel()
+		if err := otelShutdown(shutdownCtx); err != nil {
+			slog.Warn("otel shutdown", "err", err)
+		}
+	}()
+	cfg.Meter = meter
 
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {

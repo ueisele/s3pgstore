@@ -53,6 +53,21 @@ func TestConfigValidate_RequiresS3Client(t *testing.T) {
 	requireErrContains(t, cfg.validate(), "S3Client is required")
 }
 
+func TestConfigValidate_MaxInflightS3RequestsRejectsNegative(t *testing.T) {
+	cfg := validConfig()
+	cfg.MaxInflightS3Requests = -1
+	requireErrContains(t, cfg.validate(),
+		"MaxInflightS3Requests -1 must be >= 0")
+}
+
+func TestConfigValidate_MaxInflightS3RequestsZeroOK(t *testing.T) {
+	cfg := validConfig()
+	cfg.MaxInflightS3Requests = 0 // sentinel for "use library default"
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("zero should be accepted (library default), got %v", err)
+	}
+}
+
 func TestConfigValidate_RequiresPartitionKeyParts(t *testing.T) {
 	cfg := validConfig()
 	cfg.PartitionKeyParts = nil

@@ -184,8 +184,8 @@ func newRBStore(t *testing.T, f *fixture) *s3pgstore.Store[rbRec] {
 	t.Helper()
 	cfg := s3pgstore.Config[rbRec]{
 		Executor:          s3pgstore.NewPoolExecutor(f.Pool),
-		Bucket:            f.Bucket,
-		Prefix:            "rebuild",
+		S3Bucket:          f.Bucket,
+		S3Prefix:          "rebuild",
 		S3Client:          f.S3Client,
 		SchemaName:        f.Schema,
 		PartitionKeyParts: []string{"customer"},
@@ -242,7 +242,7 @@ func TestRebuild_RoundTrip(t *testing.T) {
 	res, err := Rebuild(t.Context(), RebuildConfig{
 		Pool:              f.Pool,
 		S3Client:          f.S3Client,
-		Bucket:            f.Bucket,
+		S3Bucket:          f.Bucket,
 		S3Prefix:          "rebuild",
 		SchemaName:        f.Schema,
 		TablePrefix:       "s3pgstore_",
@@ -332,7 +332,7 @@ func TestRebuild_Idempotent(t *testing.T) {
 	cfg := RebuildConfig{
 		Pool:              f.Pool,
 		S3Client:          f.S3Client,
-		Bucket:            f.Bucket,
+		S3Bucket:          f.Bucket,
 		S3Prefix:          "rebuild",
 		SchemaName:        f.Schema,
 		TablePrefix:       "s3pgstore_",
@@ -366,7 +366,7 @@ func TestRebuild_EmptyBucket(t *testing.T) {
 	res, err := Rebuild(t.Context(), RebuildConfig{
 		Pool:              f.Pool,
 		S3Client:          f.S3Client,
-		Bucket:            f.Bucket,
+		S3Bucket:          f.Bucket,
 		S3Prefix:          "rebuild",
 		SchemaName:        f.Schema,
 		TablePrefix:       "s3pgstore_",
@@ -388,8 +388,8 @@ func TestRebuild_RecoversTokenAndExtFromS3Metadata(t *testing.T) {
 	f := newFixture(t)
 	cfg := s3pgstore.Config[rbRec]{
 		Executor:          s3pgstore.NewPoolExecutor(f.Pool),
-		Bucket:            f.Bucket,
-		Prefix:            "rebuild",
+		S3Bucket:          f.Bucket,
+		S3Prefix:          "rebuild",
 		S3Client:          f.S3Client,
 		SchemaName:        f.Schema,
 		PartitionKeyParts: []string{"customer"},
@@ -444,7 +444,7 @@ func TestRebuild_RecoversTokenAndExtFromS3Metadata(t *testing.T) {
 	res, err := Rebuild(t.Context(), RebuildConfig{
 		Pool:              f.Pool,
 		S3Client:          f.S3Client,
-		Bucket:            f.Bucket,
+		S3Bucket:          f.Bucket,
 		S3Prefix:          "rebuild",
 		SchemaName:        f.Schema,
 		TablePrefix:       "s3pgstore_",
@@ -514,7 +514,7 @@ func TestRebuild_RejectsMissingPartitionParts(t *testing.T) {
 	_, err := Rebuild(t.Context(), RebuildConfig{
 		Pool:        f.Pool,
 		S3Client:    f.S3Client,
-		Bucket:      f.Bucket,
+		S3Bucket:    f.Bucket,
 		SchemaName:  f.Schema,
 		TablePrefix: "s3pgstore_",
 	})

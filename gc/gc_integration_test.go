@@ -185,8 +185,8 @@ func newGCStore(t *testing.T, f *fixture) *s3pgstore.Store[gcRec] {
 	t.Helper()
 	cfg := s3pgstore.Config[gcRec]{
 		Executor:          s3pgstore.NewPoolExecutor(f.Pool),
-		Bucket:            f.Bucket,
-		Prefix:            "gc",
+		S3Bucket:          f.Bucket,
+		S3Prefix:          "gc",
 		S3Client:          f.S3Client,
 		SchemaName:        f.Schema,
 		PartitionKeyParts: []string{"customer"},
@@ -248,7 +248,7 @@ func TestGC_RunOnce_ReclaimsAgedOrphan(t *testing.T) {
 	n, err := gc.RunOnce(t.Context(), gc.Config{
 		Pool:        f.Pool,
 		S3Client:    f.S3Client,
-		Bucket:      f.Bucket,
+		S3Bucket:    f.Bucket,
 		SchemaName:  f.Schema,
 		TablePrefix: "s3pgstore_",
 		Grace:       1 * time.Hour,
@@ -301,7 +301,7 @@ func TestGC_RunOnce_GracePeriodRespected(t *testing.T) {
 	n, err := gc.RunOnce(t.Context(), gc.Config{
 		Pool:        f.Pool,
 		S3Client:    f.S3Client,
-		Bucket:      f.Bucket,
+		S3Bucket:    f.Bucket,
 		SchemaName:  f.Schema,
 		TablePrefix: "s3pgstore_",
 		Grace:       1 * time.Hour,
@@ -350,7 +350,7 @@ func TestGC_RunOnce_SkipsCommittedFiles(t *testing.T) {
 	n, err := gc.RunOnce(t.Context(), gc.Config{
 		Pool:        f.Pool,
 		S3Client:    f.S3Client,
-		Bucket:      f.Bucket,
+		S3Bucket:    f.Bucket,
 		SchemaName:  f.Schema,
 		TablePrefix: "s3pgstore_",
 		Grace:       0, // would reclaim ANY orphan, but there are none
@@ -374,7 +374,7 @@ func TestGC_RunOnce_Idempotent(t *testing.T) {
 	cfg := gc.Config{
 		Pool:        f.Pool,
 		S3Client:    f.S3Client,
-		Bucket:      f.Bucket,
+		S3Bucket:    f.Bucket,
 		SchemaName:  f.Schema,
 		TablePrefix: "s3pgstore_",
 		Grace:       1 * time.Hour,
@@ -409,7 +409,7 @@ func TestGC_RunOnce_BatchSizeLimitsScan(t *testing.T) {
 	cfg := gc.Config{
 		Pool:        f.Pool,
 		S3Client:    f.S3Client,
-		Bucket:      f.Bucket,
+		S3Bucket:    f.Bucket,
 		SchemaName:  f.Schema,
 		TablePrefix: "s3pgstore_",
 		Grace:       1 * time.Hour,
@@ -454,7 +454,7 @@ func TestGC_RunOnce_MissingS3KeyStillReclaimsRow(t *testing.T) {
 	n, err := gc.RunOnce(t.Context(), gc.Config{
 		Pool:        f.Pool,
 		S3Client:    f.S3Client,
-		Bucket:      f.Bucket,
+		S3Bucket:    f.Bucket,
 		SchemaName:  f.Schema,
 		TablePrefix: "s3pgstore_",
 		Grace:       1 * time.Hour,
@@ -482,7 +482,7 @@ func TestGC_Run_LoopCancels(t *testing.T) {
 		done <- gc.Run(ctx, gc.Config{
 			Pool:        f.Pool,
 			S3Client:    f.S3Client,
-			Bucket:      f.Bucket,
+			S3Bucket:    f.Bucket,
 			SchemaName:  f.Schema,
 			TablePrefix: "s3pgstore_",
 			Grace:       1 * time.Hour,
@@ -532,10 +532,10 @@ func TestGC_RunOnce_Validation(t *testing.T) {
 		{name: "no S3Client",
 			cfg:  gc.Config{Pool: &pgxpool.Pool{}},
 			want: "S3Client is required"},
-		{name: "no Bucket",
+		{name: "no S3Bucket",
 			cfg: gc.Config{
 				Pool: &pgxpool.Pool{}, S3Client: &s3.Client{}},
-			want: "Bucket is required"},
+			want: "S3Bucket is required"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

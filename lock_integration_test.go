@@ -25,8 +25,8 @@ type lockRec struct {
 func newLockCfg(f *fixture) s3pgstore.Config[lockRec] {
 	return s3pgstore.Config[lockRec]{
 		Executor:          s3pgstore.NewPoolExecutor(f.Pool),
-		Bucket:            f.Bucket,
-		Prefix:            "lock",
+		S3Bucket:          f.Bucket,
+		S3Prefix:          "lock",
 		S3Client:          f.S3Client,
 		SchemaName:        f.Schema,
 		PartitionKeyParts: []string{"customer"},

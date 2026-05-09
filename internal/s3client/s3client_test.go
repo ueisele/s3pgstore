@@ -10,10 +10,10 @@ import (
 // drops one of these silently regresses TCP-churn behaviour
 // under load — the test exists specifically to catch that.
 func TestBuildHTTPClient_PoolSizing(t *testing.T) {
-	c := BuildHTTPClient(64)
-	tr, ok := c.Transport.(*http.Transport)
+	c := buildHTTPClient(64, nil)
+	tr, ok := unwrapTransport(c.Transport)
 	if !ok {
-		t.Fatalf("Transport: want *http.Transport, got %T", c.Transport)
+		t.Fatalf("Transport: want *http.Transport (possibly wrapped), got %T", c.Transport)
 	}
 	if got := tr.MaxIdleConns; got != 64 {
 		t.Errorf("MaxIdleConns: want 64, got %d", got)
@@ -31,17 +31,32 @@ func TestBuildHTTPClient_PoolSizing(t *testing.T) {
 }
 
 // TestBuildHTTPClient_DefaultsWhenZeroOrNegative verifies the
-// "<=0 → default 32" sentinel. Any caller passing a misconfigured
+// "<=0 → default 64" sentinel. Any caller passing a misconfigured
 // zero (e.g. unset env var defaulting to 0) gets a sane pool
 // rather than a single-connection HTTP client.
 func TestBuildHTTPClient_DefaultsWhenZeroOrNegative(t *testing.T) {
 	for _, n := range []int{0, -1, -100} {
-		c := BuildHTTPClient(n)
-		tr := c.Transport.(*http.Transport)
-		if got := tr.MaxConnsPerHost; got != defaultMaxInflightRequests {
-			t.Errorf("BuildHTTPClient(%d).MaxConnsPerHost: "+
+		c := buildHTTPClient(n, nil)
+		tr, ok := unwrapTransport(c.Transport)
+		if !ok {
+			t.Fatalf("Transport: unwrap failed, got %T", c.Transport)
+		}
+		if got := tr.MaxConnsPerHost; got != defaultMaxOpenConnections {
+			t.Errorf("buildHTTPClient(%d).MaxConnsPerHost: "+
 				"want %d, got %d",
-				n, defaultMaxInflightRequests, got)
+				n, defaultMaxOpenConnections, got)
 		}
 	}
+}
+
+// unwrapTransport peels the s3pgstore tracingTransport wrap to
+// expose the underlying *http.Transport for pool-sizing
+// assertions. Returns (nil, false) if the chain doesn't
+// terminate at *http.Transport.
+func unwrapTransport(rt http.RoundTripper) (*http.Transport, bool) {
+	if tt, ok := rt.(tracingTransport); ok {
+		rt = tt.base
+	}
+	tr, ok := rt.(*http.Transport)
+	return tr, ok
 }

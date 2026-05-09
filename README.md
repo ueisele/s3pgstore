@@ -110,8 +110,8 @@ type CostRecord struct {
 
 store, err := s3pgstore.New[CostRecord](ctx, s3pgstore.Config[CostRecord]{
     Executor: s3pgstore.NewPoolExecutor(pgPool),
-    Bucket:   "warehouse",
-    Prefix:   "billing",
+    S3Bucket: "warehouse",
+    S3Prefix: "billing",
     S3Client: s3Client,
 
     PartitionKeyParts: []string{"charge_period", "customer"},
@@ -158,7 +158,7 @@ shared package that defines the `Config[T]` once, two binaries
 that consume it.
 
 **Shared package.** Schema-shaping fields are defined once;
-runtime-only fields (`Executor` / `S3Client` / `Bucket`) are
+runtime-only fields (`Executor` / `S3Client` / `S3Bucket`) are
 filled in by the constructor.
 
 ```go
@@ -215,8 +215,8 @@ func NewStore(
     cfg := schemaCfg()
     cfg.Executor = s3pgstore.NewPoolExecutor(pool)
     cfg.S3Client = s3c
-    cfg.Bucket = bucket
-    cfg.Prefix = "billing"
+    cfg.S3Bucket = bucket
+    cfg.S3Prefix = "billing"
     return s3pgstore.New(ctx, cfg)
 }
 
@@ -227,7 +227,7 @@ func RenderSchema() (string, error) {
     cfg := schemaCfg()
     cfg.Executor = s3pgstore.NewPoolExecutor(nil) // never invoked
     cfg.S3Client = &s3.Client{}                   // never invoked
-    cfg.Bucket = "schema-only"
+    cfg.S3Bucket = "schema-only"
     return s3pgstore.RenderDDL(cfg)
 }
 ```
@@ -299,7 +299,7 @@ configuration and operational notes:
 
 ```sh
 S3PGSTORE_DATABASE_URL=postgres://s3pgstore:s3pgstore@localhost/s3pgstore?sslmode=disable \
-S3PGSTORE_BUCKET=warehouse \
+S3PGSTORE_S3_BUCKET=warehouse \
 S3PGSTORE_S3_ENDPOINT=http://localhost:9000 \
   go run github.com/ueisele/s3pgstore/cmd/s3pgstore-gc
 ```
@@ -378,7 +378,7 @@ loss:
 
 ```sh
 S3PGSTORE_DATABASE_URL=postgres://... \
-S3PGSTORE_BUCKET=warehouse \
+S3PGSTORE_S3_BUCKET=warehouse \
 S3PGSTORE_S3_PREFIX=billing \
 S3PGSTORE_PARTITION_KEY_PARTS=charge_period,customer \
   go run github.com/ueisele/s3pgstore/cmd/s3pgstore-rebuild
@@ -413,9 +413,11 @@ shape, and orphan tracking. Highlights:
 | `s3pgstore.write.{bytes,records}` | histograms | P100 on bytes drives `EncodeBufPoolMaxBytes` tuning. |
 | `s3pgstore.write.encode_buf_dropped` | counter | Incident — encoder dropped an oversized buffer; cap is undersized. |
 | `s3pgstore.write.token_race.retry.count` | counter | Incident — concurrent writers contending on the same idempotency token. |
-| `s3pgstore.s3.{request.count,request.duration,body_size}` | ctr+hist+hist | Library's view of S3 ops; one increment per logical op (acquire + retry + release). |
-| `s3pgstore.s3.transient_error.count` | counter | Fires *once per failed attempt* (every retry, even masked ones). Pair with `s3.request.count` for the percentage-error panel. Labels include `error.type` ∈ {slowdown, server, client, transport, ...}. |
-| `s3pgstore.target.{sem_wait_duration,sem_inflight,sem_waiting}` | hist+gauge+gauge | `Config.MaxInflightS3Requests` saturation (default 32); `waiting > 0` sustained = bump the cap (and size the `*s3.Client`'s `*http.Client` pool to match). |
+| `s3pgstore.s3.{request.count,request.duration,body_size}` | ctr+hist+hist | Library's view of S3 ops; one increment per logical op (one row per SDK call, including all adaptive-retry attempts). `request.count` carries an `attempts` label sourced from the SDK's AttemptResults metadata. Per-attempt error classification lives in `s3.attempt.error.count`, not here. |
+| `s3pgstore.s3.attempt.error.count{error_type, attempt, terminal}` | counter | Fires once per failed S3 attempt — retried (`terminal="false"`) OR terminal (`terminal="true"`). Single counter answers "rate of `<error_type>` events" without summing two metrics. `error_type="slowdown"` going non-zero in steady state means adaptive retry is throttling against your backend ceiling; lower `Config.S3MaxOpenConnections` to leave more headroom. |
+| `s3pgstore.s3.ratelimit.wait.duration` | histogram | Wallclock spent in the client-side rate limiter before the SDK ran the op. Measured outside `s3.request.duration`. Sub-ms when `S3MaxRequestsPerSecond` is unsaturated; rising p99 means the per-second cap is now the bottleneck. Only emits when `S3MaxRequestsPerSecond > 0`. |
+| `s3pgstore.s3.tcp.connections` | up-down counter | Current open TCP sockets to S3 (active + idle in pool). Saturation signal vs `S3MaxOpenConnections` — sitting at the cap during steady-state load means raise the cap. Drift upward without load = a Conn leak. Operator binaries only (the wraps live in `BuildS3Client`'s HTTP transport). |
+| `s3pgstore.s3.connection.reuse.count{reused}` | counter | Per-request idle-pool outcome from `httptrace.GotConn`. Rate ratio (`reused="true"` / total) is the idle-pool hit rate — high (>0.95) under steady load = pool sized well; low = `MaxIdleConns` starving the pool, or workload bursts faster than `IdleConnTimeout`. |
 | `s3pgstore.fanout.{partitions,items}` | histograms | Per-call fan-out width — capacity planning. |
 | `s3pgstore.occ.version_conflict.count` | counter | Incident — OCC writes colliding. |
 | `s3pgstore.lookup_by_token.count{result}` | counter | Idempotency hit-rate. |
@@ -480,7 +482,7 @@ duplicate, our `s3pgstore.s3.*` surface:
 - "Did the library issue 5 PUTs or 1 PUT that the SDK retried 4
   times?" → ours says 1, theirs says 5. Both true, both useful.
 - "Is S3 throttling us?" → ours via
-  `s3.transient_error.count{error.type=slowdown}`; theirs via
+  `s3.attempt.error.count{error.type=slowdown}`; theirs via
   retry-count-per-call.
 - "Is latency in our code or in the SDK retry chain?" →
   compare `s3pgstore.s3.request.duration` against
@@ -559,7 +561,13 @@ Sustained `acquired ≈ max` with non-zero growth in
 `acquire_duration_total_ms` indicates the pool is undersized for
 the offered concurrency — bump `pgxpool.Config.MaxConns`. The
 library's own write-path concurrency is bounded by
-`Config.MaxInflightRequests` (the S3 semaphore) plus the pool
+`Config.S3MaxConcurrentOpsPerMethod` (FanOut goroutine pool) +
+`Config.S3MaxOpenConnections` (HTTP transport TCP cap, the
+global concurrency ceiling) +
+`Config.S3MaxRequestsPerSecond` (optional client-side token
+bucket — set when the backend has a known per-second ceiling
+that concurrency alone can't enforce, e.g. STACKIT 2500 RPS or
+AWS S3 per-prefix 5500 GET / 3500 PUT) plus the pool
 size; CLAUDE.md § Orphan tracking notes that each writer holds
 **at most one** pool connection at a time, so the pool needs to
 size for `peak concurrent writers + readers + sequencer

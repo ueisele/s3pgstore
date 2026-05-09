@@ -29,8 +29,8 @@ type mvRec struct {
 func newMVCfg(f *fixture) s3pgstore.Config[mvRec] {
 	return s3pgstore.Config[mvRec]{
 		Executor:          s3pgstore.NewPoolExecutor(f.Pool),
-		Bucket:            f.Bucket,
-		Prefix:            "mv",
+		S3Bucket:          f.Bucket,
+		S3Prefix:          "mv",
 		S3Client:          f.S3Client,
 		SchemaName:        f.Schema,
 		PartitionKeyParts: []string{"customer"},

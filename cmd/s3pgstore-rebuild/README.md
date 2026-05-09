@@ -37,20 +37,23 @@ version. Remove or re-upload them before re-running.
 
 ### Required
 
-| Variable                        | Description                                                              |
-| ------------------------------- | ------------------------------------------------------------------------ |
-| `S3PGSTORE_DATABASE_URL`        | PostgreSQL connection string. Catalog DDL must already exist.            |
-| `S3PGSTORE_BUCKET`              | S3 bucket containing the parquet objects.                                |
+| Variable                        | Description                                                               |
+| ------------------------------- | ------------------------------------------------------------------------- |
+| `S3PGSTORE_DATABASE_URL`        | PostgreSQL connection string. Catalog DDL must already exist.             |
+| `S3PGSTORE_S3_BUCKET`           | S3 bucket containing the parquet objects.                                 |
 | `S3PGSTORE_PARTITION_KEY_PARTS` | Comma-separated part names — must match the writer's `PartitionKeyParts`. |
 
 ### Optional
 
 | Variable                 | Default       | Description                                              |
 | ------------------------ | ------------- | -------------------------------------------------------- |
-| `S3PGSTORE_S3_PREFIX`    | _(empty)_     | S3 prefix matching the writer's `Config.Prefix`.         |
+| `S3PGSTORE_S3_PREFIX`    | _(empty)_     | S3 prefix matching the writer's `Config.S3Prefix`.       |
 | `S3PGSTORE_S3_ENDPOINT`  | _(AWS)_       | Override for non-AWS S3 (e.g. `http://minio:9000`).      |
 | `S3PGSTORE_S3_REGION`    | `us-east-1`   | AWS region.                                              |
-| `S3PGSTORE_S3_MAX_INFLIGHT_REQUESTS` | `32` | Caps simultaneous S3 requests; sized in lockstep with the HTTP transport's connection pool. Higher values speed up multi-million-file rebuilds at the cost of socket pressure. |
+| `S3PGSTORE_S3_MAX_OPEN_CONNECTIONS` | `64` | Caps concurrent TCP connections to S3 (drives the HTTP transport's connection pool). This is the global concurrency ceiling for the rebuild — higher values speed up multi-million-file runs at the cost of socket pressure on the bucket. For "effectively unlimited", set a large value like 1000. |
+| `S3PGSTORE_S3_MAX_RETRY_ATTEMPTS` | `5` | SDK retry budget per logical S3 op (1 initial + retries). Equal-jitter backoff windows 100ms..10s. |
+| `S3PGSTORE_S3_MAX_REQUESTS_PER_SECOND` | _(unset = unlimited)_ | Pre-throttle outgoing S3 ops via a client-side token bucket. Crucial for backends with a known per-second ceiling — STACKIT 2500 RPS, AWS S3 per-prefix 5500 GET / 3500 PUT. At rebuild scale (100 ms typical HEAD latency, 400 concurrent connections → 4000 RPS via Little's Law) a connection cap alone won't keep you under 2500. |
+| `S3PGSTORE_S3_MAX_REQUESTS_PER_SECOND_BURST` | `max(1, rate*0.1)` | Token bucket burst — caps the post-idle 1-second excursion at +10% over the sustained rate. Only meaningful when `MAX_REQUESTS_PER_SECOND > 0`. |
 | `S3PGSTORE_SCHEMA`       | `public`      | Schema containing the s3pgstore tables.                  |
 | `S3PGSTORE_TABLE_PREFIX` | `s3pgstore_`  | Table-name prefix (must match the writer).               |
 
@@ -75,7 +78,7 @@ place for that future work.
 
 ```sh
 export S3PGSTORE_DATABASE_URL="postgres://s3pgstore:s3pgstore@localhost:5432/s3pgstore?sslmode=disable"
-export S3PGSTORE_BUCKET=my-bucket
+export S3PGSTORE_S3_BUCKET=my-bucket
 export S3PGSTORE_PARTITION_KEY_PARTS="tenant,date"
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
@@ -90,7 +93,7 @@ docker pull ueisele/s3pgstore-rebuild:latest
 
 docker run --rm \
   -e S3PGSTORE_DATABASE_URL="postgres://s3pgstore:s3pgstore@host.docker.internal:5432/s3pgstore?sslmode=disable" \
-  -e S3PGSTORE_BUCKET=my-bucket \
+  -e S3PGSTORE_S3_BUCKET=my-bucket \
   -e S3PGSTORE_PARTITION_KEY_PARTS="tenant,date" \
   -e AWS_ACCESS_KEY_ID="..." \
   -e AWS_SECRET_ACCESS_KEY="..." \
@@ -124,9 +127,12 @@ docker buildx build \
 - **Time budget at scale.** With ~2M files, expect a multi-hour
   run dominated by S3 HEAD throughput. Plan rebuild against the
   per-second HEAD ceiling of your bucket and the parallelism
-  the tool exercises. `S3PGSTORE_S3_MAX_INFLIGHT_REQUESTS` is
+  the tool exercises. `S3PGSTORE_S3_MAX_OPEN_CONNECTIONS` is
   the dial for that parallelism — raise it to push more HEADs
-  at the bucket; lower if S3 starts returning `SlowDown`.
+  at the bucket. SDK adaptive retry handles `SlowDown` responses
+  automatically (token-bucket rate shaping), so you don't need
+  to manually back off; just set the cap below your backend's
+  per-client ceiling.
 - **StorageGRID compatibility.** The S3 client uses
   `ResponseChecksumValidation = WhenRequired` rather than the
   SDK default `WhenSupported` — StorageGRID logs a warning on

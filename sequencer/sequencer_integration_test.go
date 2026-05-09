@@ -188,8 +188,8 @@ func newSeqStore(t *testing.T, f *fixture) *s3pgstore.Store[seqRec] {
 	t.Helper()
 	cfg := s3pgstore.Config[seqRec]{
 		Executor:          s3pgstore.NewPoolExecutor(f.Pool),
-		Bucket:            f.Bucket,
-		Prefix:            "seq",
+		S3Bucket:          f.Bucket,
+		S3Prefix:          "seq",
 		S3Client:          f.S3Client,
 		SchemaName:        f.Schema,
 		PartitionKeyParts: []string{"customer"},

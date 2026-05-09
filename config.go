@@ -85,27 +85,95 @@ type Config[T any] struct {
 	// Executor is the database access abstraction. Required.
 	Executor Executor
 
-	// S3 wiring. All three required.
-	Bucket   string
-	Prefix   string
+	// S3 wiring. All three required. The S3* prefix marks
+	// these as the "S3 namespace" — every S3-related field on
+	// Config (wiring + caps below) starts with S3 so they
+	// cluster alphabetically and mirror the env-var
+	// convention (S3PGSTORE_S3_*).
+	S3Bucket string
+	S3Prefix string
 	S3Client *s3.Client
 
-	// MaxInflightS3Requests caps net in-flight S3 requests through
-	// the library's target. The cap drives the
-	// s3pgstore.target.sem_inflight / sem_waiting / sem_wait_duration
-	// gauges — operators tune this against the bucket's per-second
-	// ceiling and the upstream S3 client's connection-pool limits.
-	// Zero → 32 (the library default). Negative → Config.validate
-	// returns an error.
+	// S3MaxOpenConnections caps total TCP connections to the S3
+	// backend across the entire Store, all methods, all
+	// goroutines. This is the *only* enforcement layer for "no
+	// more than N concurrent S3 ops" — set it to your share of
+	// the backend's per-client concurrency limit (e.g. STACKIT
+	// 500 concurrent ÷ N replicas with ~10% headroom).
 	//
-	// This is the library-level cap; if the underlying *s3.Client
-	// uses an *http.Client with a smaller MaxConnsPerHost, that
-	// transport-level limit dominates. Best practice is to size
-	// both knobs together: the HTTP client's MaxConnsPerHost (and
-	// MaxIdleConnsPerHost / MaxIdleConns) typically equals
-	// MaxInflightS3Requests so a saturated semaphore drains
-	// without TCP-level churn.
-	MaxInflightS3Requests int
+	// Drives the *http.Client's MaxConnsPerHost /
+	// MaxIdleConnsPerHost / MaxIdleConns when the library wraps
+	// the user's *s3.Client; the library's middleware stack
+	// otherwise has no semaphore — adaptive-mode retry handles
+	// per-second rate shaping inside this hard cap.
+	//
+	// Zero → 64 (the library default). Negative → Config.validate
+	// returns an error.
+	S3MaxOpenConnections int
+
+	// S3MaxConcurrentOpsPerMethod sizes the FanOut goroutine
+	// pool inside a single Read / Write / ReadIter / Poll call.
+	// Higher values speed up large fan-outs (Write with many
+	// partition keys, Read across many files); too high wastes
+	// goroutines that just block waiting on TCP sockets capped
+	// by S3MaxOpenConnections.
+	//
+	// Sane defaults: same as S3MaxOpenConnections when running
+	// one method at a time; lower (e.g. /N) when expecting N
+	// concurrent methods.
+	//
+	// Zero → 64 (the library default). Negative → Config.validate
+	// returns an error.
+	S3MaxConcurrentOpsPerMethod int
+
+	// S3MaxRetryAttempts is the SDK retry budget per logical S3
+	// op (1 initial + N-1 retries). Higher values trade more
+	// time-to-failure for more chances to mask transient blips
+	// and SlowDown bursts. Lower values surface failures to
+	// callers faster.
+	//
+	// Combined with the equal-jitter backoff schedule
+	// (window 100ms..10s), worst-case wallclock for an
+	// exhausted budget is ~6 s at S3MaxRetryAttempts=5.
+	//
+	// Zero → 5 (the library default). Negative → Config.validate
+	// returns an error.
+	S3MaxRetryAttempts int
+
+	// S3MaxRequestsPerSecond pre-throttles outgoing S3 ops at
+	// this fixed rate via a client-side token bucket. Set when
+	// the backend has a known per-second ceiling that
+	// concurrency alone can't enforce — e.g. STACKIT 2500 RPS,
+	// AWS S3 per-prefix 5500 GET / 3500 PUT.
+	//
+	// Sized in concert with S3MaxOpenConnections: even with
+	// concurrency capped at 400, ~50 ms typical S3 latency
+	// would yield 8000 RPS via Little's Law — well over
+	// STACKIT's 2500. Pre-shaping the rate avoids the
+	// adaptive-retry "discover via SlowDown" feedback loop.
+	//
+	// Zero or negative → no rate limiter (rely solely on
+	// adaptive retry's reactive bucket).
+	S3MaxRequestsPerSecond float64
+
+	// S3MaxRequestBurst sizes the token bucket's burst
+	// capacity — the maximum number of ops that can fire
+	// instantaneously after an idle period. Only meaningful
+	// when S3MaxRequestsPerSecond > 0.
+	//
+	// rate.Limiter's worst-case throughput in any rolling
+	// 1-second window is (burst + rate), so a burst of N
+	// over-shoots the sustained rate by N for one second after
+	// idle. For backends with strict per-second windows, keep
+	// burst small relative to rate.
+	//
+	// Zero defaults to max(1, int(rate * 0.1)) — 10% of rate,
+	// capping post-idle excursion at +10% over the sustained
+	// limit. Operators on backends with very strict windows
+	// (counted at fine granularity) should set this lower
+	// (e.g. 1) to disable any meaningful burst.
+	// Negative → Config.validate returns an error.
+	S3MaxRequestBurst int
 
 	// Schema layout
 	SchemaName  string // default "public"
@@ -178,15 +246,33 @@ func (c Config[T]) validate() error {
 	if c.Executor == nil {
 		add("Executor is required")
 	}
-	if c.Bucket == "" {
-		add("Bucket is required")
+	if c.S3Bucket == "" {
+		add("S3Bucket is required")
 	}
 	if c.S3Client == nil {
 		add("S3Client is required")
 	}
-	if c.MaxInflightS3Requests < 0 {
-		add("MaxInflightS3Requests %d must be >= 0 (zero → default 32)",
-			c.MaxInflightS3Requests)
+	if c.S3MaxOpenConnections < 0 {
+		add("S3MaxOpenConnections %d must be >= 0 (zero → default 64)",
+			c.S3MaxOpenConnections)
+	}
+	if c.S3MaxConcurrentOpsPerMethod < 0 {
+		add("S3MaxConcurrentOpsPerMethod %d must be >= 0 "+
+			"(zero → default 64)",
+			c.S3MaxConcurrentOpsPerMethod)
+	}
+	if c.S3MaxRetryAttempts < 0 {
+		add("S3MaxRetryAttempts %d must be >= 0 (zero → default 5)",
+			c.S3MaxRetryAttempts)
+	}
+	if c.S3MaxRequestsPerSecond < 0 {
+		add("S3MaxRequestsPerSecond %g must be >= 0 (zero → no rate limit)",
+			c.S3MaxRequestsPerSecond)
+	}
+	if c.S3MaxRequestBurst < 0 {
+		add("S3MaxRequestBurst %d must be >= 0 "+
+			"(zero → 10%% of S3MaxRequestsPerSecond)",
+			c.S3MaxRequestBurst)
 	}
 	if len(c.PartitionKeyParts) == 0 {
 		add("PartitionKeyParts must be non-empty")

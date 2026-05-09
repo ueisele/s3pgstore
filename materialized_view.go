@@ -32,7 +32,7 @@ type MaterializedView[K any] struct {
 	executor Executor
 	tableSQL string
 	cols     []string // quoted SQL identifiers in select order
-	metrics  *Metrics
+	metrics  *metrics
 }
 
 // NewMaterializedView returns a typed lookup handle for the MV

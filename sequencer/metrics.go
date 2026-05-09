@@ -25,16 +25,22 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/metric/noop"
 
 	"github.com/ueisele/s3pgstore/internal/catalog"
 )
 
-// Metrics is the sequencer's per-Config instrumentation handle.
+// scopeName is the OTel meter scope this package's
+// instruments register under when cfg.Meter is nil.
+// Convention: the Go package import path (matches OTel's
+// instrumentation-scope semantic).
+const scopeName = "github.com/ueisele/s3pgstore/sequencer"
+
+// metrics is the sequencer's per-Config instrumentation handle.
 // Constructed inside RunOnce / Run via newMetrics(cfg).
 // A nil receiver makes every record call a no-op.
-type Metrics struct {
+type metrics struct {
 	assigned metric.Int64Counter
 	lockWait metric.Float64Histogram
 }
@@ -46,10 +52,10 @@ type Metrics struct {
 // registerUnsequencedGauge handles that separately and is meant
 // to be called exactly once per long-lived sequencer process —
 // Run does it under the hood.
-func newMetrics(cfg Config) (*Metrics, error) {
+func newMetrics(cfg Config) (*metrics, error) {
 	meter := cfg.Meter
 	if meter == nil {
-		meter = noop.NewMeterProvider().Meter("s3pgstore.sequencer")
+		meter = otel.GetMeterProvider().Meter(scopeName)
 	}
 
 	assigned, err := meter.Int64Counter(
@@ -77,7 +83,7 @@ func newMetrics(cfg Config) (*Metrics, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Metrics{
+	return &metrics{
 		assigned: assigned,
 		lockWait: lockWait,
 	}, nil
@@ -127,7 +133,7 @@ func registerUnsequencedGauge(cfg Config) error {
 
 // recordAssigned fires after a successful RunOnce call with the
 // row count assigned in that batch.
-func (m *Metrics) recordAssigned(ctx context.Context, n int) {
+func (m *metrics) recordAssigned(ctx context.Context, n int) {
 	if m == nil {
 		return
 	}
@@ -136,7 +142,7 @@ func (m *Metrics) recordAssigned(ctx context.Context, n int) {
 
 // recordLockWait records the time spent inside the
 // pg_advisory_xact_lock statement.
-func (m *Metrics) recordLockWait(ctx context.Context, seconds float64) {
+func (m *metrics) recordLockWait(ctx context.Context, seconds float64) {
 	if m == nil {
 		return
 	}

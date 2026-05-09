@@ -10,6 +10,7 @@ import (
 	"github.com/parquet-go/parquet-go/compress"
 
 	"github.com/ueisele/s3pgstore/internal/catalog"
+	"github.com/ueisele/s3pgstore/internal/s3client"
 )
 
 // Store is the typed entry point for writing and reading
@@ -24,7 +25,7 @@ type Store[T any] struct {
 	names    catalog.Names
 	target   *s3target
 	encoder  *parquetEncoder[T]
-	metrics  *Metrics
+	metrics  *metrics
 	sql      sqlCache
 }
 
@@ -136,12 +137,30 @@ func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
 		return nil, fmt.Errorf("register metrics: %w", err)
 	}
 
+	// Wrap the user's *s3.Client with our middleware stack
+	// (adaptive retry + metrics). The user's original client is
+	// not mutated — wrapping is by-value via the SDK's
+	// Options(). This is the client the read/write paths
+	// actually call PutObject/GetObject/DeleteObject on.
+	//
+	// The s3.* metrics surface lives entirely in
+	// internal/s3client — store doesn't carry it. WrapS3Client
+	// registers its instruments against the same OTel meter
+	// the library uses, so operators see s3pgstore.s3.*
+	// alongside s3pgstore.method.* etc. on one dashboard.
+	wrappedS3, err := s3client.WrapS3Client(r.S3Client, s3client.WrapOptions{
+		MaxRetryAttempts:          r.S3MaxRetryAttempts,
+		MaxRequestsPerSecond:      r.S3MaxRequestsPerSecond,
+		MaxRequestsPerSecondBurst: r.S3MaxRequestBurst,
+		Meter:                     cfg.Meter,
+	})
+	if err != nil {
+		return nil, err
+	}
 	target, err := newS3Target(s3TargetConfig{
-		S3Client:            r.S3Client,
-		Bucket:              r.Bucket,
-		Prefix:              r.Prefix,
-		MaxInflightRequests: r.MaxInflightS3Requests,
-		Metrics:             metrics,
+		S3Client:                    wrappedS3,
+		S3Bucket:                    r.S3Bucket,
+		S3MaxConcurrentOpsPerMethod: r.S3MaxConcurrentOpsPerMethod,
 	})
 	if err != nil {
 		return nil, err
@@ -160,14 +179,14 @@ func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
 }
 
 // dataPath returns the S3-key prefix under which parquet data
-// files live for this Store: "<Prefix>/data". A leading slash
-// from cfg.Prefix is preserved verbatim — the library does not
-// normalise prefixes.
+// files live for this Store: "<S3Prefix>/data". A leading slash
+// from cfg.S3Prefix is preserved verbatim — the library does
+// not normalise prefixes.
 func (s *Store[T]) dataPath() string {
-	if s.resolved.Prefix == "" {
+	if s.resolved.S3Prefix == "" {
 		return "data"
 	}
-	return s.resolved.Prefix + "/data"
+	return s.resolved.S3Prefix + "/data"
 }
 
 // dataKey returns the S3 key for a single parquet file under

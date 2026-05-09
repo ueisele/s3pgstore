@@ -103,7 +103,7 @@ func TestS3Target_PutGetRoundTrip(t *testing.T) {
 	bucket := itNewBucket(t, cli)
 	tgt, err := newS3Target(s3TargetConfig{
 		S3Client: cli,
-		Bucket:   bucket,
+		S3Bucket: bucket,
 	})
 	if err != nil {
 		t.Fatalf("newS3Target: %v", err)
@@ -128,7 +128,7 @@ func TestS3Target_GetMissing(t *testing.T) {
 		t.Fatalf("MinIO: %v", err)
 	}
 	bucket := itNewBucket(t, cli)
-	tgt, err := newS3Target(s3TargetConfig{S3Client: cli, Bucket: bucket})
+	tgt, err := newS3Target(s3TargetConfig{S3Client: cli, S3Bucket: bucket})
 	if err != nil {
 		t.Fatalf("newS3Target: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestS3Target_DeleteIdempotent(t *testing.T) {
 		t.Fatalf("MinIO: %v", err)
 	}
 	bucket := itNewBucket(t, cli)
-	tgt, err := newS3Target(s3TargetConfig{S3Client: cli, Bucket: bucket})
+	tgt, err := newS3Target(s3TargetConfig{S3Client: cli, S3Bucket: bucket})
 	if err != nil {
 		t.Fatalf("newS3Target: %v", err)
 	}
@@ -166,10 +166,15 @@ func TestS3Target_DeleteIdempotent(t *testing.T) {
 	}
 }
 
-// TestS3Target_ConcurrentPutsRespectSemaphore confirms the
-// MaxInflightRequests cap is observed under load. Counts the
-// peak in-flight count via callbacks installed around put.
-func TestS3Target_ConcurrentPutsRespectSemaphore(t *testing.T) {
+// TestS3Target_ConcurrentPutsSmokeTest exercises put/get under
+// load to verify the typed wrapper behaves under concurrent
+// goroutines. After the middleware refactor s3target itself no
+// longer enforces a semaphore (concurrency is capped at the
+// HTTP transport's MaxConnsPerHost on the wrapped client and at
+// the per-method FanOut pool size in the library); this test
+// just smoke-tests that 30 simultaneous PUTs against a raw
+// MinIO client all complete and round-trip cleanly.
+func TestS3Target_ConcurrentPutsSmokeTest(t *testing.T) {
 	cli, err := itShareMinio(t.Context())
 	if err != nil {
 		t.Fatalf("MinIO: %v", err)
@@ -177,9 +182,9 @@ func TestS3Target_ConcurrentPutsRespectSemaphore(t *testing.T) {
 	bucket := itNewBucket(t, cli)
 	const cap = 3
 	tgt, err := newS3Target(s3TargetConfig{
-		S3Client:            cli,
-		Bucket:              bucket,
-		MaxInflightRequests: cap,
+		S3Client:                    cli,
+		S3Bucket:                    bucket,
+		S3MaxConcurrentOpsPerMethod: cap,
 	})
 	if err != nil {
 		t.Fatalf("newS3Target: %v", err)
@@ -199,9 +204,7 @@ func TestS3Target_ConcurrentPutsRespectSemaphore(t *testing.T) {
 	}
 	wg.Wait()
 
-	// The semaphore cap is enforced by buffered-channel size, not
-	// observable directly without instrumenting acquire/release.
-	// Sanity-check by listing all expected keys came through.
+	// Verify all keys round-tripped successfully.
 	for i := range total {
 		key := fmt.Sprintf("data/%d", i)
 		if _, err := tgt.get(t.Context(), key); err != nil {

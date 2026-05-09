@@ -146,7 +146,7 @@ func RunOnce(ctx context.Context, cfg Config) (int, error) {
 }
 
 func runOnceWithMetrics(
-	ctx context.Context, r Config, m *Metrics,
+	ctx context.Context, r Config, m *metrics,
 ) (int, error) {
 	names := catalog.NewNames(r.SchemaName, r.TablePrefix)
 
@@ -250,9 +250,9 @@ func Run(ctx context.Context, cfg Config) error {
 // drainAll repeats RunOnce until a call assigns fewer than
 // BatchSize rows. Returns the total assigned and the first
 // error encountered (which short-circuits the drain). Reuses
-// one *Metrics across calls so the assigned counter and
+// one *metrics across calls so the assigned counter and
 // lock_wait histogram aggregate across the whole drain.
-func drainAll(ctx context.Context, cfg Config, m *Metrics) (int, error) {
+func drainAll(ctx context.Context, cfg Config, m *metrics) (int, error) {
 	total := 0
 	r := cfg.resolved()
 	for {

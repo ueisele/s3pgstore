@@ -6,15 +6,18 @@
 //
 // Environment variables:
 //
-//	S3PGSTORE_DATABASE_URL              PostgreSQL DSN (required)
-//	S3PGSTORE_BUCKET                    S3 bucket (required)
-//	S3PGSTORE_S3_PREFIX                 S3 prefix (default "")
-//	S3PGSTORE_S3_ENDPOINT               Optional non-AWS endpoint
-//	S3PGSTORE_S3_REGION                 AWS region (default "us-east-1")
-//	S3PGSTORE_S3_MAX_INFLIGHT_REQUESTS  Cap simultaneous S3 requests (default 32)
-//	S3PGSTORE_SCHEMA                    Schema name (default "public")
-//	S3PGSTORE_TABLE_PREFIX              Table prefix (default "s3pgstore_")
-//	S3PGSTORE_PARTITION_KEY_PARTS       Comma-separated parts (required)
+//	S3PGSTORE_DATABASE_URL                       PostgreSQL DSN (required)
+//	S3PGSTORE_S3_BUCKET                          S3 bucket (required)
+//	S3PGSTORE_S3_PREFIX                          S3 prefix (default "")
+//	S3PGSTORE_S3_ENDPOINT                        Optional non-AWS endpoint
+//	S3PGSTORE_S3_REGION                          AWS region (default "us-east-1")
+//	S3PGSTORE_S3_MAX_OPEN_CONNECTIONS            Cap concurrent TCP connections to S3 (default 64)
+//	S3PGSTORE_S3_MAX_RETRY_ATTEMPTS              SDK retry budget per S3 op, 1 + retries (default 5)
+//	S3PGSTORE_S3_MAX_REQUESTS_PER_SECOND         Pre-throttle outgoing S3 ops to this rate (default 0 = unlimited)
+//	S3PGSTORE_S3_MAX_REQUESTS_PER_SECOND_BURST   Token bucket burst (default = max(1, rate*0.1))
+//	S3PGSTORE_SCHEMA                             Schema name (default "public")
+//	S3PGSTORE_TABLE_PREFIX                       Table prefix (default "s3pgstore_")
+//	S3PGSTORE_PARTITION_KEY_PARTS                Comma-separated parts (required)
 //
 // Telemetry (opt-in; see cmd/internal/otelinit for details):
 //
@@ -47,9 +50,10 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/ueisele/s3pgstore/cmd/internal/otelinit"
-	"github.com/ueisele/s3pgstore/cmd/internal/s3client"
+	"github.com/ueisele/s3pgstore/internal/s3client"
 )
 
 func main() {
@@ -65,9 +69,9 @@ func run() error {
 	if dsn == "" {
 		return errors.New("S3PGSTORE_DATABASE_URL is required")
 	}
-	bucket := os.Getenv("S3PGSTORE_BUCKET")
+	bucket := os.Getenv("S3PGSTORE_S3_BUCKET")
 	if bucket == "" {
-		return errors.New("S3PGSTORE_BUCKET is required")
+		return errors.New("S3PGSTORE_S3_BUCKET is required")
 	}
 	partsRaw := os.Getenv("S3PGSTORE_PARTITION_KEY_PARTS")
 	if partsRaw == "" {
@@ -82,7 +86,7 @@ func run() error {
 	}
 
 	cfg := RebuildConfig{
-		Bucket:            bucket,
+		S3Bucket:          bucket,
 		S3Prefix:          os.Getenv("S3PGSTORE_S3_PREFIX"),
 		SchemaName:        getenvOr("S3PGSTORE_SCHEMA", "public"),
 		TablePrefix:       getenvOr("S3PGSTORE_TABLE_PREFIX", "s3pgstore_"),
@@ -93,15 +97,11 @@ func run() error {
 		syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	_, otelShutdown, err := otelinit.Setup(ctx,
+	meter, otelShutdown, err := otelinit.Setup(ctx,
 		"s3pgstore-rebuild")
 	if err != nil {
 		return fmt.Errorf("otel setup: %w", err)
 	}
-	// RebuildConfig has no Meter field today (rebuild's
-	// internals aren't instrumented yet), but installing the
-	// global provider via otelinit.Setup means any future
-	// instrumentation flows through automatically.
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(
 			context.Background(), 5*time.Second)
@@ -118,7 +118,11 @@ func run() error {
 	defer pool.Close()
 	cfg.Pool = pool
 
-	s3Client, err := loadS3Client(ctx)
+	// Threading meter through loadS3Client wires the
+	// dashboard's s3pgstore.s3.{request,attempt.error,body_size,
+	// ratelimit.wait,tcp.connections,connection.reuse}
+	// instruments to fire over the multi-hour DR run.
+	s3Client, err := loadS3Client(ctx, meter)
 	if err != nil {
 		return err
 	}
@@ -127,7 +131,7 @@ func run() error {
 	slog.Info("s3pgstore-rebuild starting",
 		"schema", cfg.SchemaName,
 		"prefix", cfg.TablePrefix,
-		"bucket", cfg.Bucket,
+		"bucket", cfg.S3Bucket,
 		"s3_prefix", cfg.S3Prefix,
 		"partition_key_parts", cfg.PartitionKeyParts)
 
@@ -141,21 +145,67 @@ func run() error {
 	return nil
 }
 
-func loadS3Client(ctx context.Context) (*s3.Client, error) {
-	maxInflight, err := envInt("S3PGSTORE_S3_MAX_INFLIGHT_REQUESTS")
+func loadS3Client(
+	ctx context.Context, meter metric.Meter,
+) (*s3.Client, error) {
+	maxOpen, err := envIntNonNeg(
+		"S3PGSTORE_S3_MAX_OPEN_CONNECTIONS")
 	if err != nil {
 		return nil, err
 	}
-	if maxInflight < 0 {
-		return nil, fmt.Errorf(
-			"S3PGSTORE_S3_MAX_INFLIGHT_REQUESTS %d: must be >= 0",
-			maxInflight)
+	maxAttempts, err := envIntNonNeg(
+		"S3PGSTORE_S3_MAX_RETRY_ATTEMPTS")
+	if err != nil {
+		return nil, err
+	}
+	maxRPS, err := envFloatNonNeg(
+		"S3PGSTORE_S3_MAX_REQUESTS_PER_SECOND")
+	if err != nil {
+		return nil, err
+	}
+	maxBurst, err := envIntNonNeg(
+		"S3PGSTORE_S3_MAX_REQUESTS_PER_SECOND_BURST")
+	if err != nil {
+		return nil, err
 	}
 	return s3client.BuildS3Client(ctx, s3client.Options{
-		Region:              os.Getenv("S3PGSTORE_S3_REGION"),
-		Endpoint:            os.Getenv("S3PGSTORE_S3_ENDPOINT"),
-		MaxInflightRequests: maxInflight,
+		Region:                    os.Getenv("S3PGSTORE_S3_REGION"),
+		Endpoint:                  os.Getenv("S3PGSTORE_S3_ENDPOINT"),
+		MaxOpenConnections:        maxOpen,
+		MaxRetryAttempts:          maxAttempts,
+		MaxRequestsPerSecond:      maxRPS,
+		MaxRequestsPerSecondBurst: maxBurst,
+		Meter:                     meter,
 	})
+}
+
+// envIntNonNeg parses a non-negative int env var. Empty → 0.
+func envIntNonNeg(key string) (int, error) {
+	n, err := envInt(key)
+	if err != nil {
+		return 0, err
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("%s %d: must be >= 0", key, n)
+	}
+	return n, nil
+}
+
+// envFloatNonNeg parses a non-negative float env var.
+// Empty → 0.
+func envFloatNonNeg(key string) (float64, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return 0, nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s %q: %w", key, v, err)
+	}
+	if f < 0 {
+		return 0, fmt.Errorf("%s %g: must be >= 0", key, f)
+	}
+	return f, nil
 }
 
 // envInt parses an env var as int. Returns (0, nil) when unset.

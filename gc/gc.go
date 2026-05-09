@@ -41,11 +41,11 @@ const (
 )
 
 // Config captures the operator-facing knobs. The zero value is
-// not valid — Pool, S3Client, and Bucket are required.
+// not valid — Pool, S3Client, and S3Bucket are required.
 type Config struct {
 	Pool     *pgxpool.Pool
 	S3Client *s3.Client
-	Bucket   string
+	S3Bucket string
 
 	// SchemaName / TablePrefix mirror the writer's
 	// s3pgstore.Config and must match. Defaults are filled in
@@ -101,8 +101,8 @@ func (c Config) validate() error {
 	if c.S3Client == nil {
 		return errors.New("gc.Config: S3Client is required")
 	}
-	if c.Bucket == "" {
-		return errors.New("gc.Config: Bucket is required")
+	if c.S3Bucket == "" {
+		return errors.New("gc.Config: S3Bucket is required")
 	}
 	return nil
 }
@@ -131,7 +131,7 @@ func RunOnce(ctx context.Context, cfg Config) (int, error) {
 }
 
 func runOnceWithMetrics(
-	ctx context.Context, r Config, m *Metrics,
+	ctx context.Context, r Config, m *metrics,
 ) (int, error) {
 	names := catalog.NewNames(r.SchemaName, r.TablePrefix)
 
@@ -245,7 +245,7 @@ func reclaimOne(
 	names catalog.Names, s3Key string,
 ) error {
 	if _, err := cfg.S3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(cfg.Bucket),
+		Bucket: aws.String(cfg.S3Bucket),
 		Key:    aws.String(s3Key),
 	}); err != nil {
 		return fmt.Errorf("S3 DELETE %s: %w", s3Key, err)

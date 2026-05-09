@@ -38,8 +38,8 @@ import (
 type RebuildConfig struct {
 	Pool              *pgxpool.Pool
 	S3Client          *s3.Client
-	Bucket            string
-	S3Prefix          string // matches the writer's Config.Prefix
+	S3Bucket          string
+	S3Prefix          string // matches the writer's Config.S3Prefix
 	SchemaName        string
 	TablePrefix       string
 	PartitionKeyParts []string
@@ -102,7 +102,7 @@ func Rebuild(
 	names := catalog.NewNames(cfg.SchemaName, cfg.TablePrefix)
 
 	dataPrefix := dataPrefixOf(cfg.S3Prefix)
-	keys, err := listAllKeys(ctx, cfg.S3Client, cfg.Bucket, dataPrefix)
+	keys, err := listAllKeys(ctx, cfg.S3Client, cfg.S3Bucket, dataPrefix)
 	if err != nil {
 		return RebuildResult{}, fmt.Errorf("LIST: %w", err)
 	}
@@ -171,8 +171,8 @@ func validateRebuildConfig(cfg RebuildConfig) error {
 		return errors.New("rebuild: Pool is required")
 	case cfg.S3Client == nil:
 		return errors.New("rebuild: S3Client is required")
-	case cfg.Bucket == "":
-		return errors.New("rebuild: Bucket is required")
+	case cfg.S3Bucket == "":
+		return errors.New("rebuild: S3Bucket is required")
 	case cfg.SchemaName == "":
 		return errors.New("rebuild: SchemaName is required")
 	case cfg.TablePrefix == "":
@@ -313,7 +313,7 @@ func insertFileRow(
 	fallbackVersion int64,
 ) (int64, bool, error) {
 	head, err := cfg.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(cfg.Bucket),
+		Bucket: aws.String(cfg.S3Bucket),
 		Key:    aws.String(s3Key),
 	})
 	if err != nil {

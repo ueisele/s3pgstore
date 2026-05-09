@@ -617,7 +617,7 @@ type streamState struct {
 	slotCh        chan struct{}
 	byteWake      chan struct{}
 	firstHardErr  error
-	m             *Metrics
+	m             *metrics
 
 	// lastProgressNs is the wall-clock timestamp (UnixNano) of
 	// the most recent forward-progress event in the pipeline:

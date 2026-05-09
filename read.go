@@ -159,8 +159,9 @@ func (o withReadAheadBytesOpt) applyRead(opts *readOpts) {
 // Single SQL query against s3pgstore_files (no per-file
 // filtering, no LIMIT — every file row for every matched
 // partition comes back, per CLAUDE.md). For each partition,
-// files are fetched in parallel from S3 (capped by the
-// target's MaxInflightRequests semaphore), decoded, and
+// files are fetched in parallel from S3 (capped by
+// Config.S3MaxConcurrentOpsPerMethod inside this Read call,
+// and globally by Config.S3MaxOpenConnections), decoded, and
 // concatenated; dedup runs once per partition.
 //
 // Empty filters slice returns (nil, nil) — no partitions
@@ -348,23 +349,21 @@ func (s *Store[T]) selectFileRows(
 }
 
 // fetchAndDecode pulls every parquet file in files from S3 in
-// parallel (capped by the s3target's MaxInflightRequests
-// semaphore plus fanOut's worker pool), decodes each into
-// []T, and concatenates the partition's records in s3_key lex
-// order.
+// parallel via a fanOut goroutine pool sized to
+// Config.S3MaxConcurrentOpsPerMethod, decodes each into []T,
+// and concatenates the partition's records in s3_key lex order.
 //
 // Lex ordering matters for dedup tie-break (last wins on
 // equal max version, per CLAUDE.md). The caller pre-sorted
 // files by s3_key in the SELECT; per-index result slots
 // preserve that order while parallelising the GETs.
 //
-// Concurrency is bounded by the s3target's effective
-// MaxInflightRequests so worker count matches the parallelism
-// the target itself would tolerate — beyond that, extra
-// goroutines just queue on the target's semaphore. fanOut's
-// shared-cancel ctx propagates first-error-wins through the
-// target's retry loop, so a failing GET unwinds in-flight
-// siblings instead of running them to completion.
+// The global TCP-connection cap (Config.S3MaxOpenConnections)
+// is enforced one level down by the wrapped s3.Client's HTTP
+// transport. fanOut's shared-cancel ctx propagates
+// first-error-wins through the SDK's adaptive-retry loop, so a
+// failing GET unwinds in-flight siblings instead of running
+// them to completion.
 func (s *Store[T]) fetchAndDecode(
 	ctx context.Context, files []fileRow,
 ) ([]T, error) {

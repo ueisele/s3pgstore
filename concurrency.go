@@ -42,8 +42,8 @@ type fanOutObserver func(ctx context.Context, items, workers int)
 // worker count even when len(items) is large. Matters for
 // nested fan-out (e.g. write partitions × MV inserts per
 // partition) where the older one-goroutine-per-item shape could
-// spawn N×K goroutines that mostly parked on the per-target
-// MaxInflightRequests semaphore inside s3target.put.
+// spawn N×K goroutines that mostly parked waiting for an HTTP
+// transport socket (capped by Config.S3MaxOpenConnections).
 //
 // Error semantics: the first real (non-cancellation) error wins
 // and cancels the rest. context.Canceled errors from siblings

@@ -23,8 +23,8 @@ type readRec struct {
 func newReadCfg(f *fixture) s3pgstore.Config[readRec] {
 	return s3pgstore.Config[readRec]{
 		Executor:          s3pgstore.NewPoolExecutor(f.Pool),
-		Bucket:            f.Bucket,
-		Prefix:            "billing",
+		S3Bucket:          f.Bucket,
+		S3Prefix:          "billing",
 		S3Client:          f.S3Client,
 		SchemaName:        f.Schema,
 		PartitionKeyParts: []string{"charge_period", "customer"},

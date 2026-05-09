@@ -22,7 +22,7 @@ func (stubExecutor) DetachTx(ctx context.Context) context.Context    { return ct
 func validConfig() Config[map[string]any] {
 	return Config[map[string]any]{
 		Executor:          stubExecutor{},
-		Bucket:            "bucket",
+		S3Bucket:          "bucket",
 		S3Client:          &s3.Client{},
 		PartitionKeyParts: []string{"period", "customer"},
 		PartitionKeyOf:    func(map[string]any) string { return "k" },
@@ -43,8 +43,8 @@ func TestConfigValidate_RequiresExecutor(t *testing.T) {
 
 func TestConfigValidate_RequiresBucket(t *testing.T) {
 	cfg := validConfig()
-	cfg.Bucket = ""
-	requireErrContains(t, cfg.validate(), "Bucket is required")
+	cfg.S3Bucket = ""
+	requireErrContains(t, cfg.validate(), "S3Bucket is required")
 }
 
 func TestConfigValidate_RequiresS3Client(t *testing.T) {
@@ -53,19 +53,44 @@ func TestConfigValidate_RequiresS3Client(t *testing.T) {
 	requireErrContains(t, cfg.validate(), "S3Client is required")
 }
 
-func TestConfigValidate_MaxInflightS3RequestsRejectsNegative(t *testing.T) {
+func TestConfigValidate_S3MaxOpenConnectionsRejectsNegative(t *testing.T) {
 	cfg := validConfig()
-	cfg.MaxInflightS3Requests = -1
+	cfg.S3MaxOpenConnections = -1
 	requireErrContains(t, cfg.validate(),
-		"MaxInflightS3Requests -1 must be >= 0")
+		"S3MaxOpenConnections -1 must be >= 0")
 }
 
-func TestConfigValidate_MaxInflightS3RequestsZeroOK(t *testing.T) {
+func TestConfigValidate_S3MaxConcurrentOpsPerMethodRejectsNegative(t *testing.T) {
 	cfg := validConfig()
-	cfg.MaxInflightS3Requests = 0 // sentinel for "use library default"
+	cfg.S3MaxConcurrentOpsPerMethod = -1
+	requireErrContains(t, cfg.validate(),
+		"S3MaxConcurrentOpsPerMethod -1 must be >= 0")
+}
+
+func TestConfigValidate_S3KnobsZeroOK(t *testing.T) {
+	cfg := validConfig()
+	cfg.S3MaxOpenConnections = 0        // sentinel for "use default"
+	cfg.S3MaxConcurrentOpsPerMethod = 0 // sentinel for "use default"
+	cfg.S3MaxRetryAttempts = 0          // sentinel for "use default"
+	cfg.S3MaxRequestsPerSecond = 0      // sentinel for "no rate limit"
+	cfg.S3MaxRequestBurst = 0           // sentinel for "10% of rate"
 	if err := cfg.validate(); err != nil {
-		t.Fatalf("zero should be accepted (library default), got %v", err)
+		t.Fatalf("zeros should be accepted (library defaults), got %v", err)
 	}
+}
+
+func TestConfigValidate_S3MaxRequestsPerSecondRejectsNegative(t *testing.T) {
+	cfg := validConfig()
+	cfg.S3MaxRequestsPerSecond = -1
+	requireErrContains(t, cfg.validate(),
+		"S3MaxRequestsPerSecond -1 must be >= 0")
+}
+
+func TestConfigValidate_S3MaxRequestBurstRejectsNegative(t *testing.T) {
+	cfg := validConfig()
+	cfg.S3MaxRequestBurst = -1
+	requireErrContains(t, cfg.validate(),
+		"S3MaxRequestBurst -1 must be >= 0")
 }
 
 func TestConfigValidate_RequiresPartitionKeyParts(t *testing.T) {

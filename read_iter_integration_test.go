@@ -25,8 +25,8 @@ type iterRec struct {
 func newIterCfg(f *fixture) s3pgstore.Config[iterRec] {
 	return s3pgstore.Config[iterRec]{
 		Executor:          s3pgstore.NewPoolExecutor(f.Pool),
-		Bucket:            f.Bucket,
-		Prefix:            "iter",
+		S3Bucket:          f.Bucket,
+		S3Prefix:          "iter",
 		S3Client:          f.S3Client,
 		SchemaName:        f.Schema,
 		PartitionKeyParts: []string{"customer"},

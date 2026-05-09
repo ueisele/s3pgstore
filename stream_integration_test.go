@@ -22,8 +22,8 @@ type streamRec struct {
 func newStreamCfg(f *fixture) s3pgstore.Config[streamRec] {
 	return s3pgstore.Config[streamRec]{
 		Executor:          s3pgstore.NewPoolExecutor(f.Pool),
-		Bucket:            f.Bucket,
-		Prefix:            "stream",
+		S3Bucket:          f.Bucket,
+		S3Prefix:          "stream",
 		S3Client:          f.S3Client,
 		SchemaName:        f.Schema,
 		PartitionKeyParts: []string{"customer"},

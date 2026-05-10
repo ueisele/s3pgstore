@@ -30,43 +30,6 @@ type WriteResult struct {
 	UncompressedSize int64
 }
 
-// WriteOption is the interface implemented by Write
-// modifiers. Phase 5 ships no options — they're added in
-// Phase 7 (idempotency, OCC) and Phase 8 (metadata). The
-// type exists now so the API surface stays stable.
-type WriteOption interface {
-	applyWrite(*writeOpts)
-}
-
-// writeOpts is the resolved option bag passed down the write
-// path. Fields are per-call; the zero value is the
-// no-token / no-OCC / no-metadata default.
-type writeOpts struct {
-	idempotencyToken     *string
-	idempotencyTokenOf   func() (string, error)
-	idempotencyTokenOfFn func(records any) (string, error)
-	expectedVersionSet   bool
-	expectedVersion      int64
-	metadata             map[string]any
-}
-
-func (s *Store[T]) resolveWriteOpts(opts ...WriteOption) (writeOpts, error) {
-	var o writeOpts
-	for _, opt := range opts {
-		opt.applyWrite(&o)
-	}
-	if o.idempotencyToken != nil && o.idempotencyTokenOfFn != nil {
-		return writeOpts{}, errors.New(
-			"WithIdempotencyToken and " +
-				"WithIdempotencyTokenOf are mutually exclusive")
-	}
-	if err := validateMetadata(o.metadata,
-		s.resolved.ExtensionColumns); err != nil {
-		return writeOpts{}, err
-	}
-	return o, nil
-}
-
 // Write groups records by PartitionKeyOf, encodes one parquet
 // file per group, and inserts the catalog rows. Returns a
 // WriteResult per partition in lex order of partition key.

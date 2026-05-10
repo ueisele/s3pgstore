@@ -7,6 +7,54 @@ import "errors"
 // version doesn't match. Callers compose with errors.Is.
 var ErrVersionConflict = errors.New("version conflict")
 
+// errMixedTypeIdempotencyTokenOf would only fire when a
+// caller manages to pass a WithIdempotencyTokenOf opt
+// constructed for one T to a Store of another T — the type
+// system makes that hard but not impossible (e.g. via
+// reflection or build-tag tomfoolery), so the runtime check
+// is here as a safety net.
+//
+//nolint:gochecknoglobals // sentinel
+var errMixedTypeIdempotencyTokenOf = errors.New(
+	"WithIdempotencyTokenOf type mismatch")
+
+// WriteOption is the interface implemented by Write
+// modifiers. Phase 5 ships no options — they're added in
+// Phase 7 (idempotency, OCC) and Phase 8 (metadata). The
+// type exists now so the API surface stays stable.
+type WriteOption interface {
+	applyWrite(*writeOpts)
+}
+
+// writeOpts is the resolved option bag passed down the write
+// path. Fields are per-call; the zero value is the
+// no-token / no-OCC / no-metadata default.
+type writeOpts struct {
+	idempotencyToken     *string
+	idempotencyTokenOf   func() (string, error)
+	idempotencyTokenOfFn func(records any) (string, error)
+	expectedVersionSet   bool
+	expectedVersion      int64
+	metadata             map[string]any
+}
+
+func (s *Store[T]) resolveWriteOpts(opts ...WriteOption) (writeOpts, error) {
+	var o writeOpts
+	for _, opt := range opts {
+		opt.applyWrite(&o)
+	}
+	if o.idempotencyToken != nil && o.idempotencyTokenOfFn != nil {
+		return writeOpts{}, errors.New(
+			"WithIdempotencyToken and " +
+				"WithIdempotencyTokenOf are mutually exclusive")
+	}
+	if err := validateMetadata(o.metadata,
+		s.resolved.ExtensionColumns); err != nil {
+		return writeOpts{}, err
+	}
+	return o, nil
+}
+
 // WithIdempotencyToken returns a WriteOption that tags the
 // write with token for retry-safe idempotency. Retries with
 // the same (partition_key, token) pair return the original
@@ -103,14 +151,3 @@ func (o expectedVersionOpt) applyWrite(opts *writeOpts) {
 	opts.expectedVersionSet = true
 	opts.expectedVersion = o.version
 }
-
-// errMixedTypeIdempotencyTokenOf would only fire when a
-// caller manages to pass a WithIdempotencyTokenOf opt
-// constructed for one T to a Store of another T — the type
-// system makes that hard but not impossible (e.g. via
-// reflection or build-tag tomfoolery), so the runtime check
-// is here as a safety net.
-//
-//nolint:gochecknoglobals // sentinel
-var errMixedTypeIdempotencyTokenOf = errors.New(
-	"WithIdempotencyTokenOf type mismatch")

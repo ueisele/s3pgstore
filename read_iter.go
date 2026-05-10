@@ -407,33 +407,30 @@ func (s *Store[T]) downloadAndDecodeIter(
 	// downloadAndDecodeIter returns.
 	//
 	// On any pool task error, the task fn calls recordHardErr
-	// (cancelling state.ctx with the wrapped err as cause) before
-	// markComplete. gctx is derived from state.ctx, so it
-	// auto-cancels too — submitter sees gctx done in
+	// (cancelling state.ctx with the wrapped err as cause)
+	// before markComplete. gctx is derived from state.ctx, so
+	// it auto-cancels too — submitter sees gctx done in
 	// acquireBodySlot, sibling tasks observe gctx done in
 	// s.target.get. Files past the submitter's exit point are
 	// deliberately NOT markComplete'd; their partitions' done
 	// channels would block waitForPartition forever, except
-	// state.ctx is cancelled (by the failing task or the
-	// parent), so waitForPartition's ctx.Done branch fires and
-	// the decoder forwards hardErr (= context.Cause(state.ctx)).
+	// state.ctx is cancelled, so waitForPartition's ctx.Done
+	// branch fires and the decoder forwards hardErr
+	// (= context.Cause(state.ctx)).
 	//
-	// recordHardErr on g.Wait err covers the case where every
-	// task succeeded but the parent ctx was cancelled
-	// (Group.Wait returns parentCtx.Err() in that case): the
-	// task fn never had an err to record, the submitter's
-	// cancel-detected path may not have fired (if all
-	// submissions were already in flight), so without this the
-	// decoder might see state.ctx auto-cancelled by parent
-	// with no in-tree cause set explicitly. recordHardErr is
-	// idempotent so it harmlessly no-ops when state.ctx was
-	// already cancelled by an in-flight task.
+	// We don't need to recordHardErr g.Wait's return value:
+	// for any non-nil g.Wait result, state.ctx is already
+	// cancelled with the appropriate cause — either by the
+	// failing task itself (task error path) or by parent
+	// propagation (all-success-then-parent-cancel path). The
+	// g.Wait call exists purely to drain in-flight tasks
+	// before the submitter goroutine exits, so wg.Wait sees
+	// all pool work complete before downloadAndDecodeIter
+	// returns and the streamState is dropped.
 	g, gctx := s.resolved.WorkerPool.WithContext(state.ctx)
 	wg.Go(func() {
 		s.runDownloadSubmitter(gctx, g, state)
-		if err := g.Wait(); err != nil {
-			state.recordHardErr(err)
-		}
+		_ = g.Wait()
 	})
 	// No cancel-broadcast helper goroutine: every blocking
 	// primitive in streamState (slotCh acquire, partState.done
@@ -543,46 +540,38 @@ func (s *Store[T]) preparePartitions(
 			})
 		}
 
-		ps := &partState{
+		// byPartition only emits non-empty buckets (every insert
+		// is append, so len(files) >= 1), so we can construct
+		// partState directly without an empty-files defense.
+		parts = append(parts, &partState{
 			partitionKey: k,
 			files:        files,
 			version:      version,
 			exts:         exts,
 			bodies:       make([][]byte, len(files)),
 			done:         make(chan struct{}),
-		}
-		// Defensive: byPartition only emits non-empty buckets, so
-		// len(files) == 0 should be unreachable here. Pre-close
-		// for safety so a future caller path that constructs an
-		// empty partition can't deadlock the decoder.
-		if len(files) == 0 {
-			close(ps.done)
-		}
-		parts = append(parts, ps)
+		})
 	}
 	return parts
 }
 
 // partState holds per-partition download progress. partitionKey,
 // files, version, and exts are fixed at preparePartitions time;
-// bodies + completed are mutated by downloaders under
+// bodies + completed are mutated by pool tasks under
 // streamState.mu.
 //
 // done is a per-partition completion signal. markComplete closes
-// it under streamState.mu when the final file lands;
-// waitForPartition selects on it (plus ctx.Done) so the decoder
-// observes both completion and cancellation natively without a
-// cond.Broadcast helper. Closed exactly once: the
-// completed == len(files) edge is reached at most once because
-// each downloader marks each file at most once and the close
-// happens inside the same critical section that increments
-// completed.
+// it when the final file lands; waitForPartition selects on it
+// (plus state.ctx.Done) so the decoder observes both completion
+// and cancellation natively without a cond.Broadcast helper.
+// Closed exactly once: the completed == len(files) edge is
+// reached at most once because each downloader marks each file
+// at most once and the increment is mutex-protected, so only
+// one goroutine sees the final increment.
 //
-// No per-file errors slice — runDownloader records hard errors
-// on streamState.firstHardErr (single source of truth for the
-// decoder); cascade ctx.Canceled from acquire-cancel is
-// intentionally swallowed (it's not a "real" error, just the
-// pipeline shutting down).
+// No per-file errors slice — pool tasks call recordHardErr to
+// cancel state.ctx with the wrapped err as cause; the decoder
+// receives that cause via waitForPartition's return value.
 type partState struct {
 	partitionKey string
 	files        []fileRow
@@ -718,18 +707,11 @@ func (s *streamState) recordHardErr(err error) {
 	s.cancel(err)
 }
 
-// hardErr returns the cause that aborted the pipeline, or nil
-// if state.ctx is still alive. Reads via context.Cause, which
-// is set atomically with the close of state.ctx.Done — any
-// goroutine that observes state.ctx done is guaranteed to read
-// a non-nil cause here.
-func (s *streamState) hardErr() error {
-	return context.Cause(s.ctx)
-}
-
 // acquireBodySlot reserves one slot in the compressed-body
 // pool. Blocks while the pool is full and ctx is alive. Returns
-// false if ctx is cancelled while waiting.
+// nil on successful acquire; non-nil error (= context.Cause(ctx))
+// when ctx is cancelled while waiting — caller can use the
+// returned error directly without a separate hardErr lookup.
 //
 // The pool counts compressed parquet bodies that downloaders
 // have stored into per-partition slots and the decoder has not
@@ -751,24 +733,24 @@ func (s *streamState) hardErr() error {
 // succeeded — cancel-during-wait is intentionally not recorded
 // (shutdown noise, near-zero duration would drown out the
 // saturation signal).
-func (s *streamState) acquireBodySlot(ctx context.Context) bool {
+func (s *streamState) acquireBodySlot(ctx context.Context) error {
 	if s.slotCh == nil {
-		return ctx.Err() == nil
+		return context.Cause(ctx)
 	}
 	// Non-blocking fast path: slot available, no wait
 	// observation.
 	select {
 	case s.slotCh <- struct{}{}:
-		return true
+		return nil
 	default:
 	}
 	waitStart := time.Now()
 	select {
 	case s.slotCh <- struct{}{}:
 		s.m.recordIterBodySlotWait(ctx, time.Since(waitStart))
-		return true
+		return nil
 	case <-ctx.Done():
-		return false
+		return context.Cause(ctx)
 	}
 }
 
@@ -787,12 +769,13 @@ func (s *streamState) releaseBodySlots(n int) {
 	s.lastProgressNs.Store(time.Now().UnixNano())
 }
 
-// markComplete is the downloader-side update: store the body in
+// markComplete is the pool-task-side update: store the body in
 // the partition's slot, increment completed, and close the
 // partition's done channel when the final file lands. body is
-// nil for hard errors and acquire-cancel — the decoder skips
-// nil bodies in decodePartition and surfaces hard errors via
-// streamState.firstHardErr.
+// nil for hard errors — the decoder will see waitForPartition
+// return non-nil (because the failing task called recordHardErr
+// before this markComplete, cancelling state.ctx) and forward
+// that cause to the consumer.
 //
 // The completed == len(files) edge is reached at most once
 // across concurrent downloaders because each file is marked
@@ -821,41 +804,37 @@ func (s *streamState) markComplete(
 }
 
 // waitForPartition blocks until every file in partition pi has
-// been downloaded (success or error) or ctx is cancelled.
-// Returns true if the partition fully completed; false only
-// when ctx fired before completion.
+// been downloaded OR ctx is cancelled. Returns nil iff the
+// partition completed AND ctx is still alive at return time;
+// non-nil error (= context.Cause(ctx)) otherwise.
 //
-// Note the asymmetry with ctx: a partition that finishes at
-// roughly the same instant ctx fires still returns true so the
-// decoder can inspect streamState.firstHardErr and surface a
-// hard error that triggered our own cancel(). Without this, a
-// NoSuchKey race could close decodedCh without forwarding the
-// error. The non-blocking precheck on p.done preserves this
-// asymmetry — Go's select among ready cases is uniform-random,
-// so the precheck pattern (same shape as sendBatch) prefers
-// completion over cancellation when both are observable.
+// The post-condition (nil ⇒ ctx alive) is load-bearing: it
+// folds in the "did a sibling task error during our wait?"
+// check the decoder used to do separately. recordHardErr
+// always precedes markComplete (CLAUDE.md "Multi-goroutine
+// pipelines unify cancel + abort reason"), so when p.done
+// closes for a partition that has any nil body, state.ctx is
+// already cancelled. Returning the cause here lets the decoder
+// forward it without an extra hardErr lookup; without it, the
+// decoder could silently emit a partial PartitionResult (some
+// bodies present, some marked nil by failed tasks).
 func (s *streamState) waitForPartition(
 	ctx context.Context, pi int,
-) bool {
+) error {
 	p := s.parts[pi]
 	select {
 	case <-p.done:
-		return true
-	default:
-	}
-	select {
-	case <-p.done:
-		return true
 	case <-ctx.Done():
-		return false
 	}
+	return context.Cause(ctx)
 }
 
 // reserveBytes accounts uncomp bytes against the cap. Blocks
 // while bufferedBytes + uncomp would exceed cap AND the buffer
 // is non-empty; the empty-buffer escape lets a single oversized
 // partition through (otherwise the pipeline would deadlock).
-// Returns false if ctx is cancelled while waiting.
+// Returns nil on successful reservation; non-nil error
+// (= context.Cause(ctx)) when ctx is cancelled while waiting.
 //
 // Predicate-loop shape: lock, check, unlock, wait on byteWake
 // or ctx.Done, retry. Stale signals are harmless — only the
@@ -870,9 +849,9 @@ func (s *streamState) waitForPartition(
 // acquireBodySlot, cancel path is not recorded.
 func (s *streamState) reserveBytes(
 	ctx context.Context, uncomp, cap int64,
-) bool {
+) error {
 	if cap <= 0 || uncomp <= 0 {
-		return ctx.Err() == nil
+		return context.Cause(ctx)
 	}
 	var waitStart time.Time
 	waited := false
@@ -889,13 +868,13 @@ func (s *streamState) reserveBytes(
 			if waited {
 				s.m.recordIterByteBudgetWait(ctx, time.Since(waitStart))
 			}
-			return true
+			return nil
 		}
 		s.mu.Unlock()
-		if ctx.Err() != nil {
+		if err := context.Cause(ctx); err != nil {
 			// Cancel path: do not record — only successful
 			// reservations are observed.
-			return false
+			return err
 		}
 		if !waited {
 			waitStart = time.Now()
@@ -904,7 +883,7 @@ func (s *streamState) reserveBytes(
 		select {
 		case <-s.byteWake:
 		case <-ctx.Done():
-			return false
+			return context.Cause(ctx)
 		}
 	}
 }
@@ -969,25 +948,16 @@ func (s *Store[T]) runDownloadSubmitter(
 ) {
 	for pi := range state.parts {
 		for fi := range state.parts[pi].files {
-			if !state.acquireBodySlot(ctx) {
-				// Set hardErr BEFORE markComplete so the
-				// decoder, on observing this partition's done
-				// channel close, sees the cancel signal and
-				// bails before decoding a partition that may
-				// have a mix of present and nil bodies (would
-				// otherwise silently emit a partial
-				// PartitionResult). Both calls go through the
-				// same mu in streamState; close(p.done) happens
-				// after the markComplete unlock, so a decoder
-				// that observes p.done closed and then
-				// mu.Locks for hardErr is guaranteed to see
-				// the value we wrote here.
-				//
-				// recordHardErr is no-op if hardErr is already
-				// set — preserving "first task error wins"
-				// when an in-flight task errored before us.
-				state.recordHardErr(ctx.Err())
-				state.markComplete(pi, fi, nil)
+			if state.acquireBodySlot(ctx) != nil {
+				// state.ctx is already cancelled with a cause
+				// set (either parent propagation or a sibling
+				// task's recordHardErr — the failing task
+				// always cancels before returning to errgroup,
+				// so by the time gctx is done state.ctx is
+				// done too). The decoder will reach this
+				// partition's waitForPartition, observe ctx
+				// done, and forward hardErr — no need for us
+				// to markComplete or recordHardErr here.
 				return
 			}
 			key := state.parts[pi].files[fi].s3Key
@@ -1016,12 +986,17 @@ func (s *Store[T]) runDownloadSubmitter(
 // Sends each completed partition's records — or any hard error
 // captured anywhere in the pipeline — to decodedCh.
 //
-// Error precedence: streamState.hardErr() is the single source
-// of truth for hard download errors. The decoder checks it at
-// every partition boundary and on every cancel-aware exit
-// (waitForPartition / reserveBytes returning false). Per-file
-// errs in partState are not stored — the only signal a worker
-// records is hardErr.
+// Error precedence: context.Cause(state.ctx) is the single
+// source of truth for hard download errors, and the
+// wait/reserve helpers (waitForPartition, reserveBytes)
+// return that cause directly when they return non-nil. The
+// decoder forwards each non-nil err to the consumer. The
+// "is state.ctx done" check is folded into waitForPartition's
+// post-condition: a nil return guarantees both the partition
+// completed AND ctx is alive, so no extra pre/post checks are
+// needed around the wait. Per-file errs in partState are not
+// stored — the only signal a pool task records is via
+// recordHardErr.
 func (s *Store[T]) runDecoder(
 	ctx context.Context, state *streamState,
 	opts *readOpts, decodedCh chan<- decodedBatch[T],
@@ -1031,49 +1006,25 @@ func (s *Store[T]) runDecoder(
 		// Surface decoder position to the observer so a stalled
 		// pipeline's slog.Warn points at the right partition.
 		state.decoderPi.Store(int64(pi))
-		// Check before each partition: a worker on an already-
-		// completed partition may have recorded a hard error
-		// while we were decoding the previous one. Surface it
-		// before touching pi.
-		if err := state.hardErr(); err != nil {
-			sendBatch(ctx, decodedCh, decodedBatch[T]{err: err})
-			return
-		}
 
-		if !state.waitForPartition(ctx, pi) {
-			// ctx fired before pi finished. hardErr returns
-			// context.Cause(state.ctx), which is set
-			// atomically with the cancel: either the wrapped
-			// task err (pool task path), the parent's cause
-			// (parent cancel), or g.Wait's return (submitter
-			// goroutine). Always non-nil at this point because
-			// waitForPartition only returns false when ctx is
-			// done.
-			if err := state.hardErr(); err != nil {
-				sendBatch(ctx, decodedCh, decodedBatch[T]{err: err})
-			}
+		if err := state.waitForPartition(ctx, pi); err != nil {
+			// state.ctx fired (before pi finished, during the
+			// wait, or pi completed but a sibling task errored
+			// before we returned). The returned err is the
+			// cause set atomically with the cancel.
+			sendBatch(ctx, decodedCh, decodedBatch[T]{err: err})
 			return
 		}
 		ps := state.parts[pi]
-
-		// Re-check: a concurrent worker may have hit a hard
-		// error during the wait. Without this check the decoder
-		// would proceed to footerStats / decode of a partition
-		// whose firstHardErr is set, and the consumer would
-		// never see the real error.
-		if err := state.hardErr(); err != nil {
-			sendBatch(ctx, decodedCh, decodedBatch[T]{err: err})
-			return
-		}
 
 		// Parse footers once: exact uncompressed total for the
 		// byte budget AND total row count for pre-allocating
 		// the decoded slice. Missing files (nil body) contribute
 		// zero — but in s3pgstore the strict-error policy means
-		// any nil body is paired with a non-nil hardErr, which
-		// we already returned above. Defensive nil-skip here is
-		// for the cancel path where the producer never reached
-		// some files.
+		// any nil body is paired with a non-nil hardErr, and
+		// waitForPartition would have returned false above.
+		// Defensive nil-skip here is for the cancel path where
+		// the producer never reached some files.
 		uncomp, totalRows, err := footerStats(ps)
 		if err != nil {
 			sendBatch(ctx, decodedCh, decodedBatch[T]{err: err})
@@ -1083,10 +1034,8 @@ func (s *Store[T]) runDecoder(
 		// Gate on byte budget if configured. A single oversized
 		// partition still flows once the buffer is empty —
 		// otherwise the pipeline would deadlock.
-		if !state.reserveBytes(ctx, uncomp, opts.readAheadBytes) {
-			if err := state.hardErr(); err != nil {
-				sendBatch(ctx, decodedCh, decodedBatch[T]{err: err})
-			}
+		if err := state.reserveBytes(ctx, uncomp, opts.readAheadBytes); err != nil {
+			sendBatch(ctx, decodedCh, decodedBatch[T]{err: err})
 			return
 		}
 

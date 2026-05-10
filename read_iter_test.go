@@ -41,8 +41,8 @@ func (s *streamState) withSlotCap(cap int) *streamState {
 // immediately and does not touch bufferedBytes.
 func TestReserveBytes_NoCap(t *testing.T) {
 	s := newTestStreamState()
-	if !s.reserveBytes(context.Background(), 1<<30, 0) {
-		t.Fatal("reserveBytes with cap=0 should return true")
+	if err := s.reserveBytes(context.Background(), 1<<30, 0); err != nil {
+		t.Fatalf("reserveBytes with cap=0 should return nil, got %v", err)
 	}
 	if s.bufferedBytes != 0 {
 		t.Errorf("bufferedBytes = %d, want 0 (cap=0 should not reserve)",
@@ -54,8 +54,8 @@ func TestReserveBytes_NoCap(t *testing.T) {
 // cap and verifies the running total is updated.
 func TestReserveBytes_FitsImmediately(t *testing.T) {
 	s := newTestStreamState()
-	if !s.reserveBytes(context.Background(), 100, 1000) {
-		t.Fatal("reserveBytes should succeed when fits")
+	if err := s.reserveBytes(context.Background(), 100, 1000); err != nil {
+		t.Fatalf("reserveBytes should succeed when fits, got %v", err)
 	}
 	if s.bufferedBytes != 100 {
 		t.Errorf("bufferedBytes = %d, want 100", s.bufferedBytes)
@@ -67,13 +67,13 @@ func TestReserveBytes_FitsImmediately(t *testing.T) {
 // the first one is released.
 func TestReserveBytes_BlocksUntilRelease(t *testing.T) {
 	s := newTestStreamState()
-	if !s.reserveBytes(context.Background(), 700, 1000) {
-		t.Fatal("first reserve should succeed")
+	if err := s.reserveBytes(context.Background(), 700, 1000); err != nil {
+		t.Fatalf("first reserve should succeed, got %v", err)
 	}
 
 	done := make(chan struct{})
 	go func() {
-		s.reserveBytes(context.Background(), 500, 1000)
+		_ = s.reserveBytes(context.Background(), 500, 1000)
 		close(done)
 	}()
 
@@ -103,8 +103,8 @@ func TestReserveBytes_BlocksUntilRelease(t *testing.T) {
 // partition would deadlock the pipeline).
 func TestReserveBytes_OversizedSinglePartitionFlows(t *testing.T) {
 	s := newTestStreamState()
-	if !s.reserveBytes(context.Background(), 2000, 1000) {
-		t.Fatal("oversized reserve into empty buffer should succeed")
+	if err := s.reserveBytes(context.Background(), 2000, 1000); err != nil {
+		t.Fatalf("oversized reserve into empty buffer should succeed, got %v", err)
 	}
 	if s.bufferedBytes != 2000 {
 		t.Errorf("bufferedBytes = %d, want 2000", s.bufferedBytes)
@@ -112,17 +112,17 @@ func TestReserveBytes_OversizedSinglePartitionFlows(t *testing.T) {
 }
 
 // TestReserveBytes_CtxCancellation guards that a blocked
-// reservation returns false when ctx is cancelled — needed so
-// the pipeline can shut down cleanly when the caller breaks
-// out of the iter loop.
+// reservation returns the cancel cause when ctx is cancelled —
+// needed so the pipeline can shut down cleanly when the caller
+// breaks out of the iter loop.
 func TestReserveBytes_CtxCancellation(t *testing.T) {
 	s := newTestStreamState()
-	if !s.reserveBytes(context.Background(), 700, 1000) {
-		t.Fatal("first reserve should succeed")
+	if err := s.reserveBytes(context.Background(), 700, 1000); err != nil {
+		t.Fatalf("first reserve should succeed, got %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	got := make(chan bool, 1)
+	got := make(chan error, 1)
 	go func() {
 		got <- s.reserveBytes(ctx, 500, 1000)
 	}()
@@ -132,9 +132,9 @@ func TestReserveBytes_CtxCancellation(t *testing.T) {
 	cancel()
 
 	select {
-	case ok := <-got:
-		if ok {
-			t.Error("reserveBytes should have returned false on ctx cancel")
+	case err := <-got:
+		if err == nil {
+			t.Error("reserveBytes should have returned a cancel err")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("reserveBytes did not return after ctx cancel")
@@ -147,16 +147,16 @@ func TestReserveBytes_CtxCancellation(t *testing.T) {
 func TestAcquireBodySlot_BlocksUntilRelease(t *testing.T) {
 	s := newTestStreamState().withSlotCap(2)
 
-	if !s.acquireBodySlot(context.Background()) {
-		t.Fatal("first acquire should succeed")
+	if err := s.acquireBodySlot(context.Background()); err != nil {
+		t.Fatalf("first acquire should succeed, got %v", err)
 	}
-	if !s.acquireBodySlot(context.Background()) {
-		t.Fatal("second acquire should succeed")
+	if err := s.acquireBodySlot(context.Background()); err != nil {
+		t.Fatalf("second acquire should succeed, got %v", err)
 	}
 
 	done := make(chan struct{})
 	go func() {
-		s.acquireBodySlot(context.Background())
+		_ = s.acquireBodySlot(context.Background())
 		close(done)
 	}()
 	select {
@@ -177,12 +177,12 @@ func TestAcquireBodySlot_BlocksUntilRelease(t *testing.T) {
 	}
 }
 
-// TestAcquireBodySlot_NoCap returns true immediately when
+// TestAcquireBodySlot_NoCap returns nil immediately when
 // slotCh is nil (semaphore disabled — the test-helper path).
 func TestAcquireBodySlot_NoCap(t *testing.T) {
 	s := newTestStreamState()
-	if !s.acquireBodySlot(context.Background()) {
-		t.Fatal("acquireBodySlot with nil slotCh should return true")
+	if err := s.acquireBodySlot(context.Background()); err != nil {
+		t.Fatalf("acquireBodySlot with nil slotCh should return nil, got %v", err)
 	}
 	if s.slotCh != nil {
 		t.Errorf("slotCh = %v, want nil (no-cap path should not allocate)",
@@ -191,15 +191,15 @@ func TestAcquireBodySlot_NoCap(t *testing.T) {
 }
 
 // TestAcquireBodySlot_CtxCancellation guards that a blocked
-// acquire returns false when ctx is cancelled.
+// acquire returns the cancel cause when ctx is cancelled.
 func TestAcquireBodySlot_CtxCancellation(t *testing.T) {
 	s := newTestStreamState().withSlotCap(1)
-	if !s.acquireBodySlot(context.Background()) {
-		t.Fatal("first acquire should succeed")
+	if err := s.acquireBodySlot(context.Background()); err != nil {
+		t.Fatalf("first acquire should succeed, got %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	got := make(chan bool, 1)
+	got := make(chan error, 1)
 	go func() {
 		got <- s.acquireBodySlot(ctx)
 	}()
@@ -208,9 +208,9 @@ func TestAcquireBodySlot_CtxCancellation(t *testing.T) {
 	cancel()
 
 	select {
-	case ok := <-got:
-		if ok {
-			t.Error("acquireBodySlot should return false on ctx cancel")
+	case err := <-got:
+		if err == nil {
+			t.Error("acquireBodySlot should return a cancel err")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("acquireBodySlot did not return after ctx cancel")
@@ -371,7 +371,7 @@ func TestWaitForPartition_BlocksUntilComplete(t *testing.T) {
 		},
 	}
 
-	done := make(chan bool, 1)
+	done := make(chan error, 1)
 	go func() {
 		done <- s.waitForPartition(context.Background(), 0)
 	}()
@@ -387,9 +387,9 @@ func TestWaitForPartition_BlocksUntilComplete(t *testing.T) {
 	}
 
 	select {
-	case ok := <-done:
-		if !ok {
-			t.Error("waitForPartition should have returned true on completion")
+	case err := <-done:
+		if err != nil {
+			t.Errorf("waitForPartition should have returned nil on completion, got %v", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("waitForPartition did not return after completion")

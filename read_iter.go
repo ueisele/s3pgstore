@@ -355,8 +355,6 @@ func (s *Store[T]) downloadAndDecodeIter(
 		return
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
-
 	// bodyCap bounds the per-call in-memory compressed-body
 	// footprint: the submitter blocks on acquireBodySlot once
 	// cap slots are held; the decoder releases slots as it nils
@@ -377,7 +375,15 @@ func (s *Store[T]) downloadAndDecodeIter(
 		}
 	}
 
+	// state.ctx is the single cancellation source for every
+	// stage. WithCancelCause propagates the parent's cause
+	// automatically and lets us attach an abort reason
+	// atomically with our own cancels — see streamState's
+	// type comment for the rationale.
+	stateCtx, cancel := context.WithCancelCause(ctx)
 	state := &streamState{
+		ctx:      stateCtx,
+		cancel:   cancel,
 		parts:    parts,
 		slotCh:   make(chan struct{}, bodyCap),
 		byteWake: make(chan struct{}, 1),
@@ -387,10 +393,11 @@ func (s *Store[T]) downloadAndDecodeIter(
 	// One WaitGroup covers every helper goroutine so the deferred
 	// cleanup below can cancel ctx and then wait for everything to
 	// drain before returning — no orphaned goroutines, no leaked
-	// state.
+	// state. cancel(context.Canceled) is a no-op if some other
+	// path already set the cause; only the first cancel sticks.
 	var wg sync.WaitGroup
 	defer func() {
-		cancel()
+		cancel(context.Canceled)
 		wg.Wait()
 	}()
 
@@ -399,46 +406,41 @@ func (s *Store[T]) downloadAndDecodeIter(
 	// exiting so all in-flight pool tasks drain before
 	// downloadAndDecodeIter returns.
 	//
-	// On any pool task error, the pool's errgroup cancels gctx.
-	// The submitter sees that on its next acquireBodySlot and
-	// exits early; in-flight tasks observe gctx.Done in
-	// s.target.get and bail. Files past the submitter's exit
-	// point — including the rest of the current partition and
-	// every later partition — are deliberately NOT
-	// markComplete'd. Their partitions' done channels would
-	// block waitForPartition forever, except we cancel the
-	// outer ctx below so waitForPartition's ctx.Done branch
-	// fires and the decoder forwards the hardErr that the
-	// failing pool task recorded. Old design called the outer
-	// cancel from inside the downloader on each hard err; the
-	// new design routes the same signal via g.Wait()'s return
-	// value (errgroup gives us the first task error; we just
-	// translate it into an outer-ctx cancel).
+	// On any pool task error, the task fn calls recordHardErr
+	// (cancelling state.ctx with the wrapped err as cause) before
+	// markComplete. gctx is derived from state.ctx, so it
+	// auto-cancels too — submitter sees gctx done in
+	// acquireBodySlot, sibling tasks observe gctx done in
+	// s.target.get. Files past the submitter's exit point are
+	// deliberately NOT markComplete'd; their partitions' done
+	// channels would block waitForPartition forever, except
+	// state.ctx is cancelled (by the failing task or the
+	// parent), so waitForPartition's ctx.Done branch fires and
+	// the decoder forwards hardErr (= context.Cause(state.ctx)).
 	//
-	// recordHardErr on g.Wait err covers the case where
-	// every task succeeded but the parent ctx was cancelled
-	// (Group.Wait returns parentCtx.Err() in that case): no
-	// task recorded a hardErr, the submitter's cancel-detected
-	// path may not have fired (if all submissions were
-	// already in flight), so without this the decoder might
-	// see an outer-ctx-cancel with hardErr nil and exit
-	// silently. With this, the consumer always sees a
-	// context.Canceled (or the wrapped task error) when the
-	// pipeline exits abnormally.
-	g, gctx := s.resolved.WorkerPool.WithContext(ctx)
+	// recordHardErr on g.Wait err covers the case where every
+	// task succeeded but the parent ctx was cancelled
+	// (Group.Wait returns parentCtx.Err() in that case): the
+	// task fn never had an err to record, the submitter's
+	// cancel-detected path may not have fired (if all
+	// submissions were already in flight), so without this the
+	// decoder might see state.ctx auto-cancelled by parent
+	// with no in-tree cause set explicitly. recordHardErr is
+	// idempotent so it harmlessly no-ops when state.ctx was
+	// already cancelled by an in-flight task.
+	g, gctx := s.resolved.WorkerPool.WithContext(state.ctx)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		s.runDownloadSubmitter(gctx, g, state)
 		if err := g.Wait(); err != nil {
 			state.recordHardErr(err)
-			cancel()
 		}
 	}()
 	// No cancel-broadcast helper goroutine: every blocking
 	// primitive in streamState (slotCh acquire, partState.done
-	// wait, byteWake bell) selects on ctx.Done() natively. See
-	// CLAUDE.md "Concurrency invariants".
+	// wait, byteWake bell) selects on state.ctx.Done() natively.
+	// See CLAUDE.md "Concurrency invariants".
 
 	// Stage 2: decoder. Channel cap = readAheadPartitions so the
 	// pipeline buffers up to N decoded partitions ahead. The
@@ -455,7 +457,7 @@ func (s *Store[T]) downloadAndDecodeIter(
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		s.runDecoder(ctx, state, opts, decodedCh)
+		s.runDecoder(state.ctx, state, opts, decodedCh)
 	}()
 
 	// Stall watchdog. Pure observer — surfaces deadlocks
@@ -465,7 +467,7 @@ func (s *Store[T]) downloadAndDecodeIter(
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		state.runDeadlockObserver(ctx, method,
+		state.runDeadlockObserver(state.ctx, method,
 			stallTickInterval, stallThreshold)
 	}()
 
@@ -603,6 +605,26 @@ type partState struct {
 // byte-budget signal channels used to coordinate across stages
 // (download completion, decoded-byte release).
 //
+// ctx + cancel form the single cancellation source for every
+// stage of the pipeline. Built via context.WithCancelCause from
+// the parent ctx so that:
+//
+//   - Parent cancellation auto-propagates with its cause
+//     intact (consumer's ctx.Cause is what the iter surfaces).
+//   - recordHardErr cancels ctx with the abort reason as cause,
+//     atomically with the close of ctx.Done — any goroutine
+//     that observes ctx.Done and reads context.Cause(ctx) is
+//     guaranteed to see the cause (no race between cancel and
+//     err-read).
+//   - First cancel wins; subsequent cancels are no-ops, so
+//     "first hard err wins" semantics are preserved.
+//
+// Replaces the earlier two-channel design (firstHardErr field
+// + outer ctx) where the cancel signal and the cause were set
+// independently and a parent-ctx cancel could race the
+// recordHardErr write, leaving the decoder reading a nil
+// firstHardErr after observing ctx.Done.
+//
 // slotCh is the body-slot semaphore, a buffered channel with
 // cap = bodyCap. Senders that find the buffer full park in the
 // channel's sendq, which the Go runtime drains FIFO on every
@@ -628,14 +650,6 @@ type partState struct {
 // bufferedBytes can only stay the same or decrease while the
 // decoder is parked.
 //
-// firstHardErr holds the first non-cancellation error a
-// downloader hit (NoSuchKey, hard transport). Set once via
-// recordHardErr just before cancel() fires so the decoder can
-// surface it on its way out — without it, the decoder's
-// waitForPartition / reserveBytes returning false on ctx.Done
-// would terminate the pipeline silently and the caller would
-// observe (partial records, nil error).
-//
 // m is the optional metrics handle. acquireBodySlot and
 // reserveBytes report wait duration via
 // metrics.recordIterBodySlotWait /
@@ -644,12 +658,14 @@ type partState struct {
 // contention. Cancel-during-wait is not recorded (shutdown
 // noise).
 type streamState struct {
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+
 	mu            sync.Mutex
 	parts         []*partState
 	bufferedBytes int64
 	slotCh        chan struct{}
 	byteWake      chan struct{}
-	firstHardErr  error
 	m             *metrics
 
 	// lastProgressNs is the wall-clock timestamp (UnixNano) of
@@ -668,30 +684,53 @@ type streamState struct {
 	decoderPi atomic.Int64
 }
 
-// recordHardErr stores the first non-cancellation download
-// error the pipeline hit so the decoder can forward it before
-// exiting on ctx.Done. Subsequent calls are no-ops — the first
-// error wins. Caller is responsible for invoking cancel()
-// afterwards to halt the rest of the pipeline.
+// recordHardErr cancels state.ctx with cause = err. First call
+// sets the cause; subsequent calls are no-ops (cancel is
+// idempotent and only the first cause sticks). Used by:
+//
+//   - pool task error path: surfaces the wrapped GET err to
+//     the consumer.
+//   - submitter cancel-detected path: defensive — state.ctx is
+//     already cancelled by whoever cancelled it (parent or a
+//     sibling task), so this is a no-op but documents intent.
+//   - submitter goroutine after g.Wait: covers the case where
+//     g.Wait returned an err that no in-tree path recorded
+//     (e.g., parent cancel during in-flight tasks).
+//
+// Cancel is immediate. Listeners on state.ctx (decoder,
+// watchdog, in-flight pool tasks via gctx, submitter via gctx)
+// observe ctx.Done as soon as the first hard err is recorded.
+//
+// This is load-bearing for partial-body protection: ordering
+// recordHardErr BEFORE markComplete in the pool task fn means
+// any observer that sees p.done close (markComplete's tail
+// effect) is guaranteed to subsequently observe state.ctx done
+// and read the cause via hardErr — no decoder can silently
+// emit a partition with mixed present/nil bodies.
+//
+// Trade-off: a decoder that's mid-decode of partition K-1
+// when recordHardErr fires for partition K may have its
+// sendBatch racing the cancel. If decodedCh is full (slow
+// consumer), K-1's batch may be dropped instead of emitted.
+// In practice decodedCh is usually drained promptly by the
+// emit loop, so K-1 lands. The trade is intentional —
+// surfacing the abort reason quickly and reliably is more
+// important than guaranteeing one extra batch on slow
+// consumers.
 func (s *streamState) recordHardErr(err error) {
 	if err == nil {
 		return
 	}
-	s.mu.Lock()
-	if s.firstHardErr == nil {
-		s.firstHardErr = err
-	}
-	s.mu.Unlock()
+	s.cancel(err)
 }
 
-// hardErr returns the first hard download error recorded via
-// recordHardErr, or nil if none. Read by the decoder on cancel
-// paths so a NoSuchKey or hard transport error surfaces even
-// when ctx fired before the decoder reached its partition.
+// hardErr returns the cause that aborted the pipeline, or nil
+// if state.ctx is still alive. Reads via context.Cause, which
+// is set atomically with the close of state.ctx.Done — any
+// goroutine that observes state.ctx done is guaranteed to read
+// a non-nil cause here.
 func (s *streamState) hardErr() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.firstHardErr
+	return context.Cause(s.ctx)
 }
 
 // acquireBodySlot reserves one slot in the compressed-body
@@ -761,10 +800,13 @@ func (s *streamState) releaseBodySlots(n int) {
 // nil bodies in decodePartition and surfaces hard errors via
 // streamState.firstHardErr.
 //
-// The close happens inside the same critical section that
-// increments completed, so the "completed == len(files)" edge
-// is reached at most once even under concurrent downloaders —
-// each file is marked exactly once by exactly one downloader.
+// The completed == len(files) edge is reached at most once
+// across concurrent downloaders because each file is marked
+// exactly once and the increment is mutex-protected — only one
+// goroutine sees the counter hit len(files), so close(p.done)
+// runs exactly once. The close itself is intentionally outside
+// the critical section so we don't hold mu across the
+// channel-close runtime call.
 //
 // Bumps lastProgressNs after the mutex is released so
 // runDeadlockObserver observes a fresh timestamp on every
@@ -1005,9 +1047,14 @@ func (s *Store[T]) runDecoder(
 		}
 
 		if !state.waitForPartition(ctx, pi) {
-			// ctx fired before pi finished — either a worker
-			// recorded a hard error and called cancel (forward
-			// it) or the consumer cancelled (exit cleanly).
+			// ctx fired before pi finished. hardErr returns
+			// context.Cause(state.ctx), which is set
+			// atomically with the cancel: either the wrapped
+			// task err (pool task path), the parent's cause
+			// (parent cancel), or g.Wait's return (submitter
+			// goroutine). Always non-nil at this point because
+			// waitForPartition only returns false when ctx is
+			// done.
 			if err := state.hardErr(); err != nil {
 				sendBatch(ctx, decodedCh, decodedBatch[T]{err: err})
 			}

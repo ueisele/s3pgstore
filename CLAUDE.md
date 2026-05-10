@@ -332,6 +332,45 @@ coordinate. Properties recent regressions in s3store taught us
   Refactors must not weaken the marker check or strip the
   ctx marker on the worker path.
 
+- **Multi-goroutine pipelines unify cancel + abort reason via
+  `context.WithCancelCause`.** When a pipeline has multiple
+  goroutines that need to coordinate shutdown AND the consumer
+  needs to know WHY shutdown happened (a recorded hard error,
+  a parent ctx cancel, a deadline), construct one per-call ctx
+  via `context.WithCancelCause(parent)`, store it on the
+  pipeline's state struct, and have every stage listen on it.
+  The "record an error" helper (`recordHardErr` in the iter
+  pipeline) calls `cancel(err)` so the abort reason is set
+  atomically with the close of `ctx.Done()`. Reads happen via
+  `context.Cause(ctx)` — guaranteed non-nil at any site
+  reached because a ctx-aware select returned false. First
+  cancel wins; subsequent cancels are no-ops, preserving
+  errgroup-style "first error wins" semantics.
+
+  The alternative (a separate mutex-protected err field plus
+  an unrelated cancel signal) introduces a race: the cancel
+  propagates through Go's runtime via channel close, racing in
+  parallel with the err-field write, so an observer of
+  `ctx.Done` may read a still-nil err and surface a silent
+  termination instead of the real reason. Parent cancellation
+  is the case where this race fires reliably — there's no
+  in-tree code path between the parent's cancel and the
+  derived ctx's done firing.
+
+  Load-bearing ordering: when `recordHardErr` precedes a
+  state-mutation that another goroutine waits on (e.g.,
+  closing a per-partition `done` channel after `markComplete`),
+  the cancel-plus-cause set by `recordHardErr` becomes visible
+  to that other goroutine at the same time it observes the
+  state mutation. The iter pipeline relies on this to prevent
+  a decoder from silently emitting a partial PartitionResult
+  whose mid-flight files were marked nil by the failing task.
+
+  `streamState.ctx` (in `read_iter.go`) is the canonical
+  example. Refactors that introduce a similar multi-goroutine
+  pipeline must use this shape rather than reintroduce a
+  parallel err field + cancel design.
+
 # Backend assumptions
 
 Properties of PostgreSQL and S3 that the library's correctness

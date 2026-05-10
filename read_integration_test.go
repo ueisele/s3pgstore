@@ -14,7 +14,6 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/ueisele/s3pgstore"
-	"github.com/ueisele/s3pgstore/sequencer"
 )
 
 // readRec carries an entity key + version field so dedup
@@ -467,18 +466,6 @@ func newIterStore(t *testing.T, f *fixture) *s3pgstore.Store[iterRec] {
 	return store
 }
 
-func runIterSequencer(t *testing.T, f *fixture) {
-	t.Helper()
-	if _, err := sequencer.RunOnce(t.Context(), sequencer.Config{
-		Pool:        f.Pool,
-		SchemaName:  f.Schema,
-		TablePrefix: "s3pgstore_",
-		BatchSize:   1000,
-	}); err != nil {
-		t.Fatalf("sequencer.RunOnce: %v", err)
-	}
-}
-
 // TestReadIter_MatchesRead verifies ReadIter yields the same
 // record set in the same order as Read for the same filters.
 func TestReadIter_MatchesRead(t *testing.T) {
@@ -700,10 +687,10 @@ func TestReadRangeIter_UnboundedReturnsAll(t *testing.T) {
 	}
 }
 
-// TestReadFileRefsIter_DecodesPolledEntries: poll → filter →
-// decode round-trip. Confirms ReadFileRefsIter correctly
-// decodes the parquet bodies pointed to by Poll output.
-func TestReadFileRefsIter_DecodesPolledEntries(t *testing.T) {
+// TestReadFileRefsIter_DecodesResolvedEntries: resolve → decode
+// round-trip. Confirms ReadFileRefsIter correctly decodes the
+// parquet bodies pointed to by ResolveFileRefs output.
+func TestReadFileRefsIter_DecodesResolvedEntries(t *testing.T) {
 	f := newFixture(t)
 	store := newIterStore(t, f)
 
@@ -713,14 +700,17 @@ func TestReadFileRefsIter_DecodesPolledEntries(t *testing.T) {
 			t.Fatalf("Write: %v", err)
 		}
 	}
-	runIterSequencer(t, f)
 
-	entries, _, err := store.Poll(t.Context(), 0, 100)
+	entries, err := store.ResolveFileRefs(t.Context(),
+		[]s3pgstore.PartitionFilter{
+			s3pgstore.In("customer", "alice", "bob", "carol"),
+		})
 	if err != nil {
-		t.Fatalf("Poll: %v", err)
+		t.Fatalf("ResolveFileRefs: %v", err)
 	}
 	if len(entries) != 3 {
-		t.Fatalf("Poll: got %d entries, want 3", len(entries))
+		t.Fatalf("ResolveFileRefs: got %d entries, want 3",
+			len(entries))
 	}
 
 	got := []int64{}
@@ -776,11 +766,13 @@ func TestReadPartitionFileRefsIter_GroupsByKey(t *testing.T) {
 			t.Fatalf("Write: %v", err)
 		}
 	}
-	runIterSequencer(t, f)
 
-	entries, _, err := store.Poll(t.Context(), 0, 100)
+	entries, err := store.ResolveFileRefs(t.Context(),
+		[]s3pgstore.PartitionFilter{
+			s3pgstore.In("customer", "alice", "bob"),
+		})
 	if err != nil {
-		t.Fatalf("Poll: %v", err)
+		t.Fatalf("ResolveFileRefs: %v", err)
 	}
 
 	parts := []string{}

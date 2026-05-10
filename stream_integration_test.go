@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -70,7 +71,7 @@ func TestPoll_Empty(t *testing.T) {
 	f := newFixture(t)
 	store := newStreamStore(t, f)
 
-	entries, next, err := store.Poll(t.Context(), 0, 100)
+	entries, next, err := store.Poll(t.Context(), 0, s3pgstore.OffsetLatest)
 	if err != nil {
 		t.Fatalf("Poll: %v", err)
 	}
@@ -101,8 +102,8 @@ func TestPoll_BasicWalk(t *testing.T) {
 	}
 	runSequencerSync(t, f)
 
-	// Batch 1: offsets 1, 2.
-	b1, next1, err := store.Poll(t.Context(), 0, 2)
+	// Batch 1: offsets 1, 2 — half-open range [0, 3).
+	b1, next1, err := store.Poll(t.Context(), 0, 3)
 	if err != nil {
 		t.Fatalf("Poll 1: %v", err)
 	}
@@ -113,16 +114,16 @@ func TestPoll_BasicWalk(t *testing.T) {
 		t.Errorf("batch 1 offsets: %d, %d (want 1, 2)",
 			b1[0].Offset, b1[1].Offset)
 	}
-	if next1 != 2 {
-		t.Errorf("next1: want 2, got %d", next1)
+	if next1 != 3 {
+		t.Errorf("next1: want 3 (max+1), got %d", next1)
 	}
 	// Extensions surfaces declared columns.
 	if got := b1[0].Extensions["job_id"]; got != "job-0" {
 		t.Errorf("Extensions[job_id]: got %v, want %q", got, "job-0")
 	}
 
-	// Batch 2: offsets 3, 4.
-	b2, next2, err := store.Poll(t.Context(), next1, 2)
+	// Batch 2: offsets 3, 4 — range [next1, next1+2) = [3, 5).
+	b2, next2, err := store.Poll(t.Context(), next1, next1+2)
 	if err != nil {
 		t.Fatalf("Poll 2: %v", err)
 	}
@@ -130,21 +131,22 @@ func TestPoll_BasicWalk(t *testing.T) {
 		t.Errorf("batch 2 offsets: %v (want [3, 4])",
 			[]int64{b2[0].Offset, b2[1].Offset})
 	}
-	if next2 != 4 {
-		t.Errorf("next2: want 4, got %d", next2)
+	if next2 != 5 {
+		t.Errorf("next2: want 5 (max+1), got %d", next2)
 	}
 
-	// Batch 3: tail (offset 5).
-	b3, next3, err := store.Poll(t.Context(), next2, 2)
+	// Batch 3: tail (offset 5) — range [5, 7).
+	b3, next3, err := store.Poll(t.Context(), next2, next2+2)
 	if err != nil {
 		t.Fatalf("Poll 3: %v", err)
 	}
-	if len(b3) != 1 || b3[0].Offset != 5 || next3 != 5 {
-		t.Errorf("batch 3: offsets=%v next=%d", b3, next3)
+	if len(b3) != 1 || b3[0].Offset != 5 || next3 != 6 {
+		t.Errorf("batch 3: offsets=%v next=%d (want next=6)",
+			b3, next3)
 	}
 
 	// Batch 4: empty, next unchanged.
-	b4, next4, err := store.Poll(t.Context(), next3, 2)
+	b4, next4, err := store.Poll(t.Context(), next3, next3+2)
 	if err != nil {
 		t.Fatalf("Poll 4: %v", err)
 	}
@@ -154,13 +156,13 @@ func TestPoll_BasicWalk(t *testing.T) {
 	}
 }
 
-// TestPoll_NonPositiveBatch verifies n <= 0 short-circuits to
+// TestPoll_EmptyRange verifies since == until short-circuits to
 // (nil, since, nil) without touching the database.
-func TestPoll_NonPositiveBatch(t *testing.T) {
+func TestPoll_EmptyRange(t *testing.T) {
 	f := newFixture(t)
 	store := newStreamStore(t, f)
 
-	entries, next, err := store.Poll(t.Context(), 42, 0)
+	entries, next, err := store.Poll(t.Context(), 42, 42)
 	if err != nil {
 		t.Fatalf("Poll: %v", err)
 	}
@@ -170,10 +172,25 @@ func TestPoll_NonPositiveBatch(t *testing.T) {
 	}
 }
 
-// TestPoll_WithUntilOffset_BoundsInclusive verifies the bound
-// is inclusive: a row whose feed_seq matches `until` is
-// returned.
-func TestPoll_WithUntilOffset_BoundsInclusive(t *testing.T) {
+// TestPoll_InvertedRange verifies since > until returns an
+// error (programmer mistake; easy to spot in tests).
+func TestPoll_InvertedRange(t *testing.T) {
+	f := newFixture(t)
+	store := newStreamStore(t, f)
+
+	_, _, err := store.Poll(t.Context(), 100, 50)
+	if err == nil {
+		t.Fatal("Poll: want error for since > until, got nil")
+	}
+	if !strings.Contains(err.Error(), "since") ||
+		!strings.Contains(err.Error(), "until") {
+		t.Errorf("error text: %v", err)
+	}
+}
+
+// TestPoll_UntilExclusive verifies the upper bound is exclusive:
+// a row whose feed_seq exactly equals `until` is NOT returned.
+func TestPoll_UntilExclusive(t *testing.T) {
 	f := newFixture(t)
 	store := newStreamStore(t, f)
 
@@ -185,19 +202,51 @@ func TestPoll_WithUntilOffset_BoundsInclusive(t *testing.T) {
 	}
 	runSequencerSync(t, f)
 
-	// Bound at offset 3 — should return offsets 1, 2, 3
-	// (feed_seq <= 3).
-	entries, next, err := store.Poll(t.Context(), 0, 100,
-		s3pgstore.WithUntilOffset(3))
+	// Range [0, 4) — should return offsets 1, 2, 3 (NOT 4).
+	entries, next, err := store.Poll(t.Context(), 0, 4)
 	if err != nil {
 		t.Fatalf("Poll: %v", err)
 	}
 	if len(entries) != 3 {
-		t.Errorf("entries with WithUntilOffset(3): got %d, want 3",
+		t.Errorf("entries in [0, 4): got %d, want 3 (1,2,3)",
 			len(entries))
 	}
-	if next != 3 {
-		t.Errorf("next: got %d, want 3", next)
+	if next != 4 {
+		t.Errorf("next: got %d, want 4", next)
+	}
+}
+
+// TestPoll_OffsetLatest verifies OffsetEarliest + OffsetLatest
+// together drain the entire feed: OffsetEarliest is the
+// inclusive lower-bound sentinel (= 1, the lowest live offset),
+// OffsetLatest drops the upper-bound clause.
+func TestPoll_OffsetLatest(t *testing.T) {
+	f := newFixture(t)
+	store := newStreamStore(t, f)
+
+	for i := range 4 {
+		if _, err := store.Write(t.Context(),
+			[]streamRec{{ID: fmt.Sprintf("c%d", i)}}); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	runSequencerSync(t, f)
+
+	entries, next, err := store.Poll(t.Context(),
+		s3pgstore.OffsetEarliest, s3pgstore.OffsetLatest)
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if len(entries) != 4 {
+		t.Errorf("entries with [OffsetEarliest, OffsetLatest): "+
+			"got %d, want 4", len(entries))
+	}
+	if entries[0].Offset != s3pgstore.OffsetEarliest {
+		t.Errorf("first offset: got %d, want OffsetEarliest (%d)",
+			entries[0].Offset, s3pgstore.OffsetEarliest)
+	}
+	if next != 5 {
+		t.Errorf("next: got %d, want 5 (max+1)", next)
 	}
 }
 
@@ -216,22 +265,32 @@ func TestPollRecords_DecodesAllAndOrders(t *testing.T) {
 	}
 	runSequencerSync(t, f)
 
-	records, next, err := store.PollRecords(t.Context(), 0, 100)
+	results, next, err := store.PollRecords(t.Context(), 0,
+		s3pgstore.OffsetLatest)
 	if err != nil {
 		t.Fatalf("PollRecords: %v", err)
 	}
-	if len(records) != 4 {
-		t.Fatalf("records: got %d, want 4", len(records))
+	if len(results) != 4 {
+		t.Fatalf("results: got %d, want 4", len(results))
 	}
-	if next != 4 {
-		t.Errorf("next: got %d, want 4", next)
+	if next != 5 {
+		t.Errorf("next: got %d, want 5 (max+1)", next)
 	}
 	// Each file is a single record; order is by feed_seq which
 	// is by written_at order (and we wrote sequentially).
-	for i, r := range records {
-		if r.Value != int64(i) {
-			t.Errorf("records[%d].Value: got %d, want %d",
-				i, r.Value, i)
+	for i, fr := range results {
+		if len(fr.Records) != 1 {
+			t.Fatalf("results[%d]: %d records, want 1",
+				i, len(fr.Records))
+		}
+		if fr.Records[0].Value != int64(i) {
+			t.Errorf("results[%d].Records[0].Value: got %d, want %d",
+				i, fr.Records[0].Value, i)
+		}
+		// File metadata carries through.
+		if fr.File.Offset != int64(i+1) {
+			t.Errorf("results[%d].File.Offset: got %d, want %d",
+				i, fr.File.Offset, i+1)
 		}
 	}
 }
@@ -241,13 +300,14 @@ func TestPollRecords_Empty(t *testing.T) {
 	f := newFixture(t)
 	store := newStreamStore(t, f)
 
-	records, next, err := store.PollRecords(t.Context(), 0, 100)
+	results, next, err := store.PollRecords(t.Context(), 0,
+		s3pgstore.OffsetLatest)
 	if err != nil {
 		t.Fatalf("PollRecords: %v", err)
 	}
-	if len(records) != 0 || next != 0 {
-		t.Errorf("got (%d records, next=%d), want (0, 0)",
-			len(records), next)
+	if len(results) != 0 || next != 0 {
+		t.Errorf("got (%d results, next=%d), want (0, 0)",
+			len(results), next)
 	}
 }
 
@@ -266,11 +326,11 @@ func TestPoll_ReplayFromZeroIsStable(t *testing.T) {
 	}
 	runSequencerSync(t, f)
 
-	first, _, err := store.Poll(t.Context(), 0, 100)
+	first, _, err := store.Poll(t.Context(), 0, s3pgstore.OffsetLatest)
 	if err != nil {
 		t.Fatalf("Poll 1: %v", err)
 	}
-	second, _, err := store.Poll(t.Context(), 0, 100)
+	second, _, err := store.Poll(t.Context(), 0, s3pgstore.OffsetLatest)
 	if err != nil {
 		t.Fatalf("Poll 2: %v", err)
 	}
@@ -300,7 +360,7 @@ func TestPoll_OnlyFeedSeqNotNullVisible(t *testing.T) {
 	}
 	// Don't run the sequencer.
 
-	entries, _, err := store.Poll(t.Context(), 0, 100)
+	entries, _, err := store.Poll(t.Context(), 0, s3pgstore.OffsetLatest)
 	if err != nil {
 		t.Fatalf("Poll: %v", err)
 	}
@@ -311,7 +371,7 @@ func TestPoll_OnlyFeedSeqNotNullVisible(t *testing.T) {
 
 	// After sequencer runs, the row appears.
 	runSequencerSync(t, f)
-	entries, _, err = store.Poll(t.Context(), 0, 100)
+	entries, _, err = store.Poll(t.Context(), 0, s3pgstore.OffsetLatest)
 	if err != nil {
 		t.Fatalf("Poll: %v", err)
 	}
@@ -420,27 +480,23 @@ func TestPoll_DrainToTipPattern(t *testing.T) {
 
 	now := time.Now()
 
-	// "Tip at now" — but our writes are all before now, so the
-	// proposal-style OffsetAt(now) returns 0 (no row at-or-
-	// after now). For the drain-to-tip example to work we
-	// take "tip = highest offset committed so far", which we
-	// emulate by passing a future time and walking until empty.
-	// More realistic: use OffsetAt slightly in the past so we
-	// pick up the highest feed_seq <= now. Easier: set
-	// WithUntilOffset to a high constant or skip it entirely
-	// for "drain everything." Test the no-bound form:
+	// Drain in batches of 3, walking [since, since+3) each call.
+	// Loop terminates when the call returns an empty result —
+	// `next` stays equal to `since` in that case.
 	consumed := 0
 	since := s3pgstore.Offset(0)
 	for {
-		entries, next, err := store.PollRecords(t.Context(),
-			since, 3)
+		results, next, err := store.PollRecords(t.Context(),
+			since, since+3)
 		if err != nil {
 			t.Fatalf("PollRecords: %v", err)
 		}
-		if len(entries) == 0 {
+		if len(results) == 0 {
 			break
 		}
-		consumed += len(entries)
+		for _, fr := range results {
+			consumed += len(fr.Records)
+		}
 		since = next
 	}
 	if consumed != 7 {
@@ -490,7 +546,7 @@ func TestPoll_BackgroundSequencerWakeUpAndCancel(t *testing.T) {
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		entries, _, err := store.Poll(t.Context(), 0, 10)
+		entries, _, err := store.Poll(t.Context(), 0, s3pgstore.OffsetLatest)
 		if err != nil {
 			t.Fatalf("Poll: %v", err)
 		}
@@ -499,7 +555,7 @@ func TestPoll_BackgroundSequencerWakeUpAndCancel(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	entries, _, err := store.Poll(t.Context(), 0, 10)
+	entries, _, err := store.Poll(t.Context(), 0, s3pgstore.OffsetLatest)
 	if err != nil {
 		t.Fatalf("Poll final: %v", err)
 	}
@@ -536,15 +592,16 @@ func TestPoll_OffsetOrderMatchesFeedSeq(t *testing.T) {
 	}
 	runSequencerSync(t, f)
 
-	entries, next, err := store.Poll(t.Context(), 0, 100)
+	entries, next, err := store.Poll(t.Context(), 0,
+		s3pgstore.OffsetLatest)
 	if err != nil {
 		t.Fatalf("Poll: %v", err)
 	}
 	if len(entries) != total {
 		t.Fatalf("got %d entries, want %d", len(entries), total)
 	}
-	if next != int64(total) {
-		t.Errorf("next: got %d, want %d", next, total)
+	if next != int64(total)+1 {
+		t.Errorf("next: got %d, want %d (max+1)", next, total+1)
 	}
 	offsets := make([]int64, len(entries))
 	for i, e := range entries {
@@ -564,7 +621,7 @@ func TestPoll_OffsetOrderMatchesFeedSeq(t *testing.T) {
 //
 // Coverage matrix:
 //
-//   - Write: every field except Offset (NoOffset until sequenced).
+//   - Write: every field except Offset (OffsetNone until sequenced).
 //   - Poll (after sequencing): every field including Offset.
 //   - LookupByToken (after sequencing): every field including
 //     Offset (the projection covers the full FileRef shape per
@@ -573,7 +630,7 @@ func TestPoll_OffsetOrderMatchesFeedSeq(t *testing.T) {
 // Cross-source comparison: FileID / PartitionKey / S3Key /
 // Version / WrittenAt / RecordCount / FileSize / UncompressedSize
 // / Extensions must be identical across all three sources.
-// Offset diverges only on Write (NoOffset) vs Poll/Lookup (the
+// Offset diverges only on Write (OffsetNone) vs Poll/Lookup (the
 // sequencer-assigned value).
 func TestFileRef_CrossSourceConsistency(t *testing.T) {
 	f := newFixture(t)
@@ -601,7 +658,7 @@ func TestFileRef_CrossSourceConsistency(t *testing.T) {
 	}
 	w := written[0]
 
-	// Write-side: every field populated, Offset is NoOffset.
+	// Write-side: every field populated, Offset is OffsetNone.
 	if w.FileID == 0 {
 		t.Errorf("Write FileID: want non-zero")
 	}
@@ -632,16 +689,16 @@ func TestFileRef_CrossSourceConsistency(t *testing.T) {
 		t.Errorf("Write Extensions[job_id]: got %v, want job-xyz",
 			got)
 	}
-	if w.Offset != s3pgstore.NoOffset {
-		t.Errorf("Write Offset: want NoOffset, got %d", w.Offset)
+	if w.Offset != s3pgstore.OffsetNone {
+		t.Errorf("Write Offset: want OffsetNone, got %d", w.Offset)
 	}
 
 	// Sequence so Poll has work to do.
 	runSequencerSync(t, f)
 
 	// Poll-side: same row should come back with everything
-	// matching, plus a non-NoOffset.
-	polled, _, err := store.Poll(t.Context(), 0, 100)
+	// matching, plus a non-OffsetNone.
+	polled, _, err := store.Poll(t.Context(), 0, s3pgstore.OffsetLatest)
 	if err != nil {
 		t.Fatalf("Poll: %v", err)
 	}
@@ -649,8 +706,8 @@ func TestFileRef_CrossSourceConsistency(t *testing.T) {
 		t.Fatalf("Poll returned %d FileRefs, want 1", len(polled))
 	}
 	p := polled[0]
-	if p.Offset == s3pgstore.NoOffset {
-		t.Errorf("Poll Offset: want non-NoOffset (sequenced), got 0")
+	if p.Offset == s3pgstore.OffsetNone {
+		t.Errorf("Poll Offset: want non-OffsetNone (sequenced), got 0")
 	}
 	assertSameRow(t, "Poll", w, p)
 
@@ -711,5 +768,152 @@ func assertSameRow(t *testing.T, source string, w, got s3pgstore.FileRef) {
 	if got.Extensions["job_id"] != w.Extensions["job_id"] {
 		t.Errorf("%s Extensions[job_id]: got %v, want %v",
 			source, got.Extensions["job_id"], w.Extensions["job_id"])
+	}
+}
+
+// TestPollRecordsIter_YieldsInFeedSeqOrder verifies the iter
+// pipeline emits one FileResult per file in feed_seq order,
+// with each result carrying both File metadata (Offset for
+// checkpoint) and decoded Records.
+func TestPollRecordsIter_YieldsInFeedSeqOrder(t *testing.T) {
+	f := newFixture(t)
+	store := newStreamStore(t, f)
+
+	const total = 6
+	for i := range total {
+		if _, err := store.Write(t.Context(),
+			[]streamRec{{ID: fmt.Sprintf("c%d", i), Value: int64(i)}}); err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+	}
+	runSequencerSync(t, f)
+
+	var (
+		count   int
+		lastOff s3pgstore.Offset
+	)
+	for fr, err := range store.PollRecordsIter(t.Context(), 0,
+		s3pgstore.OffsetLatest) {
+		if err != nil {
+			t.Fatalf("yield: %v", err)
+		}
+		count++
+		if fr.File.Offset <= lastOff {
+			t.Errorf("offset not monotonic: got %d after %d",
+				fr.File.Offset, lastOff)
+		}
+		lastOff = fr.File.Offset
+		if len(fr.Records) != 1 {
+			t.Errorf("file at offset %d: %d records, want 1",
+				fr.File.Offset, len(fr.Records))
+		}
+		// Value matches feed_seq - 1 (writes were sequential,
+		// Value=i where i=offset-1).
+		if fr.Records[0].Value != fr.File.Offset-1 {
+			t.Errorf("offset %d: Value %d, want %d",
+				fr.File.Offset, fr.Records[0].Value, fr.File.Offset-1)
+		}
+	}
+	if count != total {
+		t.Errorf("yielded %d files, want %d", count, total)
+	}
+}
+
+// TestPollRecordsIter_ResumeIdiom verifies the documented
+// resume pattern: track since = fr.File.Offset + 1 across
+// iterations, restart from there to continue.
+func TestPollRecordsIter_ResumeIdiom(t *testing.T) {
+	f := newFixture(t)
+	store := newStreamStore(t, f)
+
+	for i := range 5 {
+		if _, err := store.Write(t.Context(),
+			[]streamRec{{ID: fmt.Sprintf("c%d", i)}}); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	runSequencerSync(t, f)
+
+	// First iter: pull 2 files, then break.
+	var (
+		got       []s3pgstore.Offset
+		nextSince s3pgstore.Offset
+	)
+	for fr, err := range store.PollRecordsIter(t.Context(), 0,
+		s3pgstore.OffsetLatest) {
+		if err != nil {
+			t.Fatalf("yield: %v", err)
+		}
+		got = append(got, fr.File.Offset)
+		nextSince = fr.File.Offset + 1
+		if len(got) == 2 {
+			break
+		}
+	}
+	if len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Fatalf("first iter offsets: got %v, want [1, 2]", got)
+	}
+	if nextSince != 3 {
+		t.Fatalf("nextSince after 2 yields: got %d, want 3",
+			nextSince)
+	}
+
+	// Second iter resumes from nextSince and walks the rest.
+	got = got[:0]
+	for fr, err := range store.PollRecordsIter(t.Context(),
+		nextSince, s3pgstore.OffsetLatest) {
+		if err != nil {
+			t.Fatalf("yield (resume): %v", err)
+		}
+		got = append(got, fr.File.Offset)
+	}
+	if len(got) != 3 || got[0] != 3 || got[1] != 4 || got[2] != 5 {
+		t.Errorf("resume iter offsets: got %v, want [3, 4, 5]", got)
+	}
+}
+
+// TestPollRecordsIter_EmptyRange verifies since == until yields
+// nothing without touching the catalog.
+func TestPollRecordsIter_EmptyRange(t *testing.T) {
+	f := newFixture(t)
+	store := newStreamStore(t, f)
+
+	for fr, err := range store.PollRecordsIter(t.Context(), 5, 5) {
+		t.Errorf("unexpected yield: fr=%+v err=%v", fr, err)
+	}
+}
+
+// TestPollRecordsIter_OptionsApply verifies the WithPoll*
+// options compile and route through the pipeline. (Covers the
+// option plumbing; correctness of the underlying back-pressure
+// is exercised by the read pipeline's tests, which use the same
+// mechanisms.)
+func TestPollRecordsIter_OptionsApply(t *testing.T) {
+	f := newFixture(t)
+	store := newStreamStore(t, f)
+
+	for i := range 4 {
+		if _, err := store.Write(t.Context(),
+			[]streamRec{{ID: fmt.Sprintf("c%d", i)}}); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	runSequencerSync(t, f)
+
+	count := 0
+	for _, err := range store.PollRecordsIter(t.Context(), 0,
+		s3pgstore.OffsetLatest,
+		s3pgstore.WithPollFetchAheadFiles(2),
+		s3pgstore.WithPollDecodeWorkers(2),
+		s3pgstore.WithPollDecodeAheadFiles(1),
+		s3pgstore.WithPollDecodeAheadBytes(1<<20),
+	) {
+		if err != nil {
+			t.Fatalf("yield: %v", err)
+		}
+		count++
+	}
+	if count != 4 {
+		t.Errorf("yielded %d, want 4", count)
 	}
 }

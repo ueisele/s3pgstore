@@ -15,7 +15,7 @@ import (
 // file per group, and inserts the catalog rows. Returns a
 // FileRef per partition in lex order of partition key, fully
 // populated except for Offset — feed_seq is assigned by the
-// sequencer asynchronously, so the returned refs carry NoOffset.
+// sequencer asynchronously, so the returned refs carry OffsetNone.
 //
 // The empty input case (records=nil or empty) returns nil, nil
 // — no S3 PUTs, no catalog INSERTs.

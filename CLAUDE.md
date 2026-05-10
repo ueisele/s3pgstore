@@ -221,16 +221,15 @@ must preserve them — even when the change appears unrelated.
   load-bearing test, not a perf optimization (see Verification §
   Benchmarks).
 - **Deterministic emission order across read and write paths**
-  — every read path (`Read` / `ReadIter` / `ReadPartitionIter` /
+  — every Read path (`Read` / `ReadIter` / `ReadPartitionIter` /
   `ReadRangeIter` / `ReadPartitionRangeIter` / `ReadFileRefsIter`
-  / `ReadPartitionFileRefsIter` / `PollRecords`) and the
-  write-side partition grouping emit partitions in **lex order
-  of the partition-key string**, with per-partition records in
-  **`(entity, version)` ascending order** when dedup is
-  configured (decode/insertion order without it). Same input on
-  the same data produces byte-identical output every time.
-  Consumers may rely on this for diffing, hashing, replay
-  equality, and golden-file tests.
+  / `ReadPartitionFileRefsIter`) and the write-side partition
+  grouping emit partitions in **lex order of the partition-key
+  string**, with per-partition records in **`(entity, version)`
+  ascending order** when dedup is configured (decode/insertion
+  order without it). Same input on the same data produces
+  byte-identical output every time. Consumers may rely on this
+  for diffing, hashing, replay equality, and golden-file tests.
 
   The load-bearing pieces (named once they exist):
 
@@ -249,10 +248,32 @@ must preserve them — even when the change appears unrelated.
   Refactors must not introduce non-deterministic partition
   iteration, parallel-decode pipelines that race batch sends
   out of order, or non-stable record sorts inside a partition.
-  `PollRecords` consumers needing wall-clock ordering across
-  partitions must re-sort by their own timestamp field — its
-  next-offset advancement (the "don't miss records" property)
-  is unaffected.
+
+  **Poll paths emit in feed_seq order, not lex partition order.**
+  `Poll` / `PollRecords` / `PollRecordsIter` route through the
+  file-grain `pollFetchAndDecodeIter` pipeline, which preserves
+  the catalog SELECT's `ORDER BY feed_seq` (commit-time order
+  across partitions). This is the right shape for stream
+  consumers replaying events; the trade-off is that within a
+  Poll batch records do NOT group by partition. Consumers
+  needing wall-clock ordering re-sort by their own timestamp
+  field; consumers needing partition grouping use the Read
+  paths instead. The "don't miss records" property
+  (next-offset advancement) is the load-bearing Poll guarantee.
+
+- **Poll-side range convention is half-open `[since, until)`**
+  matching `ResolveFileRefsInRange`. `since` is the inclusive
+  lower bound (OffsetNone / 0 is safe; below every live offset);
+  `until` is the exclusive upper bound. `OffsetLatest` (-1) is
+  the sentinel meaning "no upper bound" — the SQL clause is
+  omitted and the read sees every committed sequenced row at
+  SELECT time. `next` is the highest seen offset + 1, suitable
+  for passing back as `since` on the next call (the +1 reflects
+  the inclusive-`since` convention; `feed_seq >= next` excludes
+  what we already saw). Refactors must not flip either bound's
+  inclusivity without a corresponding `next` adjustment, and
+  must not reintroduce a count-cap (`n`) parameter — the range
+  IS the cap.
 
 # Concurrency invariants
 

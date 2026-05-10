@@ -102,7 +102,7 @@ type PartitionResult[T any] struct {
 // stores (FileID, PartitionKey, S3Key, Version, WrittenAt,
 // FileSize, UncompressedSize, RecordCount, Extensions). Offset
 // is populated when the row has been sequenced (feed_seq IS NOT
-// NULL); NoOffset otherwise.
+// NULL); OffsetNone otherwise.
 //
 // Filters compose with the same semantics as Read / ReadIter:
 // each PartitionFilter narrows the partition-key space, every
@@ -188,7 +188,7 @@ func (s *Store[T]) ResolveFileRefsInRange(
 //	feed_seq, ext_<col1>, ext_<col2>, ...
 //
 // feed_seq is nullable (NULL until the sequencer assigns) and
-// scanned into FileRef.Offset as NoOffset on NULL.
+// scanned into FileRef.Offset as OffsetNone on NULL.
 func (s *Store[T]) queryFileRows(
 	ctx context.Context, where string, args []any,
 ) ([]FileRef, error) {

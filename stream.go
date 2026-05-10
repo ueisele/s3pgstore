@@ -10,67 +10,47 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// PollOption is the interface implemented by Poll / PollRecords
-// modifiers. The only option in v2.0 is WithUntilOffset.
-type PollOption interface {
-	applyPoll(*pollOpts)
-}
-
-type pollOpts struct {
-	untilSet   bool
-	untilValue Offset
-}
-
-type withUntilOffsetOpt struct{ until Offset }
-
-func (o withUntilOffsetOpt) applyPoll(opts *pollOpts) {
-	opts.untilSet = true
-	opts.untilValue = o.until
-}
-
-// WithUntilOffset bounds the upper cursor of a Poll /
-// PollRecords call to until inclusive. Useful for "drain
-// everything committed up to point X and stop":
+// Poll returns the FileRefs in the half-open offset range
+// [since, until), ordered by feed_seq ascending. The second
+// return is `next` — one past the highest offset seen, suitable
+// for passing back as `since` on the next call. On an empty
+// result `next` equals the input `since` (never moves
+// backwards).
 //
-//	tip, _ := store.OffsetAt(ctx, time.Now())
-//	for since := startOffset; since < tip; {
-//	    rs, next, _ := store.PollRecords(ctx, since, 100,
-//	        s3pgstore.WithUntilOffset(tip))
-//	    if len(rs) == 0 { break }
-//	    process(rs)
-//	    since = next
-//	}
+// Range conventions:
+//   - since: inclusive lower bound. OffsetNone (0) is safe — it's
+//     below every live offset (the sequencer assigns from 1).
+//   - until: exclusive upper bound. OffsetLatest omits the
+//     upper-bound clause from the SQL so the read sees every
+//     committed sequenced row at SELECT time.
 //
-// The bound is inclusive (`feed_seq <= until`) — a row whose
-// feed_seq exactly matches `until` is included.
-func WithUntilOffset(until Offset) PollOption {
-	return withUntilOffsetOpt{until: until}
-}
-
-// Poll returns the next batch of FileRefs with
-// `feed_seq > since AND feed_seq IS NOT NULL`, ordered by
-// feed_seq, capped at n. Returns the refs and the highest
-// observed offset (suitable for passing back as `since` next
-// time). On an empty result the second return is `since`
-// unchanged — never moves backwards.
+// Match s3pgstore_files.ResolveFileRefsInRange's [since, until)
+// convention so users switching between the two ranges think
+// the same way about bounds.
 //
-// n <= 0 returns (nil, since, nil) without touching the
-// database.
+// Empty range (since == until) returns (nil, since, nil)
+// without touching the database. Inverted range (since > until)
+// returns an error.
+//
+// No upper-bound LIMIT — caller bounds the result via
+// (until - since). For unbounded drains use PollRecordsIter
+// instead, which streams files lazily and bounds memory via
+// WithPollFetchAheadFiles / WithPollDecodeAheadBytes.
 //
 // Filtering on the catalog is offset-only; consumers wanting
 // per-file filtering (by partition, by extension columns)
 // should filter the returned entries client-side and pass the
 // surviving entries to ReadFileRefsIter for decoding.
 func (s *Store[T]) Poll(
-	ctx context.Context, since Offset, n int, opts ...PollOption,
+	ctx context.Context, since, until Offset,
 ) (out []FileRef, next Offset, err error) {
 	defer s.metrics.methodScope(ctx, "Poll", &err).end()
-	if n <= 0 {
-		return nil, since, nil
+	if until != OffsetLatest && since > until {
+		return nil, since, fmt.Errorf(
+			"Poll: since (%d) > until (%d)", since, until)
 	}
-	var o pollOpts
-	for _, opt := range opts {
-		opt.applyPoll(&o)
+	if until != OffsetLatest && since == until {
+		return nil, since, nil
 	}
 
 	cols := []string{
@@ -81,20 +61,19 @@ func (s *Store[T]) Poll(
 	for _, c := range s.resolved.ExtensionColumns {
 		cols = append(cols, "ext_"+c.Name)
 	}
-	args := []any{since, n}
-	where := "feed_seq IS NOT NULL AND feed_seq > $1"
-	if o.untilSet {
-		args = append(args, o.untilValue)
-		where += fmt.Sprintf(" AND feed_seq <= $%d", len(args))
+	args := []any{since}
+	where := "feed_seq IS NOT NULL AND feed_seq >= $1"
+	if until != OffsetLatest {
+		args = append(args, until)
+		where += fmt.Sprintf(" AND feed_seq < $%d", len(args))
 	}
 	q := fmt.Sprintf(
 		`SELECT %s FROM %s
 		WHERE %s
-		ORDER BY feed_seq
-		LIMIT $2`,
+		ORDER BY feed_seq`,
 		strings.Join(cols, ", "), s.names.Files(), where)
 
-	maxOffset := since
+	next = since
 	err = s.cfg.Executor.Run(ctx, func(d DBTX) error {
 		rows, err := d.Query(ctx, q, args...)
 		if err != nil {
@@ -124,8 +103,8 @@ func (s *Store[T]) Poll(
 				}
 			}
 			out = append(out, e)
-			if e.Offset > maxOffset {
-				maxOffset = e.Offset
+			if e.Offset+1 > next {
+				next = e.Offset + 1
 			}
 		}
 		return rows.Err()
@@ -133,26 +112,37 @@ func (s *Store[T]) Poll(
 	if err != nil {
 		return nil, since, fmt.Errorf("Poll: %w", err)
 	}
-	return out, maxOffset, nil
+	return out, next, nil
 }
 
-// PollRecords is Poll + parallel S3 GET + decode. Returns the
-// flattened slice of decoded records (in offset order) and the
-// next offset.
+// PollRecords is Poll + parallel S3 GET + decode. Returns one
+// FileResult per file (in feed_seq input order, preserving
+// commit-time ordering for stream consumers) plus `next` — the
+// offset to pass as `since` on the next call.
 //
 // No dedup is applied — stream consumers see every observed
 // version, in commit order. (Dedup is a per-partition Read-side
 // concept; the stream feed is intentionally raw so consumers
 // can build their own derived state from the full sequence.)
 //
-// n <= 0 returns (nil, since, nil) without touching the
-// database.
+// Backed by the chan-based fetch+decode pipeline shared with
+// PollRecordsIter, but auto-tunes for batch use: WithPollDecode
+// Workers defaults to min(WorkerPool.MaxConcurrent(),
+// GOMAXPROCS, lenFiles) and WithPollDecodeAheadFiles to
+// ceil(lenFiles/W). Caller-supplied options always win.
+//
+// Caller bounds memory via the (until - since) range. For
+// unbounded drains prefer PollRecordsIter, which streams files
+// lazily and bounds memory via the WithPoll* knobs.
+//
+// Empty range (since == until) returns (nil, since, nil)
+// without touching the database.
 func (s *Store[T]) PollRecords(
-	ctx context.Context, since Offset, n int, opts ...PollOption,
-) (out []T, next Offset, err error) {
+	ctx context.Context, since, until Offset, opts ...PollOption,
+) (out []FileResult[T], next Offset, err error) {
 	defer s.metrics.methodScope(ctx, "PollRecords", &err).end()
 
-	entries, next, err := s.Poll(ctx, since, n, opts...)
+	entries, next, err := s.Poll(ctx, since, until)
 	if err != nil {
 		return nil, since, err
 	}
@@ -160,45 +150,26 @@ func (s *Store[T]) PollRecords(
 		return nil, next, nil
 	}
 
-	bodies := make([][]T, len(entries))
-	if err := fanOutPool(ctx, s.resolved.WorkerPool, entries,
-		s.metrics.fanOutObserverFor("PollRecords"),
-		func(ctx context.Context, i int, e FileRef) error {
-			data, err := s.target.get(ctx, e.S3Key)
-			if err != nil {
-				return fmt.Errorf("GET %s: %w", e.S3Key, err)
-			}
-			recs, err := decodeParquet[T](data)
-			if err != nil {
-				return fmt.Errorf("decode %s: %w", e.S3Key, err)
-			}
-			bodies[i] = recs
-			return nil
-		},
-	); err != nil {
-		return nil, since, err
-	}
-
-	total := 0
-	for _, b := range bodies {
-		total += len(b)
-	}
-	out = make([]T, 0, total)
-	for _, b := range bodies {
-		out = append(out, b...)
+	o := resolvePollOpts(opts)
+	var iterErr error
+	s.pollFetchAndDecodeIter(ctx, "PollRecords", entries, &o,
+		s.pollCollectDefaults, pollCollectEmit(&out, &iterErr))
+	if iterErr != nil {
+		return nil, since, iterErr
 	}
 	return out, next, nil
 }
 
 // OffsetAt returns the smallest feed_seq whose feed_seq_at is at
 // or after t. Used by stream consumers to seek to a wall-clock
-// time without scanning. Returns 0 (and no error) when no
-// sequenced row matches — interpretable as "nothing yet
+// time without scanning. Returns OffsetNone (0) (and no error)
+// when no sequenced row matches — interpretable as "nothing yet
 // committed at or after t" by callers.
 //
-// Sentinel: Offset(0) is never a valid live offset (the
+// Sentinel: OffsetNone (0) is never a valid live offset (the
 // sequencer assigns starting at 1), so a caller can safely
-// treat 0 as "no result" without a separate not-found signal.
+// treat OffsetNone as "no result" without a separate not-found
+// signal.
 func (s *Store[T]) OffsetAt(
 	ctx context.Context, t time.Time,
 ) (out Offset, err error) {
@@ -214,12 +185,12 @@ func (s *Store[T]) OffsetAt(
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return 0, nil
+			return OffsetNone, nil
 		}
-		return 0, fmt.Errorf("OffsetAt: %w", err)
+		return OffsetNone, fmt.Errorf("OffsetAt: %w", err)
 	}
 	if off == nil {
-		return 0, nil
+		return OffsetNone, nil
 	}
 	return *off, nil
 }

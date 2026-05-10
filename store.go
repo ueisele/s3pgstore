@@ -28,14 +28,37 @@ const defaultWorkerPoolSize = 64
 // only and feed_seq is UNIQUE NOT NULL once set).
 type Offset = int64
 
-// NoOffset is the sentinel Offset value for "no feed_seq
+// OffsetNone is the sentinel Offset value for "no feed_seq
 // assigned" (or "not selected"). Sequencer assignment starts at
-// 1, so NoOffset (0) is never a live offset and is safe to use
-// as both an initial cursor (Poll(ctx, NoOffset, n) reads from
-// the head) and a not-yet-sequenced marker on FileRef.Offset
-// (set by Write and the non-Poll Read paths whose SELECT does
-// not project feed_seq).
-const NoOffset Offset = 0
+// OffsetEarliest (1), so OffsetNone (0) is never a live offset
+// and is safe to use as a not-yet-sequenced marker on
+// FileRef.Offset (set by Write and the non-Poll Read paths
+// whose SELECT does not project feed_seq).
+const OffsetNone Offset = 0
+
+// OffsetEarliest is the lowest valid live offset — the first
+// value the sequencer ever assigns. Pass it as Poll's `since`
+// argument to drain from the very beginning of the feed:
+//
+//	for fr, err := range store.PollRecordsIter(ctx,
+//	    s3pgstore.OffsetEarliest, s3pgstore.OffsetLatest) { … }
+//
+// Equivalent to passing 0 (since `feed_seq >= 0` and
+// `feed_seq >= 1` return the same rows when the sequencer
+// starts at 1), but reads more honestly at the call site.
+const OffsetEarliest Offset = 1
+
+// OffsetLatest is the sentinel passed as Poll/PollRecords/
+// PollRecordsIter's `until` argument to mean "no upper bound,
+// walk to whatever's currently in the catalog." Internally the
+// SQL upper-bound clause is omitted; the read sees every row
+// whose tx committed at or before the SELECT statement's
+// snapshot, then stops (no live tail).
+//
+// The negative value avoids collision with OffsetNone (0) and
+// with any live offset (the sequencer assigns positive values
+// starting at OffsetEarliest).
+const OffsetLatest Offset = -1
 
 // FileRef is a reference to a single file in the catalog. It
 // carries enough metadata to identify the file (FileID), locate
@@ -54,9 +77,9 @@ const NoOffset Offset = 0
 // Every field is populated from every source EXCEPT Offset,
 // which is populated by Poll (always; Poll only walks sequenced
 // rows) and by Read paths (when the underlying row's feed_seq is
-// non-NULL); Write returns NoOffset because the sequencer
+// non-NULL); Write returns OffsetNone because the sequencer
 // assigns feed_seq asynchronously after the write commits.
-// Compare Offset against NoOffset (or any value <= 0) to test
+// Compare Offset against OffsetNone (or any value <= 0) to test
 // whether it's meaningful.
 //
 // Field semantics:
@@ -80,7 +103,7 @@ const NoOffset Offset = 0
 //   - Extensions: ext_<n> column values declared on the Store's
 //     Config.ExtensionColumns; missing/NULL columns are absent
 //     from the map.
-//   - Offset: assigned feed_seq, or NoOffset if not populated by
+//   - Offset: assigned feed_seq, or OffsetNone if not populated by
 //     the source.
 type FileRef struct {
 	FileID           int64
@@ -93,6 +116,22 @@ type FileRef struct {
 	UncompressedSize int64
 	Extensions       map[string]any
 	Offset           Offset
+}
+
+// FileResult is the per-file decoded output yielded by
+// PollRecords / PollRecordsIter. File carries the catalog row's
+// FileRef (including Offset for checkpointing); Records carries
+// the parquet bodies decoded into T. Records emit in their
+// per-file decode order (no sort, no dedup — stream consumers see
+// every observed version in commit order).
+//
+// Resume idiom: after processing a FileResult, the next-poll
+// `since` is `fr.File.Offset + 1`. The caller maintains the
+// cursor; if the iter never yields, the unchanged input `since`
+// is the resume point.
+type FileResult[T any] struct {
+	File    FileRef
+	Records []T
 }
 
 // Store is the typed entry point for writing and reading

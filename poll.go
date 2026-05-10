@@ -6,6 +6,16 @@ package s3pgstore
 // (pollFetchAndDecodeIter and the per-file state machinery) that
 // backs PollRecords and PollRecordsIter.
 //
+// File layout mirrors read.go's outside-in shape:
+//
+//   1. Public methods (Poll, PollRecords, PollRecordsIter, OffsetAt)
+//   2. Per-call defaulters (pollIterDefaults, pollCollectDefaults)
+//   3. Emit callbacks (pollIterEmit, pollCollectEmit)
+//   4. Pipeline orchestration (pollFetchAndDecodeIter)
+//   5. State types (fileState, pollState) + state methods
+//   6. Pipeline stages (runPollFetcher, runPollDecodeWorker)
+//   7. Internal types (decodedPollBatch) and helpers (pollFooterUncomp)
+//
 // Pipeline design diverges from read.go's partition-grain
 // readFetchAndDecodeIter:
 //
@@ -192,6 +202,55 @@ func (s *Store[T]) PollRecords(
 	return out, next, nil
 }
 
+// PollRecordsIter walks the half-open offset range
+// [since, until) and yields one FileResult per file in feed_seq
+// (commit-time) order. Each yield is the file's catalog row
+// (FileRef, including Offset for checkpointing) plus its decoded
+// records. No dedup — stream consumers see every observed
+// version.
+//
+// Memory is bounded by the pipeline knobs:
+//   - WithFetchAheadFiles caps resident compressed bodies.
+//   - WithDecodeAheadFiles caps the per-worker decode queue.
+//   - WithDecodeAheadBytes caps decoded uncompressed bytes
+//     per worker.
+//
+// Suitable for bulk replay / drain workloads — the pipelined
+// fetch + decode keeps network and CPU saturated while the
+// consumer iterates.
+//
+// `until = OffsetLatest` walks to the live tip captured at iter
+// start; `until` is exclusive (offset == until is not yielded).
+// Empty range (since == until) yields nothing without touching
+// the database. Inverted range (since > until) yields a single
+// error.
+//
+// Resume idiom: track `since = fr.File.Offset + 1` after each
+// yield. On failure, the last successfully-yielded FileResult
+// gives the checkpoint.
+func (s *Store[T]) PollRecordsIter(
+	ctx context.Context, since, until Offset, opts ...PollOption,
+) iter.Seq2[FileResult[T], error] {
+	return func(yield func(FileResult[T], error) bool) {
+		var iterErr error
+		defer s.metrics.methodScope(ctx, "PollRecordsIter", &iterErr).end()
+
+		entries, _, err := s.Poll(ctx, since, until)
+		if err != nil {
+			iterErr = err
+			yield(FileResult[T]{}, err)
+			return
+		}
+		if len(entries) == 0 {
+			return
+		}
+
+		o := resolvePollOpts(opts)
+		s.pollFetchAndDecodeIter(ctx, "PollRecordsIter", entries, &o,
+			pollIterDefaults, s.pollIterEmit(yield, &iterErr))
+	}
+}
+
 // OffsetAt returns the smallest feed_seq whose feed_seq_at is at
 // or after t. Used by stream consumers to seek to a wall-clock
 // time without scanning. Returns OffsetNone (0) (and no error)
@@ -259,61 +318,44 @@ func (s *Store[T]) pollCollectDefaults(o *pollOpts, lenFiles int) {
 	}
 }
 
-// fileState holds per-file download progress. file is fixed at
-// construction; body and err are mutated by the pool task under
-// pollState.mu.
-//
-// done is a per-file completion signal. The download task closes
-// it after writing body or recording an error; the decode worker
-// selects on it (plus state.ctx.Done) so it observes both
-// completion and cancellation natively. Closed exactly once per
-// file because a file has exactly one downloader.
-type fileState struct {
-	file FileRef
-	body []byte
-	done chan struct{}
+// pollIterEmit returns the per-batch emit callback that yields
+// one FileResult[T] per file. On a hard pipeline error: sets
+// *iterErr, yields a zero FileResult with the error, returns
+// false so the emit loop terminates.
+func (s *Store[T]) pollIterEmit(
+	yield func(FileResult[T], error) bool, iterErr *error,
+) func(decodedPollBatch[T]) bool {
+	return func(b decodedPollBatch[T]) bool {
+		if b.err != nil {
+			*iterErr = b.err
+			yield(FileResult[T]{}, b.err)
+			return false
+		}
+		return yield(FileResult[T]{
+			File:    b.file,
+			Records: b.records,
+		}, nil)
+	}
 }
 
-// pollState coordinates the fetcher, decode workers, and emit
-// loop. ctx + cancel mirror read.go's readState — single
-// cancellation source via WithCancelCause; recordHardErr cancels
-// with the abort reason as cause atomically with ctx.Done close.
-//
-// slots is the body-slot semaphore — see iter_pipeline_shared.go
-// for FIFO sendq + watchdog progress-bump rationale.
-type pollState struct {
-	ctx    context.Context
-	cancel context.CancelCauseFunc
-
-	files []*fileState
-	slots *bodySlots
-
-	// decoderFi: emit's current file index — atomic so the stall
-	// observer can read it without locking. Logged in slog
-	// alongside the stall warn for context.
-	decoderFi atomic.Int64
-}
-
-// recordHardErr cancels state.ctx with err as the cause. First
-// call wins; subsequent calls are no-ops (the pool's errgroup
-// preserves first-error semantics). Any goroutine reading
-// context.Cause(state.ctx) after a select on state.ctx.Done()
-// is guaranteed to see the cause set atomically with the close.
-func (state *pollState) recordHardErr(err error) {
-	state.cancel(err)
-}
-
-// decodedPollBatch is one file's decoded records (or a single
-// hard error) flowing from the decoder to the emit loop. file
-// is the catalog row (carried so emit can populate
-// FileResult.File); records is the parquet body decoded into T;
-// uncompBytes is what the decoder reserved (emit returns it via
-// releaseBytes after forwarding).
-type decodedPollBatch[T any] struct {
-	file        FileRef
-	records     []T
-	uncompBytes int64
-	err         error
+// pollCollectEmit returns the per-batch emit callback that
+// appends each FileResult into the *out slice. Used by
+// PollRecords (collect). On a hard pipeline error: sets *iterErr
+// and returns false to terminate the emit loop.
+func pollCollectEmit[T any](
+	out *[]FileResult[T], iterErr *error,
+) func(decodedPollBatch[T]) bool {
+	return func(b decodedPollBatch[T]) bool {
+		if b.err != nil {
+			*iterErr = b.err
+			return false
+		}
+		*out = append(*out, FileResult[T]{
+			File:    b.file,
+			Records: b.records,
+		})
+		return true
+	}
 }
 
 // pollFetchAndDecodeIter is the chan-based streaming pipeline
@@ -446,6 +488,60 @@ func (s *Store[T]) pollFetchAndDecodeIter(
 	}
 }
 
+// fileState holds per-file download progress. file is fixed at
+// construction; body and err are mutated by the pool task under
+// pollState.mu.
+//
+// done is a per-file completion signal. The download task closes
+// it after writing body or recording an error; the decode worker
+// selects on it (plus state.ctx.Done) so it observes both
+// completion and cancellation natively. Closed exactly once per
+// file because a file has exactly one downloader.
+type fileState struct {
+	file FileRef
+	body []byte
+	done chan struct{}
+}
+
+// pollState coordinates the fetcher, decode workers, and emit
+// loop. ctx + cancel mirror read.go's readState — single
+// cancellation source via WithCancelCause; recordHardErr cancels
+// with the abort reason as cause atomically with ctx.Done close.
+//
+// slots is the body-slot semaphore — see iter_pipeline_shared.go
+// for FIFO sendq + watchdog progress-bump rationale.
+type pollState struct {
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+
+	files []*fileState
+	slots *bodySlots
+
+	// decoderFi: emit's current file index — atomic so the stall
+	// observer can read it without locking. Logged in slog
+	// alongside the stall warn for context.
+	decoderFi atomic.Int64
+}
+
+// recordHardErr cancels state.ctx with err as the cause. First
+// call wins; subsequent calls are no-ops (the pool's errgroup
+// preserves first-error semantics). Any goroutine reading
+// context.Cause(state.ctx) after a select on state.ctx.Done()
+// is guaranteed to see the cause set atomically with the close.
+func (state *pollState) recordHardErr(err error) {
+	state.cancel(err)
+}
+
+// waitForFile blocks until file fi's download has completed
+// (done closed) or ctx is cancelled. Returns nil on completion
+// AND ctx still alive, context.Cause(ctx) otherwise — so the
+// "download recorded a hard err and closed done" case (which
+// always cancels state.ctx via recordHardErr first) is folded
+// into the same return value the worker forwards.
+func (state *pollState) waitForFile(ctx context.Context, fi int) error {
+	return waitOrCancel(ctx, state.files[fi].done)
+}
+
 // runPollFetcher walks files in input order and submits one
 // download task per file to the shared pool. Body-slot acquire
 // happens here (fetcher-side back-pressure) so pool workers
@@ -483,16 +579,6 @@ func (s *Store[T]) runPollFetcher(
 			return nil
 		})
 	}
-}
-
-// waitForFile blocks until file fi's download has completed
-// (done closed) or ctx is cancelled. Returns nil on completion
-// AND ctx still alive, context.Cause(ctx) otherwise — so the
-// "download recorded a hard err and closed done" case (which
-// always cancels state.ctx via recordHardErr first) is folded
-// into the same return value the worker forwards.
-func (state *pollState) waitForFile(ctx context.Context, fi int) error {
-	return waitOrCancel(ctx, state.files[fi].done)
 }
 
 // runPollDecodeWorker handles files assigned to worker w via
@@ -558,6 +644,19 @@ func (s *Store[T]) runPollDecodeWorker(
 	}
 }
 
+// decodedPollBatch is one file's decoded records (or a single
+// hard error) flowing from the decoder to the emit loop. file
+// is the catalog row (carried so emit can populate
+// FileResult.File); records is the parquet body decoded into T;
+// uncompBytes is what the decoder reserved (emit returns it via
+// releaseBytes after forwarding).
+type decodedPollBatch[T any] struct {
+	file        FileRef
+	records     []T
+	uncompBytes int64
+	err         error
+}
+
 // pollFooterUncomp parses the parquet footer and returns the
 // total uncompressed bytes across every row group. Same
 // computation as read.go's footerStats but for a single file
@@ -573,93 +672,4 @@ func pollFooterUncomp(body []byte) (int64, error) {
 		uncomp += rg.TotalByteSize
 	}
 	return uncomp, nil
-}
-
-// PollRecordsIter walks the half-open offset range
-// [since, until) and yields one FileResult per file in feed_seq
-// (commit-time) order. Each yield is the file's catalog row
-// (FileRef, including Offset for checkpointing) plus its decoded
-// records. No dedup — stream consumers see every observed
-// version.
-//
-// Memory is bounded by the pipeline knobs:
-//   - WithFetchAheadFiles caps resident compressed bodies.
-//   - WithDecodeAheadFiles caps the per-worker decode queue.
-//   - WithDecodeAheadBytes caps decoded uncompressed bytes
-//     per worker.
-//
-// Suitable for bulk replay / drain workloads — the pipelined
-// fetch + decode keeps network and CPU saturated while the
-// consumer iterates.
-//
-// `until = OffsetLatest` walks to the live tip captured at iter
-// start; `until` is exclusive (offset == until is not yielded).
-// Empty range (since == until) yields nothing without touching
-// the database. Inverted range (since > until) yields a single
-// error.
-//
-// Resume idiom: track `since = fr.File.Offset + 1` after each
-// yield. On failure, the last successfully-yielded FileResult
-// gives the checkpoint.
-func (s *Store[T]) PollRecordsIter(
-	ctx context.Context, since, until Offset, opts ...PollOption,
-) iter.Seq2[FileResult[T], error] {
-	return func(yield func(FileResult[T], error) bool) {
-		var iterErr error
-		defer s.metrics.methodScope(ctx, "PollRecordsIter", &iterErr).end()
-
-		entries, _, err := s.Poll(ctx, since, until)
-		if err != nil {
-			iterErr = err
-			yield(FileResult[T]{}, err)
-			return
-		}
-		if len(entries) == 0 {
-			return
-		}
-
-		o := resolvePollOpts(opts)
-		s.pollFetchAndDecodeIter(ctx, "PollRecordsIter", entries, &o,
-			pollIterDefaults, s.pollIterEmit(yield, &iterErr))
-	}
-}
-
-// pollIterEmit returns the per-batch emit callback that yields
-// one FileResult[T] per file. On a hard pipeline error: sets
-// *iterErr, yields a zero FileResult with the error, returns
-// false so the emit loop terminates.
-func (s *Store[T]) pollIterEmit(
-	yield func(FileResult[T], error) bool, iterErr *error,
-) func(decodedPollBatch[T]) bool {
-	return func(b decodedPollBatch[T]) bool {
-		if b.err != nil {
-			*iterErr = b.err
-			yield(FileResult[T]{}, b.err)
-			return false
-		}
-		return yield(FileResult[T]{
-			File:    b.file,
-			Records: b.records,
-		}, nil)
-	}
-}
-
-// pollCollectEmit returns the per-batch emit callback that
-// appends each FileResult into the *out slice. Used by
-// PollRecords (collect). On a hard pipeline error: sets *iterErr
-// and returns false to terminate the emit loop.
-func pollCollectEmit[T any](
-	out *[]FileResult[T], iterErr *error,
-) func(decodedPollBatch[T]) bool {
-	return func(b decodedPollBatch[T]) bool {
-		if b.err != nil {
-			*iterErr = b.err
-			return false
-		}
-		*out = append(*out, FileResult[T]{
-			File:    b.file,
-			Records: b.records,
-		})
-		return true
-	}
 }

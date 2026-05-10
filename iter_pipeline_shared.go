@@ -1,8 +1,8 @@
 package s3pgstore
 
 // iter_pipeline_shared.go holds the primitives that read.go's
-// fetchAndDecodeIter and poll.go's pollFetchAndDecodeIter both
-// rely on. It is NOT the pipeline itself — each pipeline lives
+// readFetchAndDecodeIter and poll.go's pollFetchAndDecodeIter
+// both rely on. It is NOT the pipeline itself — each pipeline lives
 // in its own file with its own grain (partition vs file). What
 // lives here is the load-bearing machinery that must stay
 // byte-identical across both: the body-slot semaphore, the

@@ -7,7 +7,7 @@ package s3pgstore
 // backs PollRecords and PollRecordsIter.
 //
 // Pipeline design diverges from read.go's partition-grain
-// fetchAndDecodeIter:
+// readFetchAndDecodeIter:
 //
 //   - One *fileState per FileRef (no partition grouping). Stream
 //     consumers want feed_seq input order, not lex-by-partition
@@ -67,7 +67,7 @@ import (
 // No upper-bound LIMIT — caller bounds the result via
 // (until - since). For unbounded drains use PollRecordsIter
 // instead, which streams files lazily and bounds memory via
-// WithPollFetchAheadFiles / WithPollDecodeAheadBytes.
+// WithFetchAheadFiles / WithDecodeAheadBytes.
 //
 // Filtering on the catalog is offset-only; consumers wanting
 // per-file filtering (by partition, by extension columns)
@@ -158,14 +158,14 @@ func (s *Store[T]) Poll(
 // can build their own derived state from the full sequence.)
 //
 // Backed by the chan-based fetch+decode pipeline shared with
-// PollRecordsIter, but auto-tunes for batch use: WithPollDecode
+// PollRecordsIter, but auto-tunes for batch use: WithDecode
 // Workers defaults to min(WorkerPool.MaxConcurrent(),
-// GOMAXPROCS, lenFiles) and WithPollDecodeAheadFiles to
+// GOMAXPROCS, lenFiles) and WithDecodeAheadFiles to
 // ceil(lenFiles/W). Caller-supplied options always win.
 //
 // Caller bounds memory via the (until - since) range. For
 // unbounded drains prefer PollRecordsIter, which streams files
-// lazily and bounds memory via the WithPoll* knobs.
+// lazily and bounds memory via the iter-pipeline knobs.
 //
 // Empty range (since == until) returns (nil, since, nil)
 // without touching the database.
@@ -583,9 +583,9 @@ func pollFooterUncomp(body []byte) (int64, error) {
 // version.
 //
 // Memory is bounded by the pipeline knobs:
-//   - WithPollFetchAheadFiles caps resident compressed bodies.
-//   - WithPollDecodeAheadFiles caps the per-worker decode queue.
-//   - WithPollDecodeAheadBytes caps decoded uncompressed bytes
+//   - WithFetchAheadFiles caps resident compressed bodies.
+//   - WithDecodeAheadFiles caps the per-worker decode queue.
+//   - WithDecodeAheadBytes caps decoded uncompressed bytes
 //     per worker.
 //
 // Suitable for bulk replay / drain workloads — the pipelined

@@ -883,7 +883,7 @@ func TestPollRecordsIter_EmptyRange(t *testing.T) {
 	}
 }
 
-// TestPollRecordsIter_OptionsApply verifies the WithPoll*
+// TestPollRecordsIter_OptionsApply verifies the iter-pipeline
 // options compile and route through the pipeline. (Covers the
 // option plumbing; correctness of the underlying back-pressure
 // is exercised by the read pipeline's tests, which use the same
@@ -903,10 +903,10 @@ func TestPollRecordsIter_OptionsApply(t *testing.T) {
 	count := 0
 	for _, err := range store.PollRecordsIter(t.Context(), 0,
 		s3pgstore.OffsetLatest,
-		s3pgstore.WithPollFetchAheadFiles(2),
-		s3pgstore.WithPollDecodeWorkers(2),
-		s3pgstore.WithPollDecodeAheadFiles(1),
-		s3pgstore.WithPollDecodeAheadBytes(1<<20),
+		s3pgstore.WithFetchAheadFiles(2),
+		s3pgstore.WithDecodeWorkers(2),
+		s3pgstore.WithDecodeAheadFiles(1),
+		s3pgstore.WithDecodeAheadBytes(1<<20),
 	) {
 		if err != nil {
 			t.Fatalf("yield: %v", err)

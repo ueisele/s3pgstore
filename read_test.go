@@ -35,7 +35,7 @@ func newTestReadState(t *testing.T) *readState {
 }
 
 // withSlotCap rebuilds the body-slot semaphore at the given
-// capacity. Mirrors how fetchAndDecodeIter wires up slots in
+// capacity. Mirrors how readFetchAndDecodeIter wires up slots in
 // production.
 func (s *readState) withSlotCap(cap int) *readState {
 	s.slots = newBodySlots(cap, s.slots.m)
@@ -44,7 +44,7 @@ func (s *readState) withSlotCap(cap int) *readState {
 
 // newTestWorkerState builds a per-decode-worker state for
 // reserveBytes/releaseBytes unit tests. Mirrors
-// fetchAndDecodeIter's setup but with a metrics-less worker so
+// readFetchAndDecodeIter's setup but with a metrics-less worker so
 // tests don't depend on the OTel SDK plumbing — the methods
 // only use m for histogram recording, which the noop default
 // handles.
@@ -347,7 +347,7 @@ func TestDeadlockObserver_NoSignalWhenProgress(t *testing.T) {
 
 // TestDeadlockObserver_ExitsOnCtxDone verifies the watchdog
 // goroutine returns promptly when its ctx is cancelled.
-// Required so fetchAndDecodeIter's deferred wg.Wait()
+// Required so readFetchAndDecodeIter's deferred wg.Wait()
 // doesn't leak the observer past the pipeline's lifetime.
 func TestDeadlockObserver_ExitsOnCtxDone(t *testing.T) {
 	s := newTestReadState(t).withSlotCap(2)
@@ -454,7 +454,7 @@ func TestWithFetchAheadFiles_DefaultsToZero(t *testing.T) {
 
 // TestWithFetchAheadFiles_ExplicitValueHonored confirms positive
 // values land on the readOpts field verbatim (the bodyCap floor
-// at maxFilesPerPartition is enforced in fetchAndDecodeIter,
+// at maxFilesPerPartition is enforced in readFetchAndDecodeIter,
 // not in option resolution).
 func TestWithFetchAheadFiles_ExplicitValueHonored(t *testing.T) {
 	o := resolveIterOpts([]ReadOption{WithFetchAheadFiles(8)})
@@ -494,7 +494,7 @@ func TestWithDecodeWorkers_ExplicitValueHonored(t *testing.T) {
 
 // TestWithDecodeWorkers_NonPositiveFloors asserts that 0 and
 // negative values floor to 1 (single-decoder, current behavior).
-// Floored at the option boundary so fetchAndDecodeIter never has
+// Floored at the option boundary so readFetchAndDecodeIter never has
 // to reason about a zero-worker config that would deadlock the
 // pipeline.
 func TestWithDecodeWorkers_NonPositiveFloors(t *testing.T) {

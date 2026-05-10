@@ -4,7 +4,7 @@ package s3pgstore
 // points (Read / ReadPartition / ReadIter and its variants),
 // the catalog SELECT helpers (ResolveFileRefs /
 // ResolveFileRefsInRange / queryFileRows), and the chan-based
-// fetch+decode pipeline (fetchAndDecodeIter and the stream/worker
+// fetch+decode pipeline (readFetchAndDecodeIter and the stream/worker
 // state machinery) that backs every entry point.
 //
 // The pipeline is vendored from
@@ -251,7 +251,7 @@ func (s *Store[T]) queryFileRows(
 // iterStreamDefaults fills the iter family's per-call defaults
 // (W=1, K=1) into any field the user left unset. Designed for
 // streaming consumers — single-decoder, minimum lookahead. Pass
-// to fetchAndDecodeIter from every ReadIter / ReadPartitionIter /
+// to readFetchAndDecodeIter from every ReadIter / ReadPartitionIter /
 // ReadRangeIter / ReadFileRefsIter call.
 //
 // User-supplied options always win: WithDecodeWorkers(N) /
@@ -332,7 +332,7 @@ func (s *Store[T]) Read(
 	}
 	o := resolveIterOpts(opts)
 	var iterErr error
-	s.fetchAndDecodeIter(ctx, "Read", rows, &o,
+	s.readFetchAndDecodeIter(ctx, "Read", rows, &o,
 		s.readBatchDefaults, recordCollectEmit(&out, &iterErr))
 	if iterErr != nil {
 		return nil, iterErr
@@ -364,7 +364,7 @@ func (s *Store[T]) ReadPartition(
 	}
 	o := resolveIterOpts(opts)
 	var iterErr error
-	s.fetchAndDecodeIter(ctx, "ReadPartition", rows, &o,
+	s.readFetchAndDecodeIter(ctx, "ReadPartition", rows, &o,
 		s.readBatchDefaults, partitionCollectEmit(&out, &iterErr))
 	if iterErr != nil {
 		return nil, iterErr
@@ -408,7 +408,7 @@ func (s *Store[T]) ReadIter(
 			yield(*new(T), err)
 			return
 		}
-		s.fetchAndDecodeIter(ctx, "ReadIter", rows, &o,
+		s.readFetchAndDecodeIter(ctx, "ReadIter", rows, &o,
 			iterStreamDefaults, s.recordEmit(yield, &iterErr))
 	}
 }
@@ -434,7 +434,7 @@ func (s *Store[T]) ReadPartitionIter(
 			yield(PartitionResult[T]{}, err)
 			return
 		}
-		s.fetchAndDecodeIter(ctx, "ReadPartitionIter", rows, &o,
+		s.readFetchAndDecodeIter(ctx, "ReadPartitionIter", rows, &o,
 			iterStreamDefaults, s.partitionEmit(yield, &iterErr))
 	}
 }
@@ -475,7 +475,7 @@ func (s *Store[T]) ReadRangeIter(
 			yield(*new(T), err)
 			return
 		}
-		s.fetchAndDecodeIter(ctx, "ReadRangeIter", rows, &o,
+		s.readFetchAndDecodeIter(ctx, "ReadRangeIter", rows, &o,
 			iterStreamDefaults, s.recordEmit(yield, &iterErr))
 	}
 }
@@ -497,7 +497,7 @@ func (s *Store[T]) ReadPartitionRangeIter(
 			yield(PartitionResult[T]{}, err)
 			return
 		}
-		s.fetchAndDecodeIter(ctx, "ReadPartitionRangeIter", rows, &o,
+		s.readFetchAndDecodeIter(ctx, "ReadPartitionRangeIter", rows, &o,
 			iterStreamDefaults, s.partitionEmit(yield, &iterErr))
 	}
 }
@@ -525,7 +525,7 @@ func (s *Store[T]) ReadFileRefsIter(
 			yield(*new(T), err)
 			return
 		}
-		s.fetchAndDecodeIter(ctx, "ReadFileRefsIter", entries, &o,
+		s.readFetchAndDecodeIter(ctx, "ReadFileRefsIter", entries, &o,
 			iterStreamDefaults, s.recordEmit(yield, &iterErr))
 	}
 }
@@ -545,7 +545,7 @@ func (s *Store[T]) ReadPartitionFileRefsIter(
 			yield(PartitionResult[T]{}, err)
 			return
 		}
-		s.fetchAndDecodeIter(ctx, "ReadPartitionFileRefsIter", entries, &o,
+		s.readFetchAndDecodeIter(ctx, "ReadPartitionFileRefsIter", entries, &o,
 			iterStreamDefaults, s.partitionEmit(yield, &iterErr))
 	}
 }
@@ -666,7 +666,7 @@ func partitionCollectEmit[T any](
 	}
 }
 
-// fetchAndDecodeIter is the chan-based streaming pipeline
+// readFetchAndDecodeIter is the chan-based streaming pipeline
 // backing every ReadIter / ReadPartitionIter / ReadRangeIter /
 // ReadPartitionRangeIter / ReadFileRefsIter /
 // ReadPartitionFileRefsIter call.
@@ -707,7 +707,7 @@ func partitionCollectEmit[T any](
 // rule that pool tasks must always make progress, so a slow
 // consumer of one ReadIter cannot starve unrelated Stores
 // sharing the pool.
-func (s *Store[T]) fetchAndDecodeIter(
+func (s *Store[T]) readFetchAndDecodeIter(
 	ctx context.Context, method string, entries []FileRef,
 	opts *readOpts, applyDefaults func(*readOpts, int),
 	emitOne func(decodedBatch[T]) bool,
@@ -785,7 +785,7 @@ func (s *Store[T]) fetchAndDecodeIter(
 	// Stage 1: fetcher. Acquires body slots and submits per-file
 	// download tasks to the shared pool. Calls g.Wait() before
 	// exiting so all in-flight pool tasks drain before
-	// fetchAndDecodeIter returns.
+	// readFetchAndDecodeIter returns.
 	//
 	// On any pool task error, the task fn calls recordHardErr
 	// (cancelling state.ctx with the wrapped err as cause)
@@ -804,7 +804,7 @@ func (s *Store[T]) fetchAndDecodeIter(
 	// error path or parent propagation). The g.Wait call exists
 	// only to drain in-flight tasks before this goroutine exits
 	// so wg.Wait sees all pool work complete before
-	// fetchAndDecodeIter returns and the readState is dropped.
+	// readFetchAndDecodeIter returns and the readState is dropped.
 	g, gctx := s.resolved.WorkerPool.WithContext(state.ctx)
 	wg.Go(func() {
 		s.runFetcher(gctx, g, state)
@@ -1112,7 +1112,7 @@ func (s *readState) waitForPartition(
 // Body-slot leak on submit-skip is harmless. If gctx is
 // cancelled between state.slots.acquire and g.Submit, the task
 // fn never runs and the slot stays held — but state.slots is
-// per-call state torn down by fetchAndDecodeIter's deferred
+// per-call state torn down by readFetchAndDecodeIter's deferred
 // wg.Wait, and waitForPartition observes ctx.Done. No deadlock,
 // no observable leak.
 func (s *Store[T]) runFetcher(

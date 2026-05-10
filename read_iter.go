@@ -11,7 +11,7 @@ package s3pgstore
 //
 // What we vendor: the producer → downloader → decoder topology,
 // the body-slot semaphore (buffered chan, FIFO sendq),
-// reserveBytes / releaseBytes around WithReadAheadBytes, the
+// reserveBytes / releaseBytes around WithDecodeAheadBytes, the
 // stall-watchdog (pure observer), recordEmit / partitionEmit.
 //
 // What we adapt:
@@ -67,8 +67,8 @@ import (
 // record matching filters, lazily one partition at a time
 // through the chan-based pipeline.
 //
-// Memory: O((WithReadAheadPartitions + 1) partitions' decoded
-// records) by default; cap with WithReadAheadBytes to bound the
+// Memory: O((WithDecodeAheadPartitions + 1) partitions' decoded
+// records) by default; cap with WithDecodeAheadBytes to bound the
 // uncompressed-bytes footprint. Without options, one partition's
 // records sit in memory at any time.
 //
@@ -99,7 +99,7 @@ func (s *Store[T]) ReadIter(
 			yield(*new(T), err)
 			return
 		}
-		s.downloadAndDecodeIter(ctx, "ReadIter", rows, &o,
+		s.fetchAndDecodeIter(ctx, "ReadIter", rows, &o,
 			s.recordEmit(yield, &iterErr))
 	}
 }
@@ -125,7 +125,7 @@ func (s *Store[T]) ReadPartitionIter(
 			yield(PartitionResult[T]{}, err)
 			return
 		}
-		s.downloadAndDecodeIter(ctx, "ReadPartitionIter", rows, &o,
+		s.fetchAndDecodeIter(ctx, "ReadPartitionIter", rows, &o,
 			s.partitionEmit(yield, &iterErr))
 	}
 }
@@ -160,7 +160,7 @@ func (s *Store[T]) ReadRangeIter(
 			yield(*new(T), err)
 			return
 		}
-		s.downloadAndDecodeIter(ctx, "ReadRangeIter", rows, &o,
+		s.fetchAndDecodeIter(ctx, "ReadRangeIter", rows, &o,
 			s.recordEmit(yield, &iterErr))
 	}
 }
@@ -182,7 +182,7 @@ func (s *Store[T]) ReadPartitionRangeIter(
 			yield(PartitionResult[T]{}, err)
 			return
 		}
-		s.downloadAndDecodeIter(ctx, "ReadPartitionRangeIter", rows, &o,
+		s.fetchAndDecodeIter(ctx, "ReadPartitionRangeIter", rows, &o,
 			s.partitionEmit(yield, &iterErr))
 	}
 }
@@ -212,7 +212,7 @@ func (s *Store[T]) ReadEntriesIter(
 			return
 		}
 		rows := entriesToFileRows(entries, s.resolved.ExtensionColumns)
-		s.downloadAndDecodeIter(ctx, "ReadEntriesIter", rows, &o,
+		s.fetchAndDecodeIter(ctx, "ReadEntriesIter", rows, &o,
 			s.recordEmit(yield, &iterErr))
 	}
 }
@@ -233,7 +233,7 @@ func (s *Store[T]) ReadPartitionEntriesIter(
 			return
 		}
 		rows := entriesToFileRows(entries, s.resolved.ExtensionColumns)
-		s.downloadAndDecodeIter(ctx, "ReadPartitionEntriesIter", rows, &o,
+		s.fetchAndDecodeIter(ctx, "ReadPartitionEntriesIter", rows, &o,
 			s.partitionEmit(yield, &iterErr))
 	}
 }
@@ -302,15 +302,15 @@ func (s *Store[T]) partitionEmit(
 	}
 }
 
-// downloadAndDecodeIter is the chan-based streaming pipeline
+// fetchAndDecodeIter is the chan-based streaming pipeline
 // backing every ReadIter / ReadPartitionIter / ReadRangeIter /
 // ReadPartitionRangeIter / ReadEntriesIter /
 // ReadPartitionEntriesIter call.
 //
 // Three concurrent stages plus the caller's emit loop:
 //
-//  1. Submitter goroutine: walks partitions in lex order,
-//     acquires one body-pool slot per file (submitter-side
+//  1. Fetcher goroutine: walks partitions in lex order,
+//     acquires one body-pool slot per file (fetcher-side
 //     back-pressure — see CLAUDE.md "Shared-pool workers must
 //     never block on per-call coordination"), then submits one
 //     download task per file to the Store's shared *pool.Pool.
@@ -321,8 +321,8 @@ func (s *Store[T]) partitionEmit(
 //  2. Decoder goroutine: walks partitions in order; for each,
 //     waits until all its files are downloaded, parses each
 //     parquet footer to compute the partition's exact
-//     uncompressed total, gates on (ReadAheadPartitions,
-//     ReadAheadBytes), decodes records, sort+dedup's them
+//     uncompressed total, gates on (DecodeAheadPartitions,
+//     DecodeAheadBytes), decodes records, sort+dedup's them
 //     in-place, and pushes a decodedBatch to the emitter.
 //
 //  3. Emit loop (this goroutine): pulls decoded partitions in
@@ -338,12 +338,12 @@ func (s *Store[T]) partitionEmit(
 // Pool-worker shape: the submitted task does only the S3 GET
 // and a markComplete / state.releaseBodySlots / recordHardErr
 // update. It never blocks on per-call coordination — body-slot
-// acquire is on the submitter, decoder back-pressure is in the
+// acquire is on the fetcher, decoder back-pressure is in the
 // (non-pool) decoder goroutine. This satisfies the shared-pool
 // rule that pool tasks must always make progress, so a slow
 // consumer of one ReadIter cannot starve unrelated Stores
 // sharing the pool.
-func (s *Store[T]) downloadAndDecodeIter(
+func (s *Store[T]) fetchAndDecodeIter(
 	ctx context.Context, method string, rows []fileRow,
 	opts *readOpts, emitOne func(decodedBatch[T]) bool,
 ) {
@@ -358,17 +358,22 @@ func (s *Store[T]) downloadAndDecodeIter(
 	// bodyCap bounds the per-call in-memory compressed-body
 	// footprint: the submitter blocks on acquireBodySlot once
 	// cap slots are held; the decoder releases slots as it nils
-	// each body. Default ceiling tracks the shared pool's
-	// MaxConcurrent so per-call body memory scales with the
-	// concurrency budget the operator chose: small pool ⇒
-	// small per-call body buffer; large pool ⇒ enough lookahead
-	// to keep the decoder fed with many tiny partitions in
-	// flight in parallel. Floor at the largest partition's
-	// file count so a single oversized partition still fits in
-	// the pool — otherwise its last few files would block on
-	// the cap and the decoder would block on those files,
-	// producing a deadlock.
-	bodyCap := s.resolved.WorkerPool.MaxConcurrent()
+	// each body. Default (WithFetchAheadFiles unset or <= 0)
+	// tracks the shared pool's MaxConcurrent so a single reader
+	// can saturate the pool's S3-op budget; small pool ⇒ small
+	// per-call body buffer, large pool ⇒ enough lookahead to
+	// keep the decoder fed with many tiny partitions in flight
+	// in parallel. Operators in shared-pool deployments can dial
+	// this down via WithFetchAheadFiles to bound aggregate
+	// resident body memory across concurrent readers. Floor at
+	// the largest partition's file count so a single oversized
+	// partition still fits — otherwise its last few files would
+	// block on the cap and the decoder would block on those
+	// files, producing a deadlock.
+	bodyCap := opts.fetchAheadFiles
+	if bodyCap <= 0 {
+		bodyCap = s.resolved.WorkerPool.MaxConcurrent()
+	}
 	for _, p := range parts {
 		if n := len(p.files); n > bodyCap {
 			bodyCap = n
@@ -401,17 +406,17 @@ func (s *Store[T]) downloadAndDecodeIter(
 		wg.Wait()
 	}()
 
-	// Stage 1: submitter. Acquires body slots and submits per-file
+	// Stage 1: fetcher. Acquires body slots and submits per-file
 	// download tasks to the shared pool. Calls g.Wait() before
 	// exiting so all in-flight pool tasks drain before
-	// downloadAndDecodeIter returns.
+	// fetchAndDecodeIter returns.
 	//
 	// On any pool task error, the task fn calls recordHardErr
 	// (cancelling state.ctx with the wrapped err as cause)
 	// before markComplete. gctx is derived from state.ctx, so
-	// it auto-cancels too — submitter sees gctx done in
+	// it auto-cancels too — fetcher sees gctx done in
 	// acquireBodySlot, sibling tasks observe gctx done in
-	// s.target.get. Files past the submitter's exit point are
+	// s.target.get. Files past the fetcher's exit point are
 	// deliberately NOT markComplete'd; their partitions' done
 	// channels would block waitForPartition forever, except
 	// state.ctx is cancelled, so waitForPartition's ctx.Done
@@ -424,12 +429,12 @@ func (s *Store[T]) downloadAndDecodeIter(
 	// failing task itself (task error path) or by parent
 	// propagation (all-success-then-parent-cancel path). The
 	// g.Wait call exists purely to drain in-flight tasks
-	// before the submitter goroutine exits, so wg.Wait sees
-	// all pool work complete before downloadAndDecodeIter
+	// before the fetcher goroutine exits, so wg.Wait sees
+	// all pool work complete before fetchAndDecodeIter
 	// returns and the streamState is dropped.
 	g, gctx := s.resolved.WorkerPool.WithContext(state.ctx)
 	wg.Go(func() {
-		s.runDownloadSubmitter(gctx, g, state)
+		s.runFetcher(gctx, g, state)
 		_ = g.Wait()
 	})
 	// No cancel-broadcast helper goroutine: every blocking
@@ -437,18 +442,18 @@ func (s *Store[T]) downloadAndDecodeIter(
 	// wait, byteWake bell) selects on state.ctx.Done() natively.
 	// See CLAUDE.md "Concurrency invariants".
 
-	// Stage 2: decoder. Channel cap = readAheadPartitions so the
+	// Stage 2: decoder. Channel cap = decodeAheadPartitions so the
 	// pipeline buffers up to N decoded partitions ahead. The
 	// pointer-typed option distinguishes "not supplied" (nil →
 	// default 1, the minimum useful pipeline shape — decode of
 	// partition N+1 overlaps yield of partition N) from "explicit
 	// zero" (cap=0, unbuffered handoff). To bound stacking when
-	// N>1, combine with WithReadAheadBytes.
-	readAheadParts := 1
-	if opts.readAheadPartitions != nil {
-		readAheadParts = *opts.readAheadPartitions
+	// N>1, combine with WithDecodeAheadBytes.
+	decodeAheadParts := 1
+	if opts.decodeAheadPartitions != nil {
+		decodeAheadParts = *opts.decodeAheadPartitions
 	}
-	decodedCh := make(chan decodedBatch[T], readAheadParts)
+	decodedCh := make(chan decodedBatch[T], decodeAheadParts)
 	wg.Go(func() {
 		s.runDecoder(state.ctx, state, opts, decodedCh)
 	})
@@ -909,9 +914,9 @@ func (s *streamState) releaseBytes(uncomp int64) {
 	}
 }
 
-// runDownloadSubmitter walks partitions in order and submits
+// runFetcher walks partitions in order and submits
 // one download task per file to the shared pool. The body-slot
-// acquire happens here on the submitter side rather than inside
+// acquire happens here on the fetcher side rather than inside
 // the pool task — pool workers must never block on per-call
 // coordination (CLAUDE.md "Shared-pool workers must never block
 // on per-call coordination"), or N waiting workers could starve
@@ -920,11 +925,11 @@ func (s *streamState) releaseBytes(uncomp int64) {
 //
 // Concurrency model:
 //
-//   - Submitter is one goroutine; acquireBodySlot blocks here
-//     when the per-call slot pool is full, so the submitter
+//   - Fetcher is one goroutine; acquireBodySlot blocks here
+//     when the per-call slot pool is full, so the fetcher
 //     itself paces the pipeline.
 //   - g.Submit blocks when the shared pool has no free slot.
-//     Both back-pressure points run on the submitter, never
+//     Both back-pressure points run on the fetcher, never
 //     on the pool worker.
 //   - In flight: at most min(bodyCap, pool.MaxConcurrent) S3
 //     GETs at any time across this call's submitted tasks.
@@ -940,10 +945,10 @@ func (s *streamState) releaseBytes(uncomp int64) {
 // cancelled between our acquireBodySlot and pool.Group.Submit's
 // internal Acquire, the task fn never runs and the body slot
 // stays held — but slotCh is per-call state torn down by
-// downloadAndDecodeIter's deferred wg.Wait, and waitForPartition
+// fetchAndDecodeIter's deferred wg.Wait, and waitForPartition
 // for files we never markComplete'd observes ctx.Done and
 // returns false. No deadlock, no observable leak.
-func (s *Store[T]) runDownloadSubmitter(
+func (s *Store[T]) runFetcher(
 	ctx context.Context, g *pool.Group, state *streamState,
 ) {
 	for pi := range state.parts {
@@ -1034,7 +1039,7 @@ func (s *Store[T]) runDecoder(
 		// Gate on byte budget if configured. A single oversized
 		// partition still flows once the buffer is empty —
 		// otherwise the pipeline would deadlock.
-		if err := state.reserveBytes(ctx, uncomp, opts.readAheadBytes); err != nil {
+		if err := state.reserveBytes(ctx, uncomp, opts.decodeAheadBytes); err != nil {
 			sendBatch(ctx, decodedCh, decodedBatch[T]{err: err})
 			return
 		}
@@ -1182,7 +1187,7 @@ func footerStats(p *partState) (uncomp, totalRows int64, err error) {
 	return uncomp, totalRows, nil
 }
 
-// Stall watchdog defaults. Production downloadAndDecodeIter
+// Stall watchdog defaults. Production fetchAndDecodeIter
 // wires these via runDeadlockObserver; tests can override with
 // shorter intervals so a stall signal fires within milliseconds
 // rather than minutes (currently no test does so — left here

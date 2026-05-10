@@ -972,7 +972,7 @@ All iter methods share the same per-partition pipeline as
 `ReadIter`: dedup via `EntityKeyOf` + `VersionOf` (or
 `WithHistory()` to disable), cancel-on-break, lex-stable emission
 order. Memory bound is one partition's records (or
-`WithReadAheadBytes` if set; see `ReadIter` notes).
+`WithDecodeAheadBytes` if set; see `ReadIter` notes).
 
 **Caveat: range and entries methods don't expose offset
 checkpoints.** A consumer that aborts mid-iteration cannot resume

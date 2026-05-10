@@ -530,7 +530,7 @@ func counterValue(
 	return 0
 }
 
-// TestReadIter_WithReadAheadBytes_GatesDecoder verifies the
+// TestReadIter_WithDecodeAheadBytes_GatesDecoder verifies the
 // byte-budget gate actually back-pressures the decoder under
 // runtime conditions. The signal we look for is
 // s3pgstore.read.iter.byte_budget.exhausted incrementing — it
@@ -546,14 +546,14 @@ func counterValue(
 // guaranteeing the decoder finds bufferedBytes > 0 when it
 // hits reserveBytes for the next partition.
 //
-// With WithReadAheadBytes(1) and any partition uncomp > 1
+// With WithDecodeAheadBytes(1) and any partition uncomp > 1
 // byte, the predicate `bufferedBytes <= 0 || ... <= cap`
 // fails on the first attempt (non-empty buffer, uncomp
 // dominates the 1-byte cap). The decoder parks, waited=true,
 // recordIterByteBudgetWait fires when releaseBytes wakes it.
 // Asserts the exhausted counter increments at least N-1 times
 // — one wait event per partition past the first.
-func TestReadIter_WithReadAheadBytes_GatesDecoder(t *testing.T) {
+func TestReadIter_WithDecodeAheadBytes_GatesDecoder(t *testing.T) {
 	f := newFixture(t)
 	store, reader := newIterStoreWithMeter(t, f)
 
@@ -585,11 +585,11 @@ func TestReadIter_WithReadAheadBytes_GatesDecoder(t *testing.T) {
 		[]s3pgstore.PartitionFilter{
 			s3pgstore.GE("customer", "alice"),
 		},
-		// readAheadPartitions large enough that the channel
+		// decodeAheadPartitions large enough that the channel
 		// cap NEVER gates — we want the byte budget to be the
 		// only contention point.
-		s3pgstore.WithReadAheadPartitions(numPartitions),
-		s3pgstore.WithReadAheadBytes(1),
+		s3pgstore.WithDecodeAheadPartitions(numPartitions),
+		s3pgstore.WithDecodeAheadBytes(1),
 	) {
 		if err != nil {
 			t.Fatalf("yield: %v", err)
@@ -620,7 +620,7 @@ func TestReadIter_WithReadAheadBytes_GatesDecoder(t *testing.T) {
 	}
 }
 
-// TestReadIter_WithReadAheadPartitions_Zero_NoDeadlock guards
+// TestReadIter_WithDecodeAheadPartitions_Zero_NoDeadlock guards
 // the explicit-no-buffer mode. n=0 makes decodedCh unbuffered
 // — the decoder's sendBatch must rendezvous with the emit
 // loop's receive on every partition, never accumulating ahead.
@@ -631,7 +631,7 @@ func TestReadIter_WithReadAheadBytes_GatesDecoder(t *testing.T) {
 // so the test runs in well under a second: we're verifying
 // the deadlock-free path, not throughput. The 30-second test
 // timeout would catch a true deadlock.
-func TestReadIter_WithReadAheadPartitions_Zero_NoDeadlock(t *testing.T) {
+func TestReadIter_WithDecodeAheadPartitions_Zero_NoDeadlock(t *testing.T) {
 	f := newFixture(t)
 	store := newIterStore(t, f)
 
@@ -649,7 +649,7 @@ func TestReadIter_WithReadAheadPartitions_Zero_NoDeadlock(t *testing.T) {
 		[]s3pgstore.PartitionFilter{
 			s3pgstore.GE("customer", "alice"),
 		},
-		s3pgstore.WithReadAheadPartitions(0),
+		s3pgstore.WithDecodeAheadPartitions(0),
 	) {
 		if err != nil {
 			t.Fatalf("yield: %v", err)

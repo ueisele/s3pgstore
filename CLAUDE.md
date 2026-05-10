@@ -308,16 +308,16 @@ coordinate. Properties recent regressions in s3store taught us
   backpressure signal) holds a pool slot while waiting — and
   N waiting workers can starve every other Group sharing the
   pool, including unrelated Stores. Fix: hoist the wait to
-  the *submitter* side (acquire-then-Submit), so pool workers
-  are guaranteed to make progress without blocking. All four
-  fan-out sites comply: Write multi-partition, Read
+  the *fetcher / submitter* side (acquire-then-Submit), so pool
+  workers are guaranteed to make progress without blocking. All
+  four fan-out sites comply: Write multi-partition, Read
   fetch+decode, PollRecords body fetch, and
-  `downloadAndDecodeIter` (whose `runDownloadSubmitter`
-  acquires the per-call body slot before calling `g.Submit`,
-  leaving the pool task to do only the S3 GET +
-  markComplete). Refactors must not introduce a worker
-  function that calls `<-state.slotCh`, `<-state.byteWake`,
-  or any other per-call channel inside a pool-submitted task.
+  `fetchAndDecodeIter` (whose `runFetcher` acquires the per-call
+  body slot before calling `g.Submit`, leaving the pool task to
+  do only the S3 GET + markComplete). Refactors must not
+  introduce a worker function that calls `<-state.slotCh`,
+  `<-state.byteWake`, or any other per-call channel inside a
+  pool-submitted task.
 
 - **Same-pool reentrancy panics; cross-pool nesting is fine.**
   A worker that calls `g.Submit(...)` on the same pool would

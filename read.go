@@ -41,7 +41,23 @@ type readOpts struct {
 	// entity dedup. Set via WithHistory.
 	includeHistory bool
 
-	// readAheadPartitions controls how many partitions ahead of
+	// fetchAheadFiles caps the number of compressed parquet
+	// bodies the fetcher may keep resident (in-flight + landed-
+	// but-not-yet-decoded) at once. Zero or negative (default)
+	// resolves to Config.WorkerPool.MaxConcurrent() so a single
+	// reader can saturate the pool's S3-op budget. Set explicitly
+	// to a smaller value in shared-pool deployments where each
+	// concurrent reader holding the full budget would inflate
+	// total resident body memory.
+	//
+	// Internally floored to max(filesPerPartition) so that one
+	// oversized partition still fits — without that floor the
+	// fetcher would block on the cap with the decoder waiting
+	// for the partition's remaining files (see read_iter.go for
+	// the deadlock trace).
+	fetchAheadFiles int
+
+	// decodeAheadPartitions controls how many partitions ahead of
 	// the current yield position the iter pipeline buffers in
 	// the decoder→yield channel. nil (option not supplied)
 	// resolves to the default of 1 — minimum useful lookahead so
@@ -52,18 +68,18 @@ type readOpts struct {
 	// memory at once. *p > 0 buffers up to p partitions in the
 	// channel, at O(p+1 partitions) memory.
 	//
-	// Pointer-typed so the zero value of WithReadAheadPartitions
+	// Pointer-typed so the zero value of WithDecodeAheadPartitions
 	// (an explicit 0) stays distinguishable from "option not
 	// supplied" (which falls back to the default of 1).
-	readAheadPartitions *int
+	decodeAheadPartitions *int
 
-	// readAheadBytes caps the cumulative uncompressed parquet
+	// decodeAheadBytes caps the cumulative uncompressed parquet
 	// bytes that may sit decoded in the iter pipeline ahead of
 	// the current yield position. Zero (default) disables the
-	// cap; only readAheadPartitions binds. Read from each
+	// cap; only decodeAheadPartitions binds. Read from each
 	// parquet file's footer (sum of row-group total_byte_size)
 	// so the cap is exact, not a heuristic.
-	readAheadBytes int64
+	decodeAheadBytes int64
 }
 
 // WithHistory disables the per-partition latest-per-entity
@@ -76,13 +92,45 @@ type withHistoryOpt struct{}
 
 func (withHistoryOpt) applyRead(o *readOpts) { o.includeHistory = true }
 
-// WithReadAheadPartitions tells the iter pipeline how many
-// partitions to buffer ahead of the current yield position.
-// Default (option not supplied) is 1 — minimum useful lookahead
-// so decode of partition N+1 overlaps yield of partition N.
-// Pass a larger value for more aggressive prefetch on consumers
-// that do non-trivial per-record work; combine with
-// WithReadAheadBytes to bound stacking of skewed-size partitions.
+// WithFetchAheadFiles caps the number of compressed parquet
+// bodies the fetcher may keep resident at once (downloads
+// in-flight + landed-but-not-yet-decoded). Default (option not
+// supplied or n <= 0) is Config.WorkerPool.MaxConcurrent() — a
+// single reader can saturate the pool's S3-op budget.
+//
+// Lower values reduce per-call body memory at the cost of S3
+// concurrency: the fetcher cannot dispatch beyond this cap into
+// the pool, so pool slots above n sit idle for this reader. Use
+// in shared-pool deployments where each concurrent reader
+// independently consuming the full budget inflates aggregate
+// resident body memory beyond what the operator wants.
+//
+// Internally floored to max(filesPerPartition) so a single
+// oversized partition still flows in full — without that floor
+// the fetcher would block on the cap with the decoder waiting
+// on the partition's remaining files.
+//
+// No effect on the buffered Read path.
+func WithFetchAheadFiles(n int) ReadOption {
+	if n < 0 {
+		n = 0
+	}
+	return withFetchAheadFilesOpt{n: n}
+}
+
+type withFetchAheadFilesOpt struct{ n int }
+
+func (o withFetchAheadFilesOpt) applyRead(opts *readOpts) {
+	opts.fetchAheadFiles = o.n
+}
+
+// WithDecodeAheadPartitions tells the iter pipeline how many
+// decoded partitions to buffer between the decoder and the yield
+// loop. Default (option not supplied) is 1 — minimum useful
+// lookahead so decode of partition N+1 overlaps yield of
+// partition N. Pass a larger value for more aggressive prefetch
+// on consumers that do non-trivial per-record work; combine with
+// WithDecodeAheadBytes to bound stacking of skewed-size partitions.
 //
 // n=0 is the explicit-no-buffer mode: unbuffered handoff between
 // decoder and yield loop. The decoder still works on partition
@@ -100,28 +148,28 @@ func (withHistoryOpt) applyRead(o *readOpts) { o.includeHistory = true }
 //
 // No effect on the buffered Read path (which materialises every
 // partition concurrently by design).
-func WithReadAheadPartitions(n int) ReadOption {
+func WithDecodeAheadPartitions(n int) ReadOption {
 	if n < 0 {
 		n = 0
 	}
-	return withReadAheadPartitionsOpt{n: n}
+	return withDecodeAheadPartitionsOpt{n: n}
 }
 
-type withReadAheadPartitionsOpt struct{ n int }
+type withDecodeAheadPartitionsOpt struct{ n int }
 
-func (o withReadAheadPartitionsOpt) applyRead(opts *readOpts) {
+func (o withDecodeAheadPartitionsOpt) applyRead(opts *readOpts) {
 	n := o.n
-	opts.readAheadPartitions = &n
+	opts.decodeAheadPartitions = &n
 }
 
-// WithReadAheadBytes caps the cumulative uncompressed parquet
+// WithDecodeAheadBytes caps the cumulative uncompressed parquet
 // bytes that may sit decoded in the iter pipeline ahead of the
 // current yield position. Zero (default) disables the cap; only
-// WithReadAheadPartitions binds.
+// WithDecodeAheadPartitions binds.
 //
-// Composes with WithReadAheadPartitions — both are evaluated and
+// Composes with WithDecodeAheadPartitions — both are evaluated and
 // whichever cap binds first holds the producer back. Useful when
-// partition sizes are skewed: a tiny WithReadAheadPartitions(1)
+// partition sizes are skewed: a tiny WithDecodeAheadPartitions(1)
 // is too conservative for many small partitions but a larger
 // value risks OOM on a few large ones; a byte cap auto-tunes
 // across both.
@@ -138,17 +186,17 @@ func (o withReadAheadPartitionsOpt) applyRead(opts *readOpts) {
 // partitions from joining the buffer.
 //
 // No effect on the buffered Read path.
-func WithReadAheadBytes(n int64) ReadOption {
+func WithDecodeAheadBytes(n int64) ReadOption {
 	if n < 0 {
 		n = 0
 	}
-	return withReadAheadBytesOpt{n: n}
+	return withDecodeAheadBytesOpt{n: n}
 }
 
-type withReadAheadBytesOpt struct{ n int64 }
+type withDecodeAheadBytesOpt struct{ n int64 }
 
-func (o withReadAheadBytesOpt) applyRead(opts *readOpts) {
-	opts.readAheadBytes = o.n
+func (o withDecodeAheadBytesOpt) applyRead(opts *readOpts) {
+	opts.decodeAheadBytes = o.n
 }
 
 // Read returns one PartitionResult[T] per partition matched by

@@ -501,8 +501,8 @@ walk by offset.
 `860cf19` "Replace iter pipeline sync.Cond with chan-based
 primitives" and `da75ca9` "Fix iter pipeline deadlock under
 cond.Wait scheduler unfairness"). The producer → downloader →
-decoder topology, the `WithReadAheadPartitions` /
-`WithReadAheadBytes` budget knobs, the cancel-on-break semantics,
+decoder topology, the `WithDecodeAheadPartitions` /
+`WithDecodeAheadBytes` budget knobs, the cancel-on-break semantics,
 and the stall-watchdog are all hard-won correctness work that we
 should inherit verbatim. Keep the test corpus too — the
 concurrency tests are exactly what catches deadlocks.
@@ -517,7 +517,7 @@ must not be relaxed when adapting the pipeline.
 What we vendor (with attribution):
 
 - The chan-based producer/downloader/decoder pipeline structure.
-- `WithReadAheadPartitions`, `WithReadAheadBytes` options.
+- `WithDecodeAheadPartitions`, `WithDecodeAheadBytes` options.
 - `runProducer`, `runDownloader`, `runDecoder` and their
   back-pressure wiring.
 - The stall watchdog (`dd83417`).

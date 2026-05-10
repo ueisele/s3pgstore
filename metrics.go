@@ -331,7 +331,7 @@ func newMetrics(cfg metricsConfig) (*metrics, error) {
 	if m.iterByteBudgetWait, err = mustHist(
 		"s3pgstore.read.iter.byte_budget.wait.duration",
 		"Time the decoder spent blocked reserving uncompressed "+
-			"bytes against ReadAheadBytes (recorded only when a "+
+			"bytes against DecodeAheadBytes (recorded only when a "+
 			"wait actually occurred AND the reservation succeeded).",
 		"s", shortWaitBuckets...); err != nil {
 		return nil, err
@@ -339,7 +339,7 @@ func newMetrics(cfg metricsConfig) (*metrics, error) {
 	if m.iterByteBudgetExhausted, err = mustCounter(
 		"s3pgstore.read.iter.byte_budget.exhausted",
 		"Times the iter pipeline's byte budget was full and the "+
-			"decoder had to wait. WithReadAheadBytes is binding.",
+			"decoder had to wait. WithDecodeAheadBytes is binding.",
 		"{event}"); err != nil {
 		return nil, err
 	}

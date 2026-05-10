@@ -25,7 +25,7 @@ func newTestStreamState() *streamState {
 }
 
 // withSlotCap attaches a body-slot semaphore of the given
-// capacity. Mirrors how downloadAndDecodeIter wires up slotCh
+// capacity. Mirrors how fetchAndDecodeIter wires up slotCh
 // in production. cap == 0 leaves slotCh nil — the
 // no-back-pressure path the live pipeline never takes but that
 // test cases exercise to confirm the disabled-cap branch
@@ -339,7 +339,7 @@ func TestDeadlockObserver_NoSignalWhenProgress(t *testing.T) {
 
 // TestDeadlockObserver_ExitsOnCtxDone verifies the watchdog
 // goroutine returns promptly when its ctx is cancelled.
-// Required so downloadAndDecodeIter's deferred wg.Wait()
+// Required so fetchAndDecodeIter's deferred wg.Wait()
 // doesn't leak the observer past the pipeline's lifetime.
 func TestDeadlockObserver_ExitsOnCtxDone(t *testing.T) {
 	s := newTestStreamState().withSlotCap(2)
@@ -396,38 +396,70 @@ func TestWaitForPartition_BlocksUntilComplete(t *testing.T) {
 	}
 }
 
-// TestWithReadAheadPartitions_ExplicitZero verifies that
+// TestWithDecodeAheadPartitions_ExplicitZero verifies that
 // passing 0 stays distinguishable from "option not supplied"
 // — the pointer-typed field carries the explicit-zero through.
-func TestWithReadAheadPartitions_ExplicitZero(t *testing.T) {
-	o := resolveIterOpts([]ReadOption{WithReadAheadPartitions(0)})
-	if o.readAheadPartitions == nil {
-		t.Fatal("explicit 0 should set readAheadPartitions, got nil")
+func TestWithDecodeAheadPartitions_ExplicitZero(t *testing.T) {
+	o := resolveIterOpts([]ReadOption{WithDecodeAheadPartitions(0)})
+	if o.decodeAheadPartitions == nil {
+		t.Fatal("explicit 0 should set decodeAheadPartitions, got nil")
 	}
-	if *o.readAheadPartitions != 0 {
-		t.Errorf("readAheadPartitions = %d, want 0",
-			*o.readAheadPartitions)
+	if *o.decodeAheadPartitions != 0 {
+		t.Errorf("decodeAheadPartitions = %d, want 0",
+			*o.decodeAheadPartitions)
 	}
 }
 
-// TestWithReadAheadPartitions_NegativeFloors floors negative
+// TestWithDecodeAheadPartitions_NegativeFloors floors negative
 // values to 0 (instead of allocating a negative-cap channel,
 // which would panic).
-func TestWithReadAheadPartitions_NegativeFloors(t *testing.T) {
-	o := resolveIterOpts([]ReadOption{WithReadAheadPartitions(-5)})
-	if o.readAheadPartitions == nil || *o.readAheadPartitions != 0 {
-		t.Errorf("negative readAheadPartitions did not floor to 0: %v",
-			o.readAheadPartitions)
+func TestWithDecodeAheadPartitions_NegativeFloors(t *testing.T) {
+	o := resolveIterOpts([]ReadOption{WithDecodeAheadPartitions(-5)})
+	if o.decodeAheadPartitions == nil || *o.decodeAheadPartitions != 0 {
+		t.Errorf("negative decodeAheadPartitions did not floor to 0: %v",
+			o.decodeAheadPartitions)
 	}
 }
 
-// TestWithReadAheadBytes_NegativeFloors mirrors the partitions
+// TestWithDecodeAheadBytes_NegativeFloors mirrors the partitions
 // option: negative caps are floored to 0 (no cap).
-func TestWithReadAheadBytes_NegativeFloors(t *testing.T) {
-	o := resolveIterOpts([]ReadOption{WithReadAheadBytes(-1)})
-	if o.readAheadBytes != 0 {
-		t.Errorf("negative readAheadBytes = %d, want 0",
-			o.readAheadBytes)
+func TestWithDecodeAheadBytes_NegativeFloors(t *testing.T) {
+	o := resolveIterOpts([]ReadOption{WithDecodeAheadBytes(-1)})
+	if o.decodeAheadBytes != 0 {
+		t.Errorf("negative decodeAheadBytes = %d, want 0",
+			o.decodeAheadBytes)
+	}
+}
+
+// TestWithFetchAheadFiles_DefaultsToZero verifies that the
+// option-not-supplied path leaves fetchAheadFiles at zero so the
+// downstream bodyCap derivation falls back to MaxConcurrent.
+func TestWithFetchAheadFiles_DefaultsToZero(t *testing.T) {
+	o := resolveIterOpts(nil)
+	if o.fetchAheadFiles != 0 {
+		t.Errorf("default fetchAheadFiles = %d, want 0",
+			o.fetchAheadFiles)
+	}
+}
+
+// TestWithFetchAheadFiles_ExplicitValueHonored confirms positive
+// values land on the readOpts field verbatim (the bodyCap floor
+// at maxFilesPerPartition is enforced in fetchAndDecodeIter,
+// not in option resolution).
+func TestWithFetchAheadFiles_ExplicitValueHonored(t *testing.T) {
+	o := resolveIterOpts([]ReadOption{WithFetchAheadFiles(8)})
+	if o.fetchAheadFiles != 8 {
+		t.Errorf("fetchAheadFiles = %d, want 8", o.fetchAheadFiles)
+	}
+}
+
+// TestWithFetchAheadFiles_NegativeFloors mirrors the other
+// options: negative values floor to 0 (= use default).
+func TestWithFetchAheadFiles_NegativeFloors(t *testing.T) {
+	o := resolveIterOpts([]ReadOption{WithFetchAheadFiles(-3)})
+	if o.fetchAheadFiles != 0 {
+		t.Errorf("negative fetchAheadFiles = %d, want 0",
+			o.fetchAheadFiles)
 	}
 }
 

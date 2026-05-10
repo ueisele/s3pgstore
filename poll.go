@@ -1,17 +1,22 @@
 package s3pgstore
 
-// poll_iter.go is the file-grain fetch+decode pipeline backing
-// PollRecords and PollRecordsIter. Its design diverges from
-// read.go's partition-grain fetchAndDecodeIter:
+// poll.go is the read path for the sequenced feed: the public
+// entry points (Poll / PollRecords / PollRecordsIter / OffsetAt)
+// and the chan-based file-grain fetch+decode pipeline
+// (pollFetchAndDecodeIter and the per-file state machinery) that
+// backs PollRecords and PollRecordsIter.
+//
+// Pipeline design diverges from read.go's partition-grain
+// fetchAndDecodeIter:
 //
 //   - One *fileState per FileRef (no partition grouping). Stream
 //     consumers want feed_seq input order, not lex-by-partition
 //     order; partition machinery is dead weight here.
 //   - No sortAndDedup. The stream feed is intentionally raw —
 //     consumers see every observed version in commit order.
-//   - decodePollFile is per-file; no "wait for all partition
-//     files" coordination, no per-partition decoded slice
-//     pre-sizing, no in-memory sort.
+//   - decode is per-file; no "wait for all partition files"
+//     coordination, no per-partition decoded slice pre-sizing,
+//     no in-memory sort.
 //
 // The shape that DOES carry over from read.go (because both
 // pipelines need the same correctness properties):
@@ -31,140 +36,205 @@ package s3pgstore
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"log/slog"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/parquet-go/parquet-go"
 
 	"github.com/ueisele/s3pgstore/pool"
 )
 
-// PollOption is the interface implemented by PollRecords /
-// PollRecordsIter modifiers. Distinct from ReadOption so the
-// surfaces don't cross-contaminate at the call site (a
-// WithPollFetchAheadFiles passed to ReadIter is a compile error).
-type PollOption interface {
-	applyPoll(*pollOpts)
-}
-
-// pollOpts is the resolved per-call tuning for the poll pipeline.
-// Pointer-typed defaultable fields distinguish "user said zero"
-// from "unset" so iter defaulters never overwrite a deliberate
-// zero.
-type pollOpts struct {
-	fetchAheadFiles  int
-	decodeWorkers    int
-	decodeAheadFiles *int
-	decodeAheadBytes int64
-}
-
-// WithPollFetchAheadFiles caps the number of compressed parquet
-// bodies that can be downloaded ahead of the consumer. Bounds
-// the per-call resident compressed-body memory to roughly
-// n * avg_file_size.
+// Poll returns the FileRefs in the half-open offset range
+// [since, until), ordered by feed_seq ascending. The second
+// return is `next` — one past the highest offset seen, suitable
+// for passing back as `since` on the next call. On an empty
+// result `next` equals the input `since` (never moves
+// backwards).
 //
-// Defaults to WorkerPool.MaxConcurrent() so a single PollRecords
-// call saturates the pool's S3-op budget. Dial it down for
-// shared-pool deployments where each reader holding the full
-// budget inflates aggregate body memory across concurrent
-// readers.
-func WithPollFetchAheadFiles(n int) PollOption {
-	if n < 0 {
-		n = 0
-	}
-	return withPollFetchAheadFilesOpt{n: n}
-}
-
-type withPollFetchAheadFilesOpt struct{ n int }
-
-func (o withPollFetchAheadFilesOpt) applyPoll(opts *pollOpts) {
-	opts.fetchAheadFiles = o.n
-}
-
-// WithPollDecodeWorkers sets the number of parallel decoder
-// goroutines. Each worker handles files where
-// `fileIdx % W == workerIdx`; emit drains worker queues in
-// round-robin so input order is preserved.
+// Range conventions:
+//   - since: inclusive lower bound. OffsetNone (0) is safe — it's
+//     below every live offset (the sequencer assigns from 1).
+//   - until: exclusive upper bound. OffsetLatest omits the
+//     upper-bound clause from the SQL so the read sees every
+//     committed sequenced row at SELECT time.
 //
-// Defaults to min(WorkerPool.MaxConcurrent(), GOMAXPROCS,
-// lenFiles) for PollRecords (collect), and 1 for PollRecordsIter
-// (stream — single-decoder minimum-lookahead, matches the read
-// iter family's defaults).
+// Match s3pgstore_files.ResolveFileRefsInRange's [since, until)
+// convention so users switching between the two ranges think
+// the same way about bounds.
 //
-// Floored at 1: WithPollDecodeWorkers(0) becomes 1; the
-// per-call default is only used when the option is not supplied.
-func WithPollDecodeWorkers(n int) PollOption {
-	if n < 1 {
-		n = 1
-	}
-	return withPollDecodeWorkersOpt{n: n}
-}
-
-type withPollDecodeWorkersOpt struct{ n int }
-
-func (o withPollDecodeWorkersOpt) applyPoll(opts *pollOpts) {
-	opts.decodeWorkers = o.n
-}
-
-// WithPollDecodeAheadFiles tells each decode worker how many
-// decoded files to buffer ahead of the consumer. The worker's
-// queue is bounded at this depth; a slow consumer back-pressures
-// the worker via the queue's blocking send, which in turn
-// back-pressures fetch via the body-slot semaphore.
+// Empty range (since == until) returns (nil, since, nil)
+// without touching the database. Inverted range (since > until)
+// returns an error.
 //
-// Defaults to ceil(lenFiles/W) for PollRecords (collect — fast
-// workers don't stall) and 1 for PollRecordsIter (minimum
-// lookahead, matches the read iter family's defaults).
-func WithPollDecodeAheadFiles(n int) PollOption {
-	if n < 0 {
-		n = 0
-	}
-	return withPollDecodeAheadFilesOpt{n: n}
-}
-
-type withPollDecodeAheadFilesOpt struct{ n int }
-
-func (o withPollDecodeAheadFilesOpt) applyPoll(opts *pollOpts) {
-	v := o.n
-	opts.decodeAheadFiles = &v
-}
-
-// WithPollDecodeAheadBytes caps the uncompressed parquet bytes
-// EACH decode worker holds in flight. When a decoded file's
-// uncompressed size would push the worker over cap AND the
-// worker's buffer is non-empty, the worker blocks until emit
-// drains a previous file. The empty-buffer escape lets a single
-// oversized file flow even if it exceeds cap.
+// No upper-bound LIMIT — caller bounds the result via
+// (until - since). For unbounded drains use PollRecordsIter
+// instead, which streams files lazily and bounds memory via
+// WithPollFetchAheadFiles / WithPollDecodeAheadBytes.
 //
-// Zero (the default) disables the byte budget; the queue depth
-// (WithPollDecodeAheadFiles) is the only memory bound.
-func WithPollDecodeAheadBytes(n int64) PollOption {
-	if n < 0 {
-		n = 0
+// Filtering on the catalog is offset-only; consumers wanting
+// per-file filtering (by partition, by extension columns)
+// should filter the returned entries client-side and pass the
+// surviving entries to ReadFileRefsIter for decoding.
+func (s *Store[T]) Poll(
+	ctx context.Context, since, until Offset,
+) (out []FileRef, next Offset, err error) {
+	defer s.metrics.methodScope(ctx, "Poll", &err).end()
+	if until != OffsetLatest && since > until {
+		return nil, since, fmt.Errorf(
+			"Poll: since (%d) > until (%d)", since, until)
 	}
-	return withPollDecodeAheadBytesOpt{n: n}
+	if until != OffsetLatest && since == until {
+		return nil, since, nil
+	}
+
+	cols := []string{
+		"file_id", "feed_seq", "partition_key", "s3_key",
+		"written_at_version", "written_at", "file_size",
+		"uncompressed_size", "record_count",
+	}
+	for _, c := range s.resolved.ExtensionColumns {
+		cols = append(cols, "ext_"+c.Name)
+	}
+	args := []any{since}
+	where := "feed_seq IS NOT NULL AND feed_seq >= $1"
+	if until != OffsetLatest {
+		args = append(args, until)
+		where += fmt.Sprintf(" AND feed_seq < $%d", len(args))
+	}
+	q := fmt.Sprintf(
+		`SELECT %s FROM %s
+		WHERE %s
+		ORDER BY feed_seq`,
+		strings.Join(cols, ", "), s.names.Files(), where)
+
+	next = since
+	err = s.cfg.Executor.Run(ctx, func(d DBTX) error {
+		rows, err := d.Query(ctx, q, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			e := FileRef{
+				Extensions: make(map[string]any,
+					len(s.resolved.ExtensionColumns)),
+			}
+			extValues := make([]any, len(s.resolved.ExtensionColumns))
+			scanArgs := []any{
+				&e.FileID, &e.Offset, &e.PartitionKey, &e.S3Key,
+				&e.Version, &e.WrittenAt, &e.FileSize,
+				&e.UncompressedSize, &e.RecordCount,
+			}
+			for i := range extValues {
+				scanArgs = append(scanArgs, &extValues[i])
+			}
+			if err := rows.Scan(scanArgs...); err != nil {
+				return err
+			}
+			for i, c := range s.resolved.ExtensionColumns {
+				if extValues[i] != nil {
+					e.Extensions[c.Name] = extValues[i]
+				}
+			}
+			out = append(out, e)
+			if e.Offset+1 > next {
+				next = e.Offset + 1
+			}
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, since, fmt.Errorf("Poll: %w", err)
+	}
+	return out, next, nil
 }
 
-type withPollDecodeAheadBytesOpt struct{ n int64 }
+// PollRecords is Poll + parallel S3 GET + decode. Returns one
+// FileResult per file (in feed_seq input order, preserving
+// commit-time ordering for stream consumers) plus `next` — the
+// offset to pass as `since` on the next call.
+//
+// No dedup is applied — stream consumers see every observed
+// version, in commit order. (Dedup is a per-partition Read-side
+// concept; the stream feed is intentionally raw so consumers
+// can build their own derived state from the full sequence.)
+//
+// Backed by the chan-based fetch+decode pipeline shared with
+// PollRecordsIter, but auto-tunes for batch use: WithPollDecode
+// Workers defaults to min(WorkerPool.MaxConcurrent(),
+// GOMAXPROCS, lenFiles) and WithPollDecodeAheadFiles to
+// ceil(lenFiles/W). Caller-supplied options always win.
+//
+// Caller bounds memory via the (until - since) range. For
+// unbounded drains prefer PollRecordsIter, which streams files
+// lazily and bounds memory via the WithPoll* knobs.
+//
+// Empty range (since == until) returns (nil, since, nil)
+// without touching the database.
+func (s *Store[T]) PollRecords(
+	ctx context.Context, since, until Offset, opts ...PollOption,
+) (out []FileResult[T], next Offset, err error) {
+	defer s.metrics.methodScope(ctx, "PollRecords", &err).end()
 
-func (o withPollDecodeAheadBytesOpt) applyPoll(opts *pollOpts) {
-	opts.decodeAheadBytes = o.n
+	entries, next, err := s.Poll(ctx, since, until)
+	if err != nil {
+		return nil, since, err
+	}
+	if len(entries) == 0 {
+		return nil, next, nil
+	}
+
+	o := resolvePollOpts(opts)
+	var iterErr error
+	s.pollFetchAndDecodeIter(ctx, "PollRecords", entries, &o,
+		s.pollCollectDefaults, pollCollectEmit(&out, &iterErr))
+	if iterErr != nil {
+		return nil, since, iterErr
+	}
+	return out, next, nil
 }
 
-// resolvePollOpts collapses the variadic option list into a
-// flat pollOpts struct. Defaults applied later by the
-// pipeline-mode-specific defaulter (collect vs. iter).
-func resolvePollOpts(opts []PollOption) pollOpts {
-	var o pollOpts
-	for _, opt := range opts {
-		opt.applyPoll(&o)
+// OffsetAt returns the smallest feed_seq whose feed_seq_at is at
+// or after t. Used by stream consumers to seek to a wall-clock
+// time without scanning. Returns OffsetNone (0) (and no error)
+// when no sequenced row matches — interpretable as "nothing yet
+// committed at or after t" by callers.
+//
+// Sentinel: OffsetNone (0) is never a valid live offset (the
+// sequencer assigns starting at 1), so a caller can safely
+// treat OffsetNone as "no result" without a separate not-found
+// signal.
+func (s *Store[T]) OffsetAt(
+	ctx context.Context, t time.Time,
+) (out Offset, err error) {
+	defer s.metrics.methodScope(ctx, "OffsetAt", &err).end()
+	q := fmt.Sprintf(
+		`SELECT MIN(feed_seq) FROM %s
+		WHERE feed_seq IS NOT NULL AND feed_seq_at >= $1`,
+		s.names.Files())
+	var off *int64
+	err = s.cfg.Executor.Run(ctx, func(d DBTX) error {
+		row := d.QueryRow(ctx, q, t.UTC())
+		return row.Scan(&off)
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return OffsetNone, nil
+		}
+		return OffsetNone, fmt.Errorf("OffsetAt: %w", err)
 	}
-	return o
+	if off == nil {
+		return OffsetNone, nil
+	}
+	return *off, nil
 }
 
 // pollIterDefaults fills the iter family's per-call defaults

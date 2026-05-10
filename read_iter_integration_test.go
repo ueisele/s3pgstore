@@ -621,8 +621,8 @@ func TestReadIter_WithDecodeAheadBytes_GatesDecoder(t *testing.T) {
 }
 
 // TestReadIter_WithDecodeAheadPartitions_Zero_NoDeadlock guards
-// the explicit-no-buffer mode. n=0 makes decodedCh unbuffered
-// — the decoder's sendBatch must rendezvous with the emit
+// the explicit-no-buffer mode. n=0 makes the per-worker queue
+// unbuffered — the worker's send must rendezvous with the emit
 // loop's receive on every partition, never accumulating ahead.
 // A regression that broke handoff under cap=0 would deadlock
 // before the iter could yield the second partition.
@@ -659,5 +659,118 @@ func TestReadIter_WithDecodeAheadPartitions_Zero_NoDeadlock(t *testing.T) {
 	}
 	if count != len(customers) {
 		t.Errorf("yielded %d records, want %d", count, len(customers))
+	}
+}
+
+// TestReadIter_WithDecodeWorkers_PreservesOrderAndCount fans
+// decode out across multiple workers and verifies the iter
+// still yields every record AND the partition emit order stays
+// lex-stable (CLAUDE.md "Deterministic emission order"). With
+// W workers handling pi via round-robin (pi % W), workers
+// complete partitions out of order; the emit loop's
+// sequential walk reads queue[(pi mod W)] in pi order so the
+// consumer sees lex order.
+//
+// Uses 12 partitions / W=4 — enough that each worker handles 3
+// partitions, exercising the round-robin path without inflating
+// runtime.
+func TestReadIter_WithDecodeWorkers_PreservesOrderAndCount(t *testing.T) {
+	f := newFixture(t)
+	store := newIterStore(t, f)
+
+	const numPartitions = 12
+	customers := make([]string, numPartitions)
+	for i := range customers {
+		// Lex-sortable single-letter prefix + index so
+		// partition_key ordering is predictable: c00..c11.
+		customers[i] = "c" + string('0'+rune(i/10)) + string('0'+rune(i%10))
+	}
+	for _, c := range customers {
+		if _, err := store.Write(t.Context(),
+			[]iterRec{{Customer: c, Value: 1},
+				{Customer: c, Value: 2}},
+		); err != nil {
+			t.Fatalf("Write %s: %v", c, err)
+		}
+	}
+
+	gotCustomers := []string{}
+	count := 0
+	for r, err := range store.ReadIter(t.Context(),
+		[]s3pgstore.PartitionFilter{
+			s3pgstore.GE("customer", "c00"),
+		},
+		s3pgstore.WithDecodeWorkers(4),
+	) {
+		if err != nil {
+			t.Fatalf("yield: %v", err)
+		}
+		count++
+		// Track first occurrence of each customer to verify
+		// per-partition emit order.
+		if len(gotCustomers) == 0 || gotCustomers[len(gotCustomers)-1] != r.Customer {
+			gotCustomers = append(gotCustomers, r.Customer)
+		}
+	}
+
+	if count != numPartitions*2 {
+		t.Errorf("yielded %d records, want %d", count, numPartitions*2)
+	}
+	if len(gotCustomers) != numPartitions {
+		t.Errorf("saw %d distinct customers, want %d",
+			len(gotCustomers), numPartitions)
+	}
+	// Lex order: c00, c01, ..., c11.
+	for i, c := range gotCustomers {
+		want := customers[i]
+		if c != want {
+			t.Errorf("partition emit order broken at index %d: got %q, want %q",
+				i, c, want)
+		}
+	}
+}
+
+// TestReadIter_WithDecodeWorkers_PerWorkerByteBudget verifies
+// the per-worker WithDecodeAheadBytes cap composes correctly
+// with WithDecodeWorkers. With W=4 workers each capped at 1
+// byte and partitions larger than 1 byte, the empty-buffer
+// escape must let each partition through OR the pipeline would
+// deadlock. Asserts every record still emits.
+//
+// This is the per-worker analog of
+// TestReadIter_WithDecodeAheadBytes_GatesDecoder — proves the
+// per-worker reservation honors the same correctness invariant
+// (oversized partition flows on empty buffer).
+func TestReadIter_WithDecodeWorkers_PerWorkerByteBudget(t *testing.T) {
+	f := newFixture(t)
+	store := newIterStore(t, f)
+
+	const numPartitions = 8
+	for i := 0; i < numPartitions; i++ {
+		c := "c" + string('0'+rune(i))
+		if _, err := store.Write(t.Context(),
+			[]iterRec{{Customer: c, Value: 1}}); err != nil {
+			t.Fatalf("Write %s: %v", c, err)
+		}
+	}
+
+	count := 0
+	for r, err := range store.ReadIter(t.Context(),
+		[]s3pgstore.PartitionFilter{
+			s3pgstore.GE("customer", "c0"),
+		},
+		s3pgstore.WithDecodeWorkers(4),
+		s3pgstore.WithDecodeAheadBytes(1),
+	) {
+		if err != nil {
+			t.Fatalf("yield: %v", err)
+		}
+		_ = r
+		count++
+	}
+	if count != numPartitions {
+		t.Errorf("yielded %d records, want %d (per-worker byte cap "+
+			"must permit oversized partitions via empty-buffer escape)",
+			count, numPartitions)
 	}
 }

@@ -57,16 +57,20 @@ type readOpts struct {
 	// the deadlock trace).
 	fetchAheadFiles int
 
-	// decodeAheadPartitions controls how many partitions ahead of
-	// the current yield position the iter pipeline buffers in
-	// the decoder→yield channel. nil (option not supplied)
-	// resolves to the default of 1 — minimum useful lookahead so
-	// decode of partition N+1 overlaps yield of partition N.
-	// *p == 0 is the explicit-no-buffer mode: unbuffered handoff,
-	// the decoder still works on N+1 concurrent with yield
-	// emitting N but never holds two decoded partitions in
-	// memory at once. *p > 0 buffers up to p partitions in the
-	// channel, at O(p+1 partitions) memory.
+	// decodeWorkers controls the number of parallel decode
+	// goroutines. Zero or negative (default) resolves to 1, the
+	// single-decoder behavior. Workers self-assign partitions
+	// round-robin (worker w handles pi where pi % W == w); emit
+	// drains worker queues in lex order to preserve the
+	// deterministic emission contract.
+	decodeWorkers int
+
+	// decodeAheadPartitions controls how many decoded partitions
+	// each worker may buffer in its output queue before blocking
+	// on send. nil (option not supplied) resolves to the default
+	// of 1. *p == 0 is the explicit-unbuffered mode (worker
+	// blocks immediately after each decode until emit drains).
+	// With W > 1 workers the per-call total is W × n.
 	//
 	// Pointer-typed so the zero value of WithDecodeAheadPartitions
 	// (an explicit 0) stays distinguishable from "option not
@@ -74,11 +78,11 @@ type readOpts struct {
 	decodeAheadPartitions *int
 
 	// decodeAheadBytes caps the cumulative uncompressed parquet
-	// bytes that may sit decoded in the iter pipeline ahead of
-	// the current yield position. Zero (default) disables the
-	// cap; only decodeAheadPartitions binds. Read from each
-	// parquet file's footer (sum of row-group total_byte_size)
-	// so the cap is exact, not a heuristic.
+	// bytes EACH decode worker may hold (currently-decoding +
+	// queued for emit). Zero (default) disables the cap. Read
+	// from each parquet file's footer (sum of row-group
+	// total_byte_size) so the cap is exact, not a heuristic.
+	// With W > 1 workers the per-call total is W × n.
 	decodeAheadBytes int64
 }
 
@@ -124,27 +128,63 @@ func (o withFetchAheadFilesOpt) applyRead(opts *readOpts) {
 	opts.fetchAheadFiles = o.n
 }
 
-// WithDecodeAheadPartitions tells the iter pipeline how many
-// decoded partitions to buffer between the decoder and the yield
-// loop. Default (option not supplied) is 1 — minimum useful
-// lookahead so decode of partition N+1 overlaps yield of
-// partition N. Pass a larger value for more aggressive prefetch
-// on consumers that do non-trivial per-record work; combine with
-// WithDecodeAheadBytes to bound stacking of skewed-size partitions.
+// WithDecodeWorkers sets the number of parallel decoder
+// goroutines for the iter pipeline. Default (option not supplied
+// or n <= 0) is 1 — single-decoder behavior, deterministic
+// CPU footprint at one core.
 //
-// n=0 is the explicit-no-buffer mode: unbuffered handoff between
-// decoder and yield loop. The decoder still works on partition
-// N+1 concurrent with yield emitting N (the handoff just blocks
-// the decoder briefly), but never two decoded partitions sit in
-// memory at once. Useful when records are large and the
-// consumer's per-record work is fast — the byte cap is then the
-// only memory regulator.
+// n > 1 fans out decode across n goroutines. Workers self-assign
+// partitions round-robin: worker w handles partitions where
+// pi % n == w. Emit drains worker queues in lex partition order
+// so the deterministic-emission contract is preserved.
+//
+// Use for batch-analytics workloads where decode dominates the
+// per-call wall-time (many partitions, reasonably uniform sizes,
+// throughput-bound consumer). Streaming workloads with small
+// records and a slow consumer see no benefit — decode time is
+// already small relative to consumer yield.
+//
+// Round-robin assignment can imbalance load when partition sizes
+// are strongly correlated with pi mod n; for typical workloads
+// (uniform sizes, or sparsely-distributed outliers) the
+// imbalance is small.
+//
+// Memory implications: WithDecodeAheadPartitions and
+// WithDecodeAheadBytes are PER WORKER — total in-flight decoded
+// memory is multiplied by n. Account for this when tuning.
+//
+// No effect on the buffered Read path.
+func WithDecodeWorkers(n int) ReadOption {
+	if n < 1 {
+		n = 1
+	}
+	return withDecodeWorkersOpt{n: n}
+}
+
+type withDecodeWorkersOpt struct{ n int }
+
+func (o withDecodeWorkersOpt) applyRead(opts *readOpts) {
+	opts.decodeWorkers = o.n
+}
+
+// WithDecodeAheadPartitions tells each decode worker how many
+// decoded partitions it may buffer in its output queue ahead of
+// the emit loop. Default (option not supplied) is 1 — minimum
+// useful lookahead so decode of the worker's next partition
+// overlaps yield of its previous one.
+//
+// n=0 is the explicit-no-buffer mode: unbuffered handoff. The
+// worker still decodes its next partition concurrent with emit
+// draining the previous (the handoff just blocks the worker
+// briefly), but never two decoded partitions per worker sit in
+// memory at once.
 //
 // Negative values are floored to 0.
 //
-// Each buffered partition holds its decoded records in memory
-// until the yield loop consumes them. Memory: O((n+1) partitions)
-// — current + n prefetched.
+// Per-worker semantics: with WithDecodeWorkers(W), the per-call
+// total of buffered decoded partitions is W × n. Memory:
+// O((W × n + 1) partitions) — workers' queues + the one being
+// yielded.
 //
 // No effect on the buffered Read path (which materialises every
 // partition concurrently by design).
@@ -162,17 +202,17 @@ func (o withDecodeAheadPartitionsOpt) applyRead(opts *readOpts) {
 	opts.decodeAheadPartitions = &n
 }
 
-// WithDecodeAheadBytes caps the cumulative uncompressed parquet
-// bytes that may sit decoded in the iter pipeline ahead of the
-// current yield position. Zero (default) disables the cap; only
-// WithDecodeAheadPartitions binds.
+// WithDecodeAheadBytes caps the uncompressed parquet bytes EACH
+// decode worker may hold (currently-decoding + queued for emit).
+// Zero (default) disables the cap; only decodeAheadPartitions
+// binds.
 //
-// Composes with WithDecodeAheadPartitions — both are evaluated and
-// whichever cap binds first holds the producer back. Useful when
-// partition sizes are skewed: a tiny WithDecodeAheadPartitions(1)
-// is too conservative for many small partitions but a larger
-// value risks OOM on a few large ones; a byte cap auto-tunes
-// across both.
+// Composes with WithDecodeAheadPartitions — both are evaluated
+// and whichever cap binds first holds the worker back. Useful
+// when partition sizes are skewed: a tiny
+// WithDecodeAheadPartitions(1) is too conservative for many
+// small partitions but a larger value risks OOM on a few large
+// ones; a byte cap auto-tunes across both.
 //
 // The byte total is read from each parquet file's footer
 // (total_byte_size summed across row groups), so the cap is
@@ -182,8 +222,10 @@ func (o withDecodeAheadPartitionsOpt) applyRead(opts *readOpts) {
 // Per-partition guarantee: if a single partition's uncompressed
 // size exceeds the cap, that one partition still decodes (the
 // cap can't be enforced below partition granularity without
-// row-group-level streaming). The cap only prevents *additional*
-// partitions from joining the buffer.
+// row-group-level streaming).
+//
+// Per-worker semantics: with WithDecodeWorkers(W), the per-call
+// total of decoded uncompressed bytes is W × n.
 //
 // No effect on the buffered Read path.
 func WithDecodeAheadBytes(n int64) ReadOption {

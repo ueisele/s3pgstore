@@ -385,6 +385,92 @@ Reclaims S3 objects whose write transactions rolled back.
 operational notes:
 [`cmd/s3pgstore-gc/README.md`](cmd/s3pgstore-gc/README.md).
 
+## Reading records
+
+Three shapes for reading, all strongly consistent — a successful
+`Write` is visible to every subsequent read the moment its
+PostgreSQL transaction commits, with no settle window:
+
+| API                    | Memory                    | When to use                                                                          |
+| ---------------------- | ------------------------- | ------------------------------------------------------------------------------------ |
+| `Read`                 | All matched partitions    | Bounded result set; every partition decoded in parallel.                             |
+| `ReadIter`             | One partition at a time   | Streaming consumption; backed by the chan-based fetch+decode pipeline.               |
+| `Poll` / `PollRecords` | Sequencer-bounded batch   | Stream replay against monotonic offsets (needs `cmd/s3pgstore-sequencer` running).   |
+
+`ReadIter` has six variants sharing one pipeline, differing only in input shape and emit unit:
+
+| Method                     | Yields                | Filter                                       |
+| -------------------------- | --------------------- | -------------------------------------------- |
+| `ReadIter`                 | record                | `[]PartitionFilter`                          |
+| `ReadPartitionIter`        | `PartitionResult[T]`  | `[]PartitionFilter`                          |
+| `ReadRangeIter`            | record                | `[since, until)` time range                  |
+| `ReadPartitionRangeIter`   | `PartitionResult[T]`  | `[since, until)` time range                  |
+| `ReadEntriesIter`          | record                | pre-resolved `[]StreamEntry` from `Poll`     |
+| `ReadPartitionEntriesIter` | `PartitionResult[T]`  | pre-resolved `[]StreamEntry` from `Poll`     |
+
+### Minimal example
+
+```go
+for r, err := range store.ReadIter(ctx,
+    []s3pgstore.PartitionFilter{
+        s3pgstore.Eq("charge_period", "2026-03-17"),
+    },
+) {
+    if err != nil { return err }
+    fmt.Println(r.NetCost)
+}
+```
+
+Records emit in lex order of partition key, then per-partition
+in `(EntityKeyOf, VersionOf)` ascending order after dedup. Same
+input yields byte-identical sequences across runs (deterministic
+emission contract). Returning `false` from the loop body (early
+`break`) cancels in-flight S3 GETs through ctx propagation.
+
+### Tuning options
+
+All composable; defaults reproduce single-decoder behavior:
+
+| Option                           | Default                                    | What it controls                                                                                                                                                                                                 |
+| -------------------------------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `WithFetchAheadFiles(n)`         | `Config.WorkerPool.MaxConcurrent()` (= 64) | Compressed parquet bodies the fetcher may keep resident (in-flight + landed-but-not-decoded). Dial down in shared-pool deployments where each reader otherwise consumes the full budget.                         |
+| `WithDecodeWorkers(n)`           | 1                                          | Parallel decode goroutines. `n > 1` fans out CPU-bound decode for batch-analytics; workers self-assign partitions round-robin (`pi % n`), emit drains queues in lex order to preserve the emission contract.     |
+| `WithDecodeAheadPartitions(n)`   | 1                                          | Per-worker decoded-partition buffer. With `WithDecodeWorkers(W)` the per-call total is `W × n`. `n=0` is unbuffered handoff (worker blocks on send until emit drains).                                            |
+| `WithDecodeAheadBytes(n)`        | 0 (disabled)                               | Per-worker uncompressed-byte cap. With `WithDecodeWorkers(W)` the per-call total is `W × n`. Empty-buffer escape lets a single oversized partition through.                                                       |
+| `WithHistory()`                  | off                                        | Disable per-partition latest-per-entity dedup; return every `(entity, version)` survivor. No effect if `EntityKeyOf` or `VersionOf` is unconfigured.                                                              |
+
+Worst-case memory for one `ReadIter` call:
+
+```
+compressed bodies  ≤ WithFetchAheadFiles × max_compressed_body
+decoded partitions ≤ (WithDecodeWorkers × WithDecodeAheadPartitions) + 1
+decoded bytes      ≤ WithDecodeWorkers × WithDecodeAheadBytes        (if set)
+```
+
+### Batch analytics: parallel decode for aggregations
+
+The single-decoder default bottlenecks at one CPU regardless of
+pool size — fine for streaming consumption, slow for one-shot
+aggregations across many partitions. For workloads where decode
+dominates fetch latency (typical with many records per
+partition), fan out with `WithDecodeWorkers`:
+
+```go
+var totalCost float64
+for r, err := range store.ReadRangeIter(ctx, monthStart, monthEnd,
+    s3pgstore.WithDecodeWorkers(8),               // one per CPU core
+    s3pgstore.WithDecodeAheadBytes(64*1024*1024), // per-worker; total ≤ 512 MiB
+) {
+    if err != nil { return err }
+    totalCost += r.NetCost
+}
+```
+
+Round-robin assignment can imbalance load when partition sizes
+strongly correlate with `pi mod W`; for typical workloads
+(uniform sizes, or sparsely-distributed outliers) the imbalance
+is small.
+
 ## Environment variables
 
 `s3client.NewClientFromEnv(ctx, prefix, meter)` and the

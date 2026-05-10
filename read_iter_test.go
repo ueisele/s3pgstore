@@ -19,9 +19,7 @@ import (
 )
 
 func newTestStreamState() *streamState {
-	return &streamState{
-		byteWake: make(chan struct{}, 1),
-	}
+	return &streamState{}
 }
 
 // withSlotCap attaches a body-slot semaphore of the given
@@ -37,28 +35,42 @@ func (s *streamState) withSlotCap(cap int) *streamState {
 	return s
 }
 
+// newTestWorkerState builds a per-decode-worker state for
+// reserveBytes/releaseBytes unit tests. Mirrors
+// fetchAndDecodeIter's setup but with a metrics-less worker so
+// tests don't depend on the OTel SDK plumbing — the methods
+// only use m for histogram recording, which the noop default
+// handles.
+func newTestWorkerState() *workerState[any] {
+	m, err := newMetrics(metricsConfig{})
+	if err != nil {
+		panic(err)
+	}
+	return newWorkerState[any](1, m)
+}
+
 // TestReserveBytes_NoCap verifies the cap=0 fast path returns
 // immediately and does not touch bufferedBytes.
 func TestReserveBytes_NoCap(t *testing.T) {
-	s := newTestStreamState()
-	if err := s.reserveBytes(context.Background(), 1<<30, 0); err != nil {
+	ws := newTestWorkerState()
+	if err := ws.reserveBytes(context.Background(), 1<<30, 0); err != nil {
 		t.Fatalf("reserveBytes with cap=0 should return nil, got %v", err)
 	}
-	if s.bufferedBytes != 0 {
+	if ws.bufferedBytes != 0 {
 		t.Errorf("bufferedBytes = %d, want 0 (cap=0 should not reserve)",
-			s.bufferedBytes)
+			ws.bufferedBytes)
 	}
 }
 
 // TestReserveBytes_FitsImmediately reserves a chunk inside the
 // cap and verifies the running total is updated.
 func TestReserveBytes_FitsImmediately(t *testing.T) {
-	s := newTestStreamState()
-	if err := s.reserveBytes(context.Background(), 100, 1000); err != nil {
+	ws := newTestWorkerState()
+	if err := ws.reserveBytes(context.Background(), 100, 1000); err != nil {
 		t.Fatalf("reserveBytes should succeed when fits, got %v", err)
 	}
-	if s.bufferedBytes != 100 {
-		t.Errorf("bufferedBytes = %d, want 100", s.bufferedBytes)
+	if ws.bufferedBytes != 100 {
+		t.Errorf("bufferedBytes = %d, want 100", ws.bufferedBytes)
 	}
 }
 
@@ -66,14 +78,14 @@ func TestReserveBytes_FitsImmediately(t *testing.T) {
 // second reservation that would exceed the cap blocks until
 // the first one is released.
 func TestReserveBytes_BlocksUntilRelease(t *testing.T) {
-	s := newTestStreamState()
-	if err := s.reserveBytes(context.Background(), 700, 1000); err != nil {
+	ws := newTestWorkerState()
+	if err := ws.reserveBytes(context.Background(), 700, 1000); err != nil {
 		t.Fatalf("first reserve should succeed, got %v", err)
 	}
 
 	done := make(chan struct{})
 	go func() {
-		_ = s.reserveBytes(context.Background(), 500, 1000)
+		_ = ws.reserveBytes(context.Background(), 500, 1000)
 		close(done)
 	}()
 
@@ -83,7 +95,7 @@ func TestReserveBytes_BlocksUntilRelease(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 
-	s.releaseBytes(700)
+	ws.releaseBytes(700)
 
 	select {
 	case <-done:
@@ -91,9 +103,9 @@ func TestReserveBytes_BlocksUntilRelease(t *testing.T) {
 		t.Fatal("second reserveBytes should have unblocked after release")
 	}
 
-	if s.bufferedBytes != 500 {
+	if ws.bufferedBytes != 500 {
 		t.Errorf("bufferedBytes = %d, want 500 (only second still held)",
-			s.bufferedBytes)
+			ws.bufferedBytes)
 	}
 }
 
@@ -102,12 +114,12 @@ func TestReserveBytes_BlocksUntilRelease(t *testing.T) {
 // reservation still proceeds (otherwise a single oversized
 // partition would deadlock the pipeline).
 func TestReserveBytes_OversizedSinglePartitionFlows(t *testing.T) {
-	s := newTestStreamState()
-	if err := s.reserveBytes(context.Background(), 2000, 1000); err != nil {
+	ws := newTestWorkerState()
+	if err := ws.reserveBytes(context.Background(), 2000, 1000); err != nil {
 		t.Fatalf("oversized reserve into empty buffer should succeed, got %v", err)
 	}
-	if s.bufferedBytes != 2000 {
-		t.Errorf("bufferedBytes = %d, want 2000", s.bufferedBytes)
+	if ws.bufferedBytes != 2000 {
+		t.Errorf("bufferedBytes = %d, want 2000", ws.bufferedBytes)
 	}
 }
 
@@ -116,15 +128,15 @@ func TestReserveBytes_OversizedSinglePartitionFlows(t *testing.T) {
 // needed so the pipeline can shut down cleanly when the caller
 // breaks out of the iter loop.
 func TestReserveBytes_CtxCancellation(t *testing.T) {
-	s := newTestStreamState()
-	if err := s.reserveBytes(context.Background(), 700, 1000); err != nil {
+	ws := newTestWorkerState()
+	if err := ws.reserveBytes(context.Background(), 700, 1000); err != nil {
 		t.Fatalf("first reserve should succeed, got %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	got := make(chan error, 1)
 	go func() {
-		got <- s.reserveBytes(ctx, 500, 1000)
+		got <- ws.reserveBytes(ctx, 500, 1000)
 	}()
 
 	time.Sleep(10 * time.Millisecond)
@@ -460,6 +472,40 @@ func TestWithFetchAheadFiles_NegativeFloors(t *testing.T) {
 	if o.fetchAheadFiles != 0 {
 		t.Errorf("negative fetchAheadFiles = %d, want 0",
 			o.fetchAheadFiles)
+	}
+}
+
+// TestWithDecodeWorkers_DefaultsToZero verifies the option-not-
+// supplied path leaves decodeWorkers at zero so the downstream
+// numWorkers derivation falls back to the single-decoder default.
+func TestWithDecodeWorkers_DefaultsToZero(t *testing.T) {
+	o := resolveIterOpts(nil)
+	if o.decodeWorkers != 0 {
+		t.Errorf("default decodeWorkers = %d, want 0", o.decodeWorkers)
+	}
+}
+
+// TestWithDecodeWorkers_ExplicitValueHonored confirms a positive
+// value lands on the readOpts field verbatim.
+func TestWithDecodeWorkers_ExplicitValueHonored(t *testing.T) {
+	o := resolveIterOpts([]ReadOption{WithDecodeWorkers(8)})
+	if o.decodeWorkers != 8 {
+		t.Errorf("decodeWorkers = %d, want 8", o.decodeWorkers)
+	}
+}
+
+// TestWithDecodeWorkers_NonPositiveFloors asserts that 0 and
+// negative values floor to 1 (single-decoder, current behavior).
+// Floored at the option boundary so fetchAndDecodeIter never has
+// to reason about a zero-worker config that would deadlock the
+// pipeline.
+func TestWithDecodeWorkers_NonPositiveFloors(t *testing.T) {
+	for _, n := range []int{0, -1, -100} {
+		o := resolveIterOpts([]ReadOption{WithDecodeWorkers(n)})
+		if o.decodeWorkers != 1 {
+			t.Errorf("WithDecodeWorkers(%d): got decodeWorkers=%d, want 1",
+				n, o.decodeWorkers)
+		}
 	}
 }
 

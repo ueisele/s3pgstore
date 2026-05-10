@@ -10,30 +10,6 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Offset is the gap-free monotonic stream cursor assigned by
-// the sequencer. Consumers walk the feed by passing the last-
-// observed offset back to Poll / PollRecords as `since`. Offsets
-// are stable: once observed, an offset never reappears with
-// different content (the sequencer assigns to committed rows
-// only and feed_seq is UNIQUE NOT NULL once set).
-type Offset = int64
-
-// StreamEntry is a file-level entry returned by Poll. It carries
-// enough information to filter (via Extensions) and decode (via
-// DataPath) without re-querying the catalog.
-//
-// Offset is the assigned feed_seq.
-// Key is the partition key the file belongs to.
-// DataPath is the full S3 key (the parquet object location).
-// Extensions carries the ext_<n> column values declared on the
-// Store's Config.ExtensionColumns; missing values appear as nil.
-type StreamEntry struct {
-	Offset     Offset
-	Key        string
-	DataPath   string
-	Extensions map[string]any
-}
-
 // PollOption is the interface implemented by Poll / PollRecords
 // modifiers. The only option in v2.0 is WithUntilOffset.
 type PollOption interface {
@@ -71,9 +47,9 @@ func WithUntilOffset(until Offset) PollOption {
 	return withUntilOffsetOpt{until: until}
 }
 
-// Poll returns the next batch of file-level stream entries with
+// Poll returns the next batch of FileRefs with
 // `feed_seq > since AND feed_seq IS NOT NULL`, ordered by
-// feed_seq, capped at n. Returns the entries and the highest
+// feed_seq, capped at n. Returns the refs and the highest
 // observed offset (suitable for passing back as `since` next
 // time). On an empty result the second return is `since`
 // unchanged — never moves backwards.
@@ -84,10 +60,10 @@ func WithUntilOffset(until Offset) PollOption {
 // Filtering on the catalog is offset-only; consumers wanting
 // per-file filtering (by partition, by extension columns)
 // should filter the returned entries client-side and pass the
-// surviving entries to ReadEntriesIter for decoding.
+// surviving entries to ReadFileRefsIter for decoding.
 func (s *Store[T]) Poll(
 	ctx context.Context, since Offset, n int, opts ...PollOption,
-) (out []StreamEntry, next Offset, err error) {
+) (out []FileRef, next Offset, err error) {
 	defer s.metrics.methodScope(ctx, "Poll", &err).end()
 	if n <= 0 {
 		return nil, since, nil
@@ -97,7 +73,11 @@ func (s *Store[T]) Poll(
 		opt.applyPoll(&o)
 	}
 
-	cols := []string{"feed_seq", "partition_key", "s3_key"}
+	cols := []string{
+		"file_id", "feed_seq", "partition_key", "s3_key",
+		"written_at_version", "written_at", "file_size",
+		"uncompressed_size", "record_count",
+	}
 	for _, c := range s.resolved.ExtensionColumns {
 		cols = append(cols, "ext_"+c.Name)
 	}
@@ -122,9 +102,15 @@ func (s *Store[T]) Poll(
 		}
 		defer rows.Close()
 		for rows.Next() {
+			e := FileRef{
+				Extensions: make(map[string]any,
+					len(s.resolved.ExtensionColumns)),
+			}
 			extValues := make([]any, len(s.resolved.ExtensionColumns))
 			scanArgs := []any{
-				new(int64), new(string), new(string),
+				&e.FileID, &e.Offset, &e.PartitionKey, &e.S3Key,
+				&e.Version, &e.WrittenAt, &e.FileSize,
+				&e.UncompressedSize, &e.RecordCount,
 			}
 			for i := range extValues {
 				scanArgs = append(scanArgs, &extValues[i])
@@ -132,24 +118,14 @@ func (s *Store[T]) Poll(
 			if err := rows.Scan(scanArgs...); err != nil {
 				return err
 			}
-			feedSeq := *scanArgs[0].(*int64)
-			partKey := *scanArgs[1].(*string)
-			s3Key := *scanArgs[2].(*string)
-			extMap := make(map[string]any,
-				len(s.resolved.ExtensionColumns))
 			for i, c := range s.resolved.ExtensionColumns {
 				if extValues[i] != nil {
-					extMap[c.Name] = extValues[i]
+					e.Extensions[c.Name] = extValues[i]
 				}
 			}
-			out = append(out, StreamEntry{
-				Offset:     feedSeq,
-				Key:        partKey,
-				DataPath:   s3Key,
-				Extensions: extMap,
-			})
-			if feedSeq > maxOffset {
-				maxOffset = feedSeq
+			out = append(out, e)
+			if e.Offset > maxOffset {
+				maxOffset = e.Offset
 			}
 		}
 		return rows.Err()
@@ -187,14 +163,14 @@ func (s *Store[T]) PollRecords(
 	bodies := make([][]T, len(entries))
 	if err := fanOutPool(ctx, s.resolved.WorkerPool, entries,
 		s.metrics.fanOutObserverFor("PollRecords"),
-		func(ctx context.Context, i int, e StreamEntry) error {
-			data, err := s.target.get(ctx, e.DataPath)
+		func(ctx context.Context, i int, e FileRef) error {
+			data, err := s.target.get(ctx, e.S3Key)
 			if err != nil {
-				return fmt.Errorf("GET %s: %w", e.DataPath, err)
+				return fmt.Errorf("GET %s: %w", e.S3Key, err)
 			}
 			recs, err := decodeParquet[T](data)
 			if err != nil {
-				return fmt.Errorf("decode %s: %w", e.DataPath, err)
+				return fmt.Errorf("decode %s: %w", e.S3Key, err)
 			}
 			bodies[i] = recs
 			return nil

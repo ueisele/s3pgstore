@@ -445,7 +445,7 @@ func newMetrics(cfg metricsConfig) (*metrics, error) {
 //
 // Usage:
 //
-//	func (s *Store[T]) Write(ctx, ...) (out []WriteResult, err error) {
+//	func (s *Store[T]) Write(ctx, ...) (out []FileRef, err error) {
 //	    defer s.metrics.methodScope(ctx, "Write", &err).end()
 //	    ...
 //	}

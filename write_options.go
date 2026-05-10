@@ -58,7 +58,7 @@ func (s *Store[T]) resolveWriteOpts(opts ...WriteOption) (writeOpts, error) {
 // WithIdempotencyToken returns a WriteOption that tags the
 // write with token for retry-safe idempotency. Retries with
 // the same (partition_key, token) pair return the original
-// WriteResult without producing a second catalog row.
+// FileRef without producing a second catalog row.
 //
 // Mutually exclusive with WithIdempotencyTokenOf — passing
 // both fails Write at the call site (caught when options

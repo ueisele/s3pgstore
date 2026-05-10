@@ -4,7 +4,7 @@ package s3pgstore
 // https://github.com/ueisele/s3store/blob/da75ca9/reader_iter_test.go
 // Copyright (c) 2024-2026 Uwe Eisele. MIT License.
 //
-// Adapted to s3pgstore: keyMeta → fileRow; methodKind →
+// Adapted to s3pgstore: keyMeta → FileRef; methodKind →
 // string method label; runDeadlockObserver takes a string
 // method now (not a *methodScope); metric assertions use the
 // in-package OTel SDK reader pattern from metrics_test.go.
@@ -377,7 +377,7 @@ func TestWaitForPartition_BlocksUntilComplete(t *testing.T) {
 	s := newTestStreamState()
 	s.parts = []*partState{
 		{
-			files:  make([]fileRow, 3),
+			files:  make([]FileRef, 3),
 			bodies: make([][]byte, 3),
 			done:   make(chan struct{}),
 		},

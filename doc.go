@@ -7,8 +7,8 @@
 //   - Write, WriteWithKey: encode []T as Parquet, PUT to S3, INSERT
 //     a catalog row in PostgreSQL. Atomic visibility on commit.
 //   - Read, ReadIter, ReadPartitionIter, ReadRangeIter,
-//     ReadPartitionRangeIter, ReadEntriesIter,
-//     ReadPartitionEntriesIter: query the catalog, fetch matching
+//     ReadPartitionRangeIter, ReadFileRefsIter,
+//     ReadPartitionFileRefsIter: query the catalog, fetch matching
 //     Parquet files in parallel, decode into []T, optionally dedup
 //     latest-per-entity in memory.
 //   - Poll, PollRecords, OffsetAt: stream change entries via a

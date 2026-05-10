@@ -97,6 +97,9 @@ func TestWrite_SinglePartition(t *testing.T) {
 	if r.S3Key == "" {
 		t.Errorf("S3Key: empty")
 	}
+	if r.WrittenAt.IsZero() {
+		t.Errorf("WrittenAt: want non-zero")
+	}
 
 	// S3 object exists.
 	if _, err := f.S3Client.HeadObject(t.Context(), &s3.HeadObjectInput{
@@ -145,7 +148,7 @@ func TestWrite_SinglePartition(t *testing.T) {
 }
 
 // TestWrite_MultiPartition: records spanning multiple
-// partitions produce one WriteResult per partition, in
+// partitions produce one FileRef per partition, in
 // lex order of partition key.
 func TestWrite_MultiPartition(t *testing.T) {
 	f := newFixture(t)
@@ -362,7 +365,7 @@ func TestWriteWithKey_ValidatesKey(t *testing.T) {
 }
 
 // TestWriteWithKey_OK: explicit key produces a single
-// WriteResult.
+// FileRef.
 func TestWriteWithKey_OK(t *testing.T) {
 	f := newFixture(t)
 	store := newWriteStore(t, f)

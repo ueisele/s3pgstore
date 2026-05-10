@@ -3,10 +3,9 @@ package s3pgstore
 // read.go is the read path for s3pgstore: the public entry
 // points (Read / ReadPartition / ReadIter and its variants),
 // the catalog SELECT helpers (selectFileRows /
-// selectFileRowsByRange / queryFileRows / entriesToFileRows),
-// and the chan-based fetch+decode pipeline (fetchAndDecodeIter
-// and the stream/worker state machinery) that backs every entry
-// point.
+// selectFileRowsByRange / queryFileRows), and the chan-based
+// fetch+decode pipeline (fetchAndDecodeIter and the stream/worker
+// state machinery) that backs every entry point.
 //
 // The pipeline is vendored from
 // https://github.com/ueisele/s3store/blob/da75ca9/reader_iter.go
@@ -24,19 +23,21 @@ package s3pgstore
 //
 //   - s3store.Reader[T] → s3pgstore.Store[T]; Target is reached
 //     via s.target rather than s.cfg.Target.
-//   - keyMeta → fileRow: the catalog gives us partition_key,
+//   - keyMeta → FileRef: the catalog gives us partition_key,
 //     written_at_version, and ext_<n> values per file at
-//     SELECT time, so partState carries fileRow directly. No
+//     SELECT time, so partState carries FileRef directly. No
 //     hiveKeyOfDataFile parsing — the partition is already in
-//     the row.
+//     the row. FileRef is also the public type returned by Poll
+//     and consumed by ReadFileRefsIter, so the entries-input path
+//     hands its slice straight to the pipeline (no projection).
 //   - tolerantOfMissingData is gone: s3pgstore has no ref-stream
 //     gate, every read path is strict. NoSuchKey from S3
 //     surfaces as a wrapped error (operator-driven prune is
 //     incident-class, not silently skipped).
 //   - The `keys []keyMeta` upstream argument splits into three
 //     input modes here (filters / time range / pre-resolved
-//     entries); each method enumerates fileRow and hands them
-//     to the same pipeline.
+//     entries); each method enumerates FileRef and hands the
+//     slice to the same pipeline.
 //   - Methods retain s3pgstore signatures: ReadIter takes
 //     `[]PartitionFilter`, ReadPartitionIter yields
 //     PartitionResult[T] (carrying Version + FileExtensions),
@@ -99,7 +100,7 @@ type FileExtensions struct {
 // (W=1, K=1) into any field the user left unset. Designed for
 // streaming consumers — single-decoder, minimum lookahead. Pass
 // to fetchAndDecodeIter from every ReadIter / ReadPartitionIter /
-// ReadRangeIter / ReadEntriesIter call.
+// ReadRangeIter / ReadFileRefsIter call.
 //
 // User-supplied options always win: WithDecodeWorkers(N) /
 // WithDecodeAheadPartitions(K) set the field before this runs;
@@ -286,14 +287,20 @@ func (s *Store[T]) ReadPartitionIter(
 	}
 }
 
-// ReadRangeIter walks every record whose feed_seq_at falls in
+// ReadRangeIter walks every record whose written_at falls in
 // [since, until). Bounds are resolved at call entry via the
 // SELECT's WHERE clause, so the upper bound stays stable under
 // concurrent writes — once the catalog SELECT runs, no new rows
 // can appear in the result set.
 //
+// Filters by write commit time, not sequencer-assignment time:
+// recently-written rows that the sequencer hasn't yet processed
+// are still visible (consistent with the atomic-visibility-on-
+// commit invariant in CLAUDE.md). Use Poll / PollRecords if you
+// need a sequenced-rows-only view.
+//
 // Half-open semantics:
-//   - since.IsZero() → start at the stream head (unbounded
+//   - since.IsZero() → start from the earliest write (unbounded
 //     below).
 //   - until.IsZero() → walk to the live tip (unbounded above —
 //     captured by the SELECT; rows committed after the SELECT
@@ -343,76 +350,59 @@ func (s *Store[T]) ReadPartitionRangeIter(
 	}
 }
 
-// ReadEntriesIter decodes pre-resolved StreamEntry slices
-// without re-querying the catalog. Each entry's S3 key is
-// validated up front against this Store's bucket+prefix; an
-// entry from a different Store fails with an error before any
-// S3 traffic.
+// ReadFileRefsIter decodes pre-resolved FileRef slices without
+// re-querying the catalog. Each ref's S3Key is validated up
+// front against this Store's bucket+prefix; an entry from a
+// different Store fails with an error before any S3 traffic.
 //
-// Records emit in lex order of partition key (Key field). The
+// Records emit in lex order of PartitionKey. The
 // pipeline groups by partition first and sorts the partition
 // keys lex before driving the producer — the input slice's
 // order is not preserved across partitions (per the
 // "Deterministic emission order" contract in CLAUDE.md).
-func (s *Store[T]) ReadEntriesIter(
-	ctx context.Context, entries []StreamEntry,
+func (s *Store[T]) ReadFileRefsIter(
+	ctx context.Context, entries []FileRef,
 	opts ...ReadOption,
 ) iter.Seq2[T, error] {
 	return func(yield func(T, error) bool) {
 		var iterErr error
-		defer s.metrics.methodScope(ctx, "ReadEntriesIter", &iterErr).end()
+		defer s.metrics.methodScope(ctx, "ReadFileRefsIter", &iterErr).end()
 		o := resolveIterOpts(opts)
-		if err := s.validateEntries(entries); err != nil {
+		if err := s.validateFileRefs(entries); err != nil {
 			iterErr = err
 			yield(*new(T), err)
 			return
 		}
-		rows := entriesToFileRows(entries, s.resolved.ExtensionColumns)
-		s.fetchAndDecodeIter(ctx, "ReadEntriesIter", rows, &o,
+		s.fetchAndDecodeIter(ctx, "ReadFileRefsIter", entries, &o,
 			iterStreamDefaults, s.recordEmit(yield, &iterErr))
 	}
 }
 
-// ReadPartitionEntriesIter is the per-partition variant of
-// ReadEntriesIter.
-func (s *Store[T]) ReadPartitionEntriesIter(
-	ctx context.Context, entries []StreamEntry,
+// ReadPartitionFileRefsIter is the per-partition variant of
+// ReadFileRefsIter.
+func (s *Store[T]) ReadPartitionFileRefsIter(
+	ctx context.Context, entries []FileRef,
 	opts ...ReadOption,
 ) iter.Seq2[PartitionResult[T], error] {
 	return func(yield func(PartitionResult[T], error) bool) {
 		var iterErr error
-		defer s.metrics.methodScope(ctx, "ReadPartitionEntriesIter", &iterErr).end()
+		defer s.metrics.methodScope(ctx, "ReadPartitionFileRefsIter", &iterErr).end()
 		o := resolveIterOpts(opts)
-		if err := s.validateEntries(entries); err != nil {
+		if err := s.validateFileRefs(entries); err != nil {
 			iterErr = err
 			yield(PartitionResult[T]{}, err)
 			return
 		}
-		rows := entriesToFileRows(entries, s.resolved.ExtensionColumns)
-		s.fetchAndDecodeIter(ctx, "ReadPartitionEntriesIter", rows, &o,
+		s.fetchAndDecodeIter(ctx, "ReadPartitionFileRefsIter", entries, &o,
 			iterStreamDefaults, s.partitionEmit(yield, &iterErr))
 	}
-}
-
-// fileRow is one row from the read-path SELECT. Field
-// ordering mirrors the SELECT column list so Scan args stay
-// in step with the SQL.
-type fileRow struct {
-	fileID           int64
-	partitionKey     string
-	s3Key            string
-	writtenAtVersion int64
-	// extValues holds the ext_<n> columns, in declaration
-	// order matching s.resolved.ExtensionColumns. Pulled out
-	// into the FileExtensions.Extensions map at read time.
-	extValues []any
 }
 
 // selectFileRows resolves a partition-filter expression into a
 // WHERE clause and runs the catalog SELECT via queryFileRows.
 func (s *Store[T]) selectFileRows(
 	ctx context.Context, filters []PartitionFilter,
-) ([]fileRow, error) {
+) ([]FileRef, error) {
 	where, args, err := translateFilters(filters,
 		partColResolver(s.resolved.PartitionKeyParts))
 	if err != nil {
@@ -422,30 +412,41 @@ func (s *Store[T]) selectFileRows(
 }
 
 // selectFileRowsByRange runs the catalog SELECT filtered by
-// feed_seq_at (unbounded sides default to open-ended). Rows
-// with feed_seq IS NULL (not yet sequenced) are excluded so the
-// result is stable under sequencer races.
+// written_at (the row's INSERT-time timestamp; unbounded sides
+// default to open-ended). All committed rows in the window are
+// returned regardless of sequencer state — atomic-visibility-on-
+// commit per CLAUDE.md.
 //
 // Bound semantics:
-//   - since: feed_seq_at >= since (zero → unbounded below).
-//   - until: feed_seq_at < until (zero → unbounded above; the
+//   - since: written_at >= since (zero → unbounded below).
+//   - until: written_at < until (zero → unbounded above; the
 //     "live tip captured at call entry" property holds because
 //     the catalog row count is monotonically non-decreasing in
 //     v2.0 — files are never deleted).
+//
+// Note: no dedicated index on written_at exists today; this is a
+// seq scan. The (partition_key, written_at) composite is leading
+// on partition_key so it doesn't help cross-partition range
+// scans. Operators with hot range queries can add a (written_at)
+// index — separate change, no library knob required.
 func (s *Store[T]) selectFileRowsByRange(
 	ctx context.Context, since, until time.Time,
-) ([]fileRow, error) {
-	parts := []string{"feed_seq IS NOT NULL"}
+) ([]FileRef, error) {
+	parts := []string{}
 	args := []any{}
 	if !since.IsZero() {
 		args = append(args, since.UTC())
 		parts = append(parts,
-			fmt.Sprintf("feed_seq_at >= $%d", len(args)))
+			fmt.Sprintf("written_at >= $%d", len(args)))
 	}
 	if !until.IsZero() {
 		args = append(args, until.UTC())
 		parts = append(parts,
-			fmt.Sprintf("feed_seq_at < $%d", len(args)))
+			fmt.Sprintf("written_at < $%d", len(args)))
+	}
+	if len(parts) == 0 {
+		// Both bounds zero — match every row.
+		parts = append(parts, "TRUE")
 	}
 	return s.queryFileRows(ctx, strings.Join(parts, " AND "), args)
 }
@@ -457,15 +458,21 @@ func (s *Store[T]) selectFileRowsByRange(
 // per-partition file order is deterministic (lex by S3 key —
 // required for the dedup tie-break per CLAUDE.md).
 //
-// Projection is fixed to the shape consumed by preparePartitions:
+// Projection covers every FileRef field the catalog stores:
 //
 //	file_id, partition_key, s3_key, written_at_version,
-//	ext_<col1>, ext_<col2>, ...
+//	written_at, file_size, uncompressed_size, record_count,
+//	feed_seq, ext_<col1>, ext_<col2>, ...
+//
+// feed_seq is nullable (NULL until the sequencer assigns) and
+// scanned into FileRef.Offset as NoOffset on NULL.
 func (s *Store[T]) queryFileRows(
 	ctx context.Context, where string, args []any,
-) ([]fileRow, error) {
+) ([]FileRef, error) {
 	cols := []string{
 		"file_id", "partition_key", "s3_key", "written_at_version",
+		"written_at", "file_size", "uncompressed_size",
+		"record_count", "feed_seq",
 	}
 	for _, c := range s.resolved.ExtensionColumns {
 		cols = append(cols, "ext_"+c.Name)
@@ -476,7 +483,7 @@ func (s *Store[T]) queryFileRows(
 		ORDER BY partition_key, s3_key`,
 		strings.Join(cols, ", "), s.names.Files(), where)
 
-	var out []fileRow
+	var out []FileRef
 	err := s.cfg.Executor.Run(ctx, func(d DBTX) error {
 		rows, err := d.Query(ctx, q, args...)
 		if err != nil {
@@ -484,20 +491,32 @@ func (s *Store[T]) queryFileRows(
 		}
 		defer rows.Close()
 		for rows.Next() {
-			r := fileRow{
-				extValues: make([]any, len(s.resolved.ExtensionColumns)),
+			e := FileRef{
+				Extensions: make(map[string]any,
+					len(s.resolved.ExtensionColumns)),
 			}
+			var feedSeq *int64
+			extValues := make([]any, len(s.resolved.ExtensionColumns))
 			scanArgs := []any{
-				&r.fileID, &r.partitionKey,
-				&r.s3Key, &r.writtenAtVersion,
+				&e.FileID, &e.PartitionKey, &e.S3Key, &e.Version,
+				&e.WrittenAt, &e.FileSize, &e.UncompressedSize,
+				&e.RecordCount, &feedSeq,
 			}
-			for i := range r.extValues {
-				scanArgs = append(scanArgs, &r.extValues[i])
+			for i := range extValues {
+				scanArgs = append(scanArgs, &extValues[i])
 			}
 			if err := rows.Scan(scanArgs...); err != nil {
 				return err
 			}
-			out = append(out, r)
+			if feedSeq != nil {
+				e.Offset = *feedSeq
+			}
+			for i, c := range s.resolved.ExtensionColumns {
+				if extValues[i] != nil {
+					e.Extensions[c.Name] = extValues[i]
+				}
+			}
+			out = append(out, e)
 		}
 		return rows.Err()
 	})
@@ -507,7 +526,7 @@ func (s *Store[T]) queryFileRows(
 	return out, nil
 }
 
-// validateEntries verifies every entry's DataPath lives under
+// validateFileRefs verifies every entry's S3Key lives under
 // this Store's data prefix. Catches "entries from a different
 // Store" before any S3 traffic — much cheaper to fail upfront
 // than to discover via 404 mid-iteration.
@@ -515,55 +534,23 @@ func (s *Store[T]) queryFileRows(
 // Cross-Store entries are an easy mistake to make (poll one
 // Store, decode in another) and the error message points to
 // the offending key.
-func (s *Store[T]) validateEntries(entries []StreamEntry) error {
+func (s *Store[T]) validateFileRefs(entries []FileRef) error {
 	dataPrefix := s.dataPath() + "/"
 	for i, e := range entries {
-		if !strings.HasPrefix(e.DataPath, dataPrefix) {
+		if !strings.HasPrefix(e.S3Key, dataPrefix) {
 			return fmt.Errorf(
-				"entries[%d].DataPath %q does not belong to "+
+				"entries[%d].S3Key %q does not belong to "+
 					"this Store (expected prefix %q)",
-				i, e.DataPath, dataPrefix)
+				i, e.S3Key, dataPrefix)
 		}
 	}
 	return nil
 }
 
-// entriesToFileRows projects StreamEntry into the internal
-// fileRow shape so the entries pipeline reuses the same
-// preparePartitions / decode machinery as the catalog-driven
-// paths.
-//
-// Extensions are decoded by name into the same positional slot
-// as the SELECT path, leaving missing keys as nil. fileID and
-// writtenAtVersion are not exposed via StreamEntry; iter
-// callers reading via the entries path get a meaningful
-// PartitionResult.Version only when the entries' s3_key lex
-// order yields it (currently always 0 since StreamEntry
-// doesn't carry written_at_version). Documented behavior.
-func entriesToFileRows(
-	entries []StreamEntry, extCols []ExtensionColumn,
-) []fileRow {
-	out := make([]fileRow, len(entries))
-	for i, e := range entries {
-		extValues := make([]any, len(extCols))
-		for j, c := range extCols {
-			if v, ok := e.Extensions[c.Name]; ok {
-				extValues[j] = v
-			}
-		}
-		out[i] = fileRow{
-			partitionKey: e.Key,
-			s3Key:        e.DataPath,
-			extValues:    extValues,
-		}
-	}
-	return out
-}
-
 // recordEmit returns the per-batch emit callback that flattens
 // each partition's already-dedup'd records into the consumer's
 // iter.Seq2[T, error] yield. Used by ReadIter / ReadRangeIter /
-// ReadEntriesIter — paths that surface records one at a time.
+// ReadFileRefsIter — paths that surface records one at a time.
 //
 // On a hard pipeline error: sets *iterErr, yields (zero T, err)
 // once, returns false so the emit loop terminates and the
@@ -590,7 +577,7 @@ func (s *Store[T]) recordEmit(
 // partitionEmit returns the per-batch emit callback that yields
 // one PartitionResult[T] per partition. Used by
 // ReadPartitionIter / ReadPartitionRangeIter /
-// ReadPartitionEntriesIter — paths that surface records grouped
+// ReadPartitionFileRefsIter — paths that surface records grouped
 // by partition.
 //
 // On a hard pipeline error: sets *iterErr, yields a zero
@@ -657,8 +644,8 @@ func partitionCollectEmit[T any](
 
 // fetchAndDecodeIter is the chan-based streaming pipeline
 // backing every ReadIter / ReadPartitionIter / ReadRangeIter /
-// ReadPartitionRangeIter / ReadEntriesIter /
-// ReadPartitionEntriesIter call.
+// ReadPartitionRangeIter / ReadFileRefsIter /
+// ReadPartitionFileRefsIter call.
 //
 // Three concurrent stages plus the caller's emit loop:
 //
@@ -697,14 +684,14 @@ func partitionCollectEmit[T any](
 // consumer of one ReadIter cannot starve unrelated Stores
 // sharing the pool.
 func (s *Store[T]) fetchAndDecodeIter(
-	ctx context.Context, method string, rows []fileRow,
+	ctx context.Context, method string, entries []FileRef,
 	opts *readOpts, applyDefaults func(*readOpts, int),
 	emitOne func(decodedBatch[T]) bool,
 ) {
-	if len(rows) == 0 {
+	if len(entries) == 0 {
 		return
 	}
-	parts := s.preparePartitions(rows)
+	parts := s.preparePartitions(entries)
 	if len(parts) == 0 {
 		return
 	}
@@ -859,26 +846,26 @@ func (s *Store[T]) fetchAndDecodeIter(
 	}
 }
 
-// preparePartitions groups rows by partition_key (rows must
-// arrive in lex partition_key, then s3_key order — both the
-// SQL ORDER BY and the entries-path projection produce that
-// order, EXCEPT the entries path doesn't sort. Defensive sort
-// here regardless: cheap on already-sorted input, mandatory for
-// out-of-order input.
+// preparePartitions groups entries by partition_key (entries
+// must arrive in lex partition_key, then s3_key order — both
+// the SQL ORDER BY and Poll's projection produce that order,
+// EXCEPT a caller-supplied entries slice may be unordered.
+// Defensive sort here regardless: cheap on already-sorted input,
+// mandatory for out-of-order input.
 //
-// Each partition's files are sorted by S3 key (deterministic
-// download order); per-file writtenAtVersion + ext_<n> values
-// are pre-aggregated so the decoded batch can carry Version +
-// FileExtensions without a second pass over fileRow.
+// Each partition's files are sorted by S3Key (deterministic
+// download order); per-file Version + Extensions are already on
+// the FileRef, so the decoded batch can carry PartitionResult's
+// Version + FileExtensions without a second pass.
 func (s *Store[T]) preparePartitions(
-	rows []fileRow,
+	entries []FileRef,
 ) []*partState {
-	if len(rows) == 0 {
+	if len(entries) == 0 {
 		return nil
 	}
-	byPartition := make(map[string][]fileRow)
-	for _, r := range rows {
-		byPartition[r.partitionKey] = append(byPartition[r.partitionKey], r)
+	byPartition := make(map[string][]FileRef)
+	for _, e := range entries {
+		byPartition[e.PartitionKey] = append(byPartition[e.PartitionKey], e)
 	}
 	partitionKeys := make([]string, 0, len(byPartition))
 	for k := range byPartition {
@@ -886,7 +873,7 @@ func (s *Store[T]) preparePartitions(
 	}
 	// Public contract: partition emission is lex-ordered. Every
 	// read path (Read / ReadIter / ReadPartitionIter / ... /
-	// ReadEntriesIter / ReadPartitionEntriesIter) flows through
+	// ReadFileRefsIter / ReadPartitionFileRefsIter) flows through
 	// this sort. Removing it surfaces Go's randomized map
 	// iteration order to the consumer and breaks byte-for-byte
 	// stable output across calls — see "Deterministic emission
@@ -896,30 +883,23 @@ func (s *Store[T]) preparePartitions(
 	parts := make([]*partState, 0, len(partitionKeys))
 	for _, k := range partitionKeys {
 		files := byPartition[k]
-		// Per-partition file ordering by s3_key — deterministic
+		// Per-partition file ordering by S3Key — deterministic
 		// decode order within a partition, also load-bearing for
 		// dedup tie-break (lex-later filename wins on equal
 		// max version, per CLAUDE.md).
-		slices.SortFunc(files, func(a, b fileRow) int {
-			return strings.Compare(a.s3Key, b.s3Key)
+		slices.SortFunc(files, func(a, b FileRef) int {
+			return strings.Compare(a.S3Key, b.S3Key)
 		})
 
 		var version int64
 		exts := make([]FileExtensions, 0, len(files))
 		for _, f := range files {
-			if f.writtenAtVersion > version {
-				version = f.writtenAtVersion
-			}
-			extMap := make(map[string]any,
-				len(s.resolved.ExtensionColumns))
-			for j, c := range s.resolved.ExtensionColumns {
-				if j < len(f.extValues) && f.extValues[j] != nil {
-					extMap[c.Name] = f.extValues[j]
-				}
+			if f.Version > version {
+				version = f.Version
 			}
 			exts = append(exts, FileExtensions{
-				FileID:     f.fileID,
-				Extensions: extMap,
+				FileID:     f.FileID,
+				Extensions: f.Extensions,
 			})
 		}
 
@@ -957,7 +937,7 @@ func (s *Store[T]) preparePartitions(
 // receives that cause via waitForPartition's return value.
 type partState struct {
 	partitionKey string
-	files        []fileRow
+	files        []FileRef
 	version      int64
 	exts         []FileExtensions
 	bodies       [][]byte
@@ -1322,7 +1302,7 @@ func (s *Store[T]) runFetcher(
 				// to markComplete or recordHardErr here.
 				return
 			}
-			key := state.parts[pi].files[fi].s3Key
+			key := state.parts[pi].files[fi].S3Key
 			g.Submit(ctx, func(ctx context.Context) error {
 				body, err := s.target.get(ctx, key)
 				if err != nil {
@@ -1449,7 +1429,7 @@ func (s *Store[T]) decodePartition(
 		state.releaseBodySlots(1)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"decode %s: %w", ps.files[fi].s3Key, err)
+				"decode %s: %w", ps.files[fi].S3Key, err)
 		}
 		out = append(out, recs...)
 	}
@@ -1527,7 +1507,7 @@ func footerStats(p *partState) (uncomp, totalRows int64, err error) {
 			bytes.NewReader(body), int64(len(body)))
 		if openErr != nil {
 			return 0, 0, fmt.Errorf(
-				"open %s: %w", p.files[fi].s3Key, openErr)
+				"open %s: %w", p.files[fi].S3Key, openErr)
 		}
 		for _, rg := range f.Metadata().RowGroups {
 			uncomp += rg.TotalByteSize

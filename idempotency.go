@@ -46,42 +46,49 @@ func (s *Store[T]) resolveTokenForPartition(
 	return "", nil
 }
 
-// lookupTokenWriteResult resolves an existing
-// (partition_key, idempotency_token) row to its WriteResult.
+// lookupTokenFileRef resolves an existing
+// (partition_key, idempotency_token) row to its FileRef.
 // Returns (zero, false, nil) when no row matches.
-func (s *Store[T]) lookupTokenWriteResult(
+func (s *Store[T]) lookupTokenFileRef(
 	ctx context.Context, partitionKey, token string,
-) (WriteResult, bool, error) {
+) (FileRef, bool, error) {
+	e := FileRef{
+		Extensions: make(map[string]any,
+			len(s.resolved.ExtensionColumns)),
+	}
 	var (
-		fileID, version  int64
-		s3Key            string
-		fileSize         int
-		uncompressedSize int64
-		recordCount      int
+		feedSeq   *int64
+		extValues = make([]any, len(s.resolved.ExtensionColumns))
 	)
 	err := s.cfg.Executor.Run(ctx, func(d DBTX) error {
+		scanArgs := []any{
+			&e.FileID, &e.PartitionKey, &e.S3Key, &e.Version,
+			&e.WrittenAt, &e.FileSize, &e.UncompressedSize,
+			&e.RecordCount, &feedSeq,
+		}
+		for i := range extValues {
+			scanArgs = append(scanArgs, &extValues[i])
+		}
 		row := d.QueryRow(ctx,
 			s.sql.idempotencyLookup,
 			partitionKey, token)
-		return row.Scan(
-			&fileID, &s3Key, &version,
-			&fileSize, &uncompressedSize, &recordCount)
+		return row.Scan(scanArgs...)
 	})
 	if err != nil {
 		if isNoRowsErr(err) {
-			return WriteResult{}, false, nil
+			return FileRef{}, false, nil
 		}
-		return WriteResult{}, false, err
+		return FileRef{}, false, err
 	}
-	return WriteResult{
-		PartitionKey:     partitionKey,
-		S3Key:            s3Key,
-		FileID:           fileID,
-		Version:          version,
-		RecordCount:      recordCount,
-		FileSize:         fileSize,
-		UncompressedSize: uncompressedSize,
-	}, true, nil
+	if feedSeq != nil {
+		e.Offset = *feedSeq
+	}
+	for i, c := range s.resolved.ExtensionColumns {
+		if extValues[i] != nil {
+			e.Extensions[c.Name] = extValues[i]
+		}
+	}
+	return e, true, nil
 }
 
 // LookupByToken probes the (partition_key, idempotency_token)
@@ -93,22 +100,22 @@ func (s *Store[T]) lookupTokenWriteResult(
 // return distinguishes "missing" from "transport error."
 func (s *Store[T]) LookupByToken(
 	ctx context.Context, partitionKey, token string,
-) (res WriteResult, hit bool, err error) {
+) (res FileRef, hit bool, err error) {
 	defer s.metrics.methodScope(ctx, "LookupByToken", &err).end()
 
 	if partitionKey == "" {
-		return WriteResult{}, false, errors.New(
+		return FileRef{}, false, errors.New(
 			"LookupByToken: partitionKey is empty")
 	}
 	if token == "" {
-		return WriteResult{}, false, errors.New(
+		return FileRef{}, false, errors.New(
 			"LookupByToken: token is empty")
 	}
 	if _, err := partitionKeyValues(partitionKey,
 		s.resolved.PartitionKeyParts); err != nil {
-		return WriteResult{}, false, err
+		return FileRef{}, false, err
 	}
-	res, hit, err = s.lookupTokenWriteResult(ctx, partitionKey, token)
+	res, hit, err = s.lookupTokenFileRef(ctx, partitionKey, token)
 	if err == nil {
 		s.metrics.recordLookupByToken(ctx, hit)
 	}

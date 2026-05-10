@@ -20,6 +20,81 @@ import (
 // configuration.
 const defaultWorkerPoolSize = 64
 
+// Offset is the gap-free monotonic stream cursor assigned by
+// the sequencer. Consumers walk the feed by passing the last-
+// observed offset back to Poll / PollRecords as `since`. Offsets
+// are stable: once observed, an offset never reappears with
+// different content (the sequencer assigns to committed rows
+// only and feed_seq is UNIQUE NOT NULL once set).
+type Offset = int64
+
+// NoOffset is the sentinel Offset value for "no feed_seq
+// assigned" (or "not selected"). Sequencer assignment starts at
+// 1, so NoOffset (0) is never a live offset and is safe to use
+// as both an initial cursor (Poll(ctx, NoOffset, n) reads from
+// the head) and a not-yet-sequenced marker on FileRef.Offset
+// (set by Write and the non-Poll Read paths whose SELECT does
+// not project feed_seq).
+const NoOffset Offset = 0
+
+// FileRef is a reference to a single file in the catalog. It
+// carries enough metadata to identify the file (FileID), locate
+// it in S3 (S3Key), describe its version (Version, Offset),
+// describe when and at what shape it was written (WrittenAt,
+// RecordCount, FileSize, UncompressedSize), and filter it
+// (Extensions) — but not the file's data; the records are
+// fetched separately via ReadFileRefsIter.
+//
+// The unifying type across Write, Poll, and the read paths.
+// Field names align with the catalog columns and across the
+// public surface so the type a writer learns about a file from
+// matches the type a reader walks files with: the result of
+// Write can be passed straight into ReadFileRefsIter.
+//
+// Every field is populated from every source EXCEPT Offset,
+// which is populated by Poll (always; Poll only walks sequenced
+// rows) and by Read paths (when the underlying row's feed_seq is
+// non-NULL); Write returns NoOffset because the sequencer
+// assigns feed_seq asynchronously after the write commits.
+// Compare Offset against NoOffset (or any value <= 0) to test
+// whether it's meaningful.
+//
+// Field semantics:
+//   - FileID: s3pgstore_files.file_id (BIGSERIAL primary key).
+//   - PartitionKey: the partition this file belongs to.
+//   - S3Key: full S3 key (the parquet object location).
+//   - Version: the partition version this file was written at;
+//     load-bearing for PartitionResult.Version derivation per
+//     CLAUDE.md.
+//   - WrittenAt: the row's INSERT-time timestamp (PostgreSQL
+//     now() at the wrapping write tx), in UTC. The atomic-
+//     visibility-on-commit invariant pins this to the moment the
+//     Write call's tx committed.
+//   - RecordCount: number of records (rows) the parquet file
+//     contains.
+//   - FileSize: compressed parquet bytes (the size of the object
+//     on S3).
+//   - UncompressedSize: sum of TotalUncompressedSize across every
+//     column chunk; useful for compression-ratio dashboards and
+//     for downstream consumers that materialize the decoded data.
+//   - Extensions: ext_<n> column values declared on the Store's
+//     Config.ExtensionColumns; missing/NULL columns are absent
+//     from the map.
+//   - Offset: assigned feed_seq, or NoOffset if not populated by
+//     the source.
+type FileRef struct {
+	FileID           int64
+	PartitionKey     string
+	S3Key            string
+	Version          int64
+	WrittenAt        time.Time
+	RecordCount      int64
+	FileSize         int64
+	UncompressedSize int64
+	Extensions       map[string]any
+	Offset           Offset
+}
+
 // Store is the typed entry point for writing and reading
 // records. Construct via New[T]; New runs Config validation,
 // constructs the parquet encoder, builds the S3 target, and
@@ -97,7 +172,7 @@ func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
 		partitionUpsertExpect:   names.PartitionUpsertSQL(r.PartitionKeyParts, true),
 		partitionUpsertNoExpect: names.PartitionUpsertSQL(r.PartitionKeyParts, false),
 		filesInsert:             names.FilesInsertSQL(r.PartitionKeyParts, extNames),
-		idempotencyLookup:       names.IdempotencyLookupSQL(),
+		idempotencyLookup:       names.IdempotencyLookupSQL(extNames),
 		pollLag:                 names.PollLagSQL(),
 		pendingWritesDepth:      names.PendingWritesDepthSQL(),
 		mvInserts:               make(map[string]string, len(cfg.MaterializedViews)),

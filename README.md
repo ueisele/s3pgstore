@@ -27,7 +27,7 @@ PostgreSQL-coordinated Parquet on S3. The v2 of the
   pessimistic locking (`LockPartition`). Concurrent writes to the
   same partition fail loudly instead of silently overwriting.
 - **Idempotent retries** of the same `(partition_key,
-  idempotency_token)` return the original `WriteResult`,
+  idempotency_token)` return the original `FileRef`,
   unbounded in time.
 
 ## Why s3pgstore
@@ -412,8 +412,8 @@ to single-decoder for streaming.
 | `ReadPartitionIter`        | yields `PartitionResult[T]`| `[]PartitionFilter`                          |
 | `ReadRangeIter`            | yields `T`                 | `[since, until)` time range                  |
 | `ReadPartitionRangeIter`   | yields `PartitionResult[T]`| `[since, until)` time range                  |
-| `ReadEntriesIter`          | yields `T`                 | pre-resolved `[]StreamEntry` from `Poll`     |
-| `ReadPartitionEntriesIter` | yields `PartitionResult[T]`| pre-resolved `[]StreamEntry` from `Poll`     |
+| `ReadFileRefsIter`          | yields `T`                 | pre-resolved `[]FileRef` from `Poll`         |
+| `ReadPartitionFileRefsIter` | yields `PartitionResult[T]`| pre-resolved `[]FileRef` from `Poll`         |
 
 ### Minimal examples
 

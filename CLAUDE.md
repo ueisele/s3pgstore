@@ -71,7 +71,7 @@ must preserve them — even when the change appears unrelated.
   and must not advance `feed_seq` from inside a writer's transaction.
 - **Idempotency is unbounded in time** — A retry with the same
   `(partition_key, idempotency_token)` returns the original
-  WriteResult, regardless of how much time has passed. Implemented
+  FileRef, regardless of how much time has passed. Implemented
   via partial UNIQUE index `(partition_key, idempotency_token)
   WHERE idempotency_token IS NOT NULL`. Refactors must not
   reintroduce a `maxRetryAge`-style bound — that would silently
@@ -222,8 +222,8 @@ must preserve them — even when the change appears unrelated.
   Benchmarks).
 - **Deterministic emission order across read and write paths**
   — every read path (`Read` / `ReadIter` / `ReadPartitionIter` /
-  `ReadRangeIter` / `ReadPartitionRangeIter` / `ReadEntriesIter`
-  / `ReadPartitionEntriesIter` / `PollRecords`) and the
+  `ReadRangeIter` / `ReadPartitionRangeIter` / `ReadFileRefsIter`
+  / `ReadPartitionFileRefsIter` / `PollRecords`) and the
   write-side partition grouping emit partitions in **lex order
   of the partition-key string**, with per-partition records in
   **`(entity, version)` ascending order** when dedup is

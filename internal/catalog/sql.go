@@ -29,21 +29,29 @@ func (n Names) PendingWriteDeleteSQL() string {
 
 // IdempotencyLookupSQL returns the SELECT statement that
 // resolves an existing (partition_key, idempotency_token) pair
-// to its WriteResult fields. Used by the write path's
+// to its FileRef fields. Used by the write path's
 // short-circuit check and by the public LookupByToken method.
 //
 // Only one row can match the partial UNIQUE index, so the
-// caller's QueryRow is unambiguous. Returns the columns the
-// public WriteResult struct cares about: file_id, s3_key,
-// written_at_version, file_size, uncompressed_size,
-// record_count.
-func (n Names) IdempotencyLookupSQL() string {
+// caller's QueryRow is unambiguous. Returns every column
+// FileRef carries: file_id, partition_key, s3_key,
+// written_at_version, written_at, file_size, uncompressed_size,
+// record_count, feed_seq, and ext_<n> in declaration order.
+// feed_seq is nullable; the caller scans into a *int64.
+func (n Names) IdempotencyLookupSQL(exts []string) string {
+	cols := []string{
+		"file_id", "partition_key", "s3_key", "written_at_version",
+		"written_at", "file_size", "uncompressed_size",
+		"record_count", "feed_seq",
+	}
+	for _, e := range exts {
+		cols = append(cols, ExtColumnPrefix+e)
+	}
 	return fmt.Sprintf(
-		`SELECT file_id, s3_key, written_at_version,
-		        file_size, uncompressed_size, record_count
+		`SELECT %s
 		FROM %s
 		WHERE partition_key = $1 AND idempotency_token = $2`,
-		n.Files())
+		strings.Join(cols, ", "), n.Files())
 }
 
 // PartitionUpsertSQL returns the upsert SQL for the partition
@@ -215,8 +223,9 @@ func (n Names) PendingWritesDepthSQL() string {
 //	$8...  part_<n> columns (in PartitionKeyParts order)
 //	then  ext_<n> columns (in ExtensionColumns order)
 //
-// Returns file_id so the caller can build a WriteResult with
-// the assigned ID.
+// Returns file_id and written_at so the caller can build a
+// FileRef with the assigned ID and the server-side write
+// timestamp (now() default).
 func (n Names) FilesInsertSQL(parts, exts []string) string {
 	cols := []string{
 		"partition_key", "s3_key", "written_at_version",
@@ -236,7 +245,7 @@ func (n Names) FilesInsertSQL(parts, exts []string) string {
 	}
 
 	return fmt.Sprintf(
-		`INSERT INTO %s (%s) VALUES (%s) RETURNING file_id`,
+		`INSERT INTO %s (%s) VALUES (%s) RETURNING file_id, written_at`,
 		n.Files(),
 		strings.Join(cols, ", "),
 		strings.Join(placeholders, ", "),

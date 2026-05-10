@@ -279,7 +279,7 @@ func TestPoll_ReplayFromZeroIsStable(t *testing.T) {
 	}
 	for i := range first {
 		if first[i].Offset != second[i].Offset ||
-			first[i].DataPath != second[i].DataPath {
+			first[i].S3Key != second[i].S3Key {
 			t.Errorf("replay mismatch at %d: %+v vs %+v",
 				i, first[i], second[i])
 		}
@@ -554,5 +554,158 @@ func TestPoll_OffsetOrderMatchesFeedSeq(t *testing.T) {
 		return offsets[i] < offsets[j]
 	}) {
 		t.Errorf("Poll offsets not sorted: %v", offsets)
+	}
+}
+
+// TestFileRef_CrossSourceConsistency verifies that the FileRef
+// returned by Write, Poll, and LookupByToken describes the same
+// row consistently across every populated field — the unifying-
+// type contract documented on FileRef.
+//
+// Coverage matrix:
+//
+//   - Write: every field except Offset (NoOffset until sequenced).
+//   - Poll (after sequencing): every field including Offset.
+//   - LookupByToken (after sequencing): every field including
+//     Offset (the projection covers the full FileRef shape per
+//     IdempotencyLookupSQL).
+//
+// Cross-source comparison: FileID / PartitionKey / S3Key /
+// Version / WrittenAt / RecordCount / FileSize / UncompressedSize
+// / Extensions must be identical across all three sources.
+// Offset diverges only on Write (NoOffset) vs Poll/Lookup (the
+// sequencer-assigned value).
+func TestFileRef_CrossSourceConsistency(t *testing.T) {
+	f := newFixture(t)
+	store := newStreamStore(t, f)
+
+	const token = "test-token-cross-source"
+	before := time.Now().UTC()
+	written, err := store.Write(t.Context(),
+		[]streamRec{{ID: "alice", Value: 42}},
+		s3pgstore.WithIdempotencyToken(token),
+		s3pgstore.WithMetadata(map[string]any{
+			"job_id": "job-xyz",
+		}),
+	)
+	after := time.Now().UTC()
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if len(written) != 1 {
+		t.Fatalf("Write returned %d FileRefs, want 1", len(written))
+	}
+	w := written[0]
+
+	// Write-side: every field populated, Offset is NoOffset.
+	if w.FileID == 0 {
+		t.Errorf("Write FileID: want non-zero")
+	}
+	if w.PartitionKey != "customer=alice" {
+		t.Errorf("Write PartitionKey: %q", w.PartitionKey)
+	}
+	if w.S3Key == "" {
+		t.Errorf("Write S3Key: empty")
+	}
+	if w.Version != 1 {
+		t.Errorf("Write Version: want 1, got %d", w.Version)
+	}
+	if w.WrittenAt.Before(before) || w.WrittenAt.After(after) {
+		t.Errorf("Write WrittenAt %v not in [%v, %v]",
+			w.WrittenAt, before, after)
+	}
+	if w.RecordCount != 1 {
+		t.Errorf("Write RecordCount: want 1, got %d", w.RecordCount)
+	}
+	if w.FileSize <= 0 {
+		t.Errorf("Write FileSize: want > 0, got %d", w.FileSize)
+	}
+	if w.UncompressedSize <= 0 {
+		t.Errorf("Write UncompressedSize: want > 0, got %d",
+			w.UncompressedSize)
+	}
+	if got := w.Extensions["job_id"]; got != "job-xyz" {
+		t.Errorf("Write Extensions[job_id]: got %v, want job-xyz",
+			got)
+	}
+	if w.Offset != s3pgstore.NoOffset {
+		t.Errorf("Write Offset: want NoOffset, got %d", w.Offset)
+	}
+
+	// Sequence so Poll has work to do.
+	runSequencerSync(t, f)
+
+	// Poll-side: same row should come back with everything
+	// matching, plus a non-NoOffset.
+	polled, _, err := store.Poll(t.Context(), 0, 100)
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if len(polled) != 1 {
+		t.Fatalf("Poll returned %d FileRefs, want 1", len(polled))
+	}
+	p := polled[0]
+	if p.Offset == s3pgstore.NoOffset {
+		t.Errorf("Poll Offset: want non-NoOffset (sequenced), got 0")
+	}
+	assertSameRow(t, "Poll", w, p)
+
+	// LookupByToken should also return a fully-populated FileRef.
+	looked, hit, err := store.LookupByToken(t.Context(),
+		w.PartitionKey, token)
+	if err != nil {
+		t.Fatalf("LookupByToken: %v", err)
+	}
+	if !hit {
+		t.Fatalf("LookupByToken: no row found for token %q", token)
+	}
+	if looked.Offset != p.Offset {
+		t.Errorf("LookupByToken Offset: got %d, want %d (Poll's)",
+			looked.Offset, p.Offset)
+	}
+	assertSameRow(t, "LookupByToken", w, looked)
+}
+
+// assertSameRow checks that every FileRef field except Offset
+// matches between the Write-side reference (w) and another
+// source's view (got). Offset is excluded because it diverges
+// across sources by design.
+func assertSameRow(t *testing.T, source string, w, got s3pgstore.FileRef) {
+	t.Helper()
+	if got.FileID != w.FileID {
+		t.Errorf("%s FileID: got %d, want %d",
+			source, got.FileID, w.FileID)
+	}
+	if got.PartitionKey != w.PartitionKey {
+		t.Errorf("%s PartitionKey: got %q, want %q",
+			source, got.PartitionKey, w.PartitionKey)
+	}
+	if got.S3Key != w.S3Key {
+		t.Errorf("%s S3Key: got %q, want %q",
+			source, got.S3Key, w.S3Key)
+	}
+	if got.Version != w.Version {
+		t.Errorf("%s Version: got %d, want %d",
+			source, got.Version, w.Version)
+	}
+	if !got.WrittenAt.Equal(w.WrittenAt) {
+		t.Errorf("%s WrittenAt: got %v, want %v",
+			source, got.WrittenAt, w.WrittenAt)
+	}
+	if got.RecordCount != w.RecordCount {
+		t.Errorf("%s RecordCount: got %d, want %d",
+			source, got.RecordCount, w.RecordCount)
+	}
+	if got.FileSize != w.FileSize {
+		t.Errorf("%s FileSize: got %d, want %d",
+			source, got.FileSize, w.FileSize)
+	}
+	if got.UncompressedSize != w.UncompressedSize {
+		t.Errorf("%s UncompressedSize: got %d, want %d",
+			source, got.UncompressedSize, w.UncompressedSize)
+	}
+	if got.Extensions["job_id"] != w.Extensions["job_id"] {
+		t.Errorf("%s Extensions[job_id]: got %v, want %v",
+			source, got.Extensions["job_id"], w.Extensions["job_id"])
 	}
 }

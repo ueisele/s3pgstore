@@ -6,39 +6,25 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"time"
 
 	"github.com/google/uuid"
 )
 
-// WriteResult is returned per partition from Write and from
-// WriteWithKey. FileID is the catalog row's BIGSERIAL primary
-// key; Version is the partition row's version after the bump
-// this Write applied.
-//
-// FileSize is the compressed parquet bytes (the size of the
-// object on S3). UncompressedSize sums TotalUncompressedSize
-// across every column chunk in the file — a useful denominator
-// for compression-ratio dashboards and a planning aid for
-// downstream consumers that materialize the decoded data.
-type WriteResult struct {
-	PartitionKey     string
-	S3Key            string
-	FileID           int64
-	Version          int64
-	RecordCount      int
-	FileSize         int
-	UncompressedSize int64
-}
-
 // Write groups records by PartitionKeyOf, encodes one parquet
 // file per group, and inserts the catalog rows. Returns a
-// WriteResult per partition in lex order of partition key.
+// FileRef per partition in lex order of partition key, fully
+// populated except for Offset — feed_seq is assigned by the
+// sequencer asynchronously, so the returned refs carry NoOffset.
 //
 // The empty input case (records=nil or empty) returns nil, nil
 // — no S3 PUTs, no catalog INSERTs.
+//
+// The returned slice can be passed straight to ReadFileRefsIter
+// for a Write → Read round-trip without an intervening Poll.
 func (s *Store[T]) Write(
 	ctx context.Context, records []T, opts ...WriteOption,
-) (out []WriteResult, err error) {
+) (out []FileRef, err error) {
 	defer s.metrics.methodScope(ctx, "Write", &err).end()
 
 	if len(records) == 0 {
@@ -80,12 +66,12 @@ func (s *Store[T]) Write(
 	// in-flight siblings, but partitions whose catalog tx already
 	// committed before cancel reaches them stay committed. The
 	// returned slice has length len(keys); failed partitions
-	// carry the zero WriteResult (FileID == 0). Callers that
+	// carry the zero FileRef (FileID == 0). Callers that
 	// retry should rely on WithIdempotencyToken — the
 	// partial-UNIQUE short-circuit collapses retries to the
 	// canonical row regardless of which partitions committed
 	// first.
-	out = make([]WriteResult, len(keys))
+	out = make([]FileRef, len(keys))
 	if err := fanOutPool(ctx, s.resolved.WorkerPool, keys,
 		s.metrics.fanOutObserverFor("Write"),
 		func(ctx context.Context, i int, key string) error {
@@ -116,20 +102,20 @@ func (s *Store[T]) Write(
 func (s *Store[T]) WriteWithKey(
 	ctx context.Context, partitionKey string, records []T,
 	opts ...WriteOption,
-) (res WriteResult, err error) {
+) (res FileRef, err error) {
 	defer s.metrics.methodScope(ctx, "WriteWithKey", &err).end()
 
 	if len(records) == 0 {
-		return WriteResult{}, errors.New(
+		return FileRef{}, errors.New(
 			"WriteWithKey: records is empty")
 	}
 	values, err := partitionKeyValues(partitionKey, s.resolved.PartitionKeyParts)
 	if err != nil {
-		return WriteResult{}, err
+		return FileRef{}, err
 	}
 	o, err := s.resolveWriteOpts(opts...)
 	if err != nil {
-		return WriteResult{}, err
+		return FileRef{}, err
 	}
 	return s.writePartition(ctx, partitionKey, values, records, o)
 }
@@ -178,17 +164,17 @@ func (s *Store[T]) WriteWithKey(
 func (s *Store[T]) writePartition(
 	ctx context.Context, partitionKey string, partValues []string,
 	records []T, o writeOpts,
-) (WriteResult, error) {
+) (FileRef, error) {
 	// 1. Token resolution + idempotency short-circuit.
 	token, err := s.resolveTokenForPartition(records, o)
 	if err != nil {
-		return WriteResult{}, err
+		return FileRef{}, err
 	}
 	if token != "" {
-		existing, ok, err := s.lookupTokenWriteResult(
+		existing, ok, err := s.lookupTokenFileRef(
 			ctx, partitionKey, token)
 		if err != nil {
-			return WriteResult{}, fmt.Errorf(
+			return FileRef{}, fmt.Errorf(
 				"lookup token: %w", err)
 		}
 		s.metrics.recordLookupByToken(ctx, ok)
@@ -201,7 +187,7 @@ func (s *Store[T]) writePartition(
 	//    errors fail fast.
 	mvRows, err := s.resolveMVRows(records)
 	if err != nil {
-		return WriteResult{}, err
+		return FileRef{}, err
 	}
 
 	// 3. Encode parquet outside the wrapping tx. CPU-bound under
@@ -209,20 +195,21 @@ func (s *Store[T]) writePartition(
 	//    free for siblings.
 	body, uncompressedSize, err := s.encoder.encode(ctx, records)
 	if err != nil {
-		return WriteResult{}, fmt.Errorf("encode parquet: %w", err)
+		return FileRef{}, fmt.Errorf("encode parquet: %w", err)
 	}
-	fileSize := len(body)
+	fileSize := int64(len(body))
+	recordCount := int64(len(records))
 
 	// 4. Fresh S3 key.
 	s3Key, err := s.newS3Key(partitionKey)
 	if err != nil {
-		return WriteResult{}, err
+		return FileRef{}, err
 	}
 
 	// 5. Pre-tx pending_writes (independent commit; see
 	//    CLAUDE.md's orphan-tracking invariant).
 	if err := s.insertPendingWriteDetachedTx(ctx, s3Key); err != nil {
-		return WriteResult{}, fmt.Errorf(
+		return FileRef{}, fmt.Errorf(
 			"insert pending_writes: %w", err)
 	}
 
@@ -233,6 +220,7 @@ func (s *Store[T]) writePartition(
 	var (
 		version        int64
 		fileID         int64
+		writtenAt      time.Time
 		s3PutAttempted bool
 	)
 	err = s.cfg.Executor.RunInTx(ctx, func(d DBTX) error {
@@ -247,13 +235,13 @@ func (s *Store[T]) writePartition(
 			return err
 		}
 
-		fileID, err = s.insertFile(ctx, d, fileInsertOpts{
+		fileID, writtenAt, err = s.insertFile(ctx, d, fileInsertOpts{
 			PartitionKey:     partitionKey,
 			S3Key:            s3Key,
 			Version:          version,
-			FileSize:         int64(fileSize),
+			FileSize:         fileSize,
 			UncompressedSize: uncompressedSize,
-			RecordCount:      int64(len(records)),
+			RecordCount:      recordCount,
 			Token:            token,
 			PartValues:       partValues,
 			Metadata:         o.metadata,
@@ -268,7 +256,7 @@ func (s *Store[T]) writePartition(
 		// validation errors (header-unsafe ext values, oversized
 		// metadata) abort cleanly with no S3 side-effects.
 		s3Metadata, err := BuildS3Metadata(
-			token, int64(len(records)), uncompressedSize, version,
+			token, recordCount, uncompressedSize, version,
 			s.resolved.ExtensionColumns, o.metadata,
 		)
 		if err != nil {
@@ -309,16 +297,25 @@ func (s *Store[T]) writePartition(
 		return s.translateWriteTxErr(ctx, err, partitionKey, token)
 	}
 
-	s.metrics.recordWriteVolume(ctx,
-		int64(fileSize), int64(len(records)))
-	return WriteResult{
+	s.metrics.recordWriteVolume(ctx, fileSize, recordCount)
+	// Copy the user-supplied metadata into a fresh map so the
+	// returned FileRef.Extensions has no aliasing with the
+	// caller's input AND matches Read/Poll's "non-nil empty when
+	// no values" shape (consistent iteration semantics).
+	exts := make(map[string]any, len(o.metadata))
+	for k, v := range o.metadata {
+		exts[k] = v
+	}
+	return FileRef{
 		PartitionKey:     partitionKey,
 		S3Key:            s3Key,
 		FileID:           fileID,
 		Version:          version,
-		RecordCount:      len(records),
+		WrittenAt:        writtenAt,
+		RecordCount:      recordCount,
 		FileSize:         fileSize,
 		UncompressedSize: uncompressedSize,
+		Extensions:       exts,
 	}, nil
 }
 
@@ -407,10 +404,11 @@ type fileInsertOpts struct {
 }
 
 // insertFile writes one s3pgstore_files row inside the wrapping
-// tx and returns the assigned file_id. A unique-violation on
-// (partition_key, idempotency_token) — the concurrent-token
-// race window — is translated to errTokenRaceLost so the
-// caller can re-lookup the canonical row after rollback.
+// tx and returns the assigned file_id and the server-side
+// written_at timestamp. A unique-violation on (partition_key,
+// idempotency_token) — the concurrent-token race window — is
+// translated to errTokenRaceLost so the caller can re-lookup the
+// canonical row after rollback.
 //
 // Positional args mirror s.sql.filesInsert's parameter list:
 // $1=partition_key, $2=s3_key, $3=written_at_version,
@@ -418,7 +416,7 @@ type fileInsertOpts struct {
 // $7=idempotency_token, $8…=part_<n>, then ext_<n>.
 func (s *Store[T]) insertFile(
 	ctx context.Context, d DBTX, row fileInsertOpts,
-) (int64, error) {
+) (int64, time.Time, error) {
 	hasToken := row.Token != ""
 	args := make([]any, 0,
 		7+len(row.PartValues)+len(s.resolved.ExtensionColumns))
@@ -432,15 +430,19 @@ func (s *Store[T]) insertFile(
 	for _, e := range s.resolved.ExtensionColumns {
 		args = append(args, metadataValueFor(row.Metadata, e))
 	}
-	var fileID int64
-	err := d.QueryRow(ctx, s.sql.filesInsert, args...).Scan(&fileID)
+	var (
+		fileID    int64
+		writtenAt time.Time
+	)
+	err := d.QueryRow(ctx, s.sql.filesInsert, args...).
+		Scan(&fileID, &writtenAt)
 	if err != nil {
 		if hasToken && isUniqueViolation(err) {
-			return 0, errTokenRaceLost
+			return 0, time.Time{}, errTokenRaceLost
 		}
-		return 0, fmt.Errorf("insert files: %w", err)
+		return 0, time.Time{}, fmt.Errorf("insert files: %w", err)
 	}
-	return fileID, nil
+	return fileID, writtenAt, nil
 }
 
 // nullableString maps the empty-string sentinel to a SQL NULL
@@ -475,7 +477,7 @@ func (s *Store[T]) notifySequencer(ctx context.Context, d DBTX) error {
 }
 
 // translateWriteTxErr maps a wrapping-tx error to the
-// (WriteResult, error) the caller of writePartition should see:
+// (FileRef, error) the caller of writePartition should see:
 //
 //   - errTokenRaceLost: re-lookup the canonical (partition_key,
 //     idempotency_token) row and return it. A vanished row means
@@ -485,18 +487,18 @@ func (s *Store[T]) notifySequencer(ctx context.Context, d DBTX) error {
 //   - any other: wrap with "catalog tx".
 func (s *Store[T]) translateWriteTxErr(
 	ctx context.Context, err error, partitionKey, token string,
-) (WriteResult, error) {
+) (FileRef, error) {
 	if errors.Is(err, errTokenRaceLost) {
 		s.metrics.recordTokenRaceRetry(ctx)
-		existing, ok, lookupErr := s.lookupTokenWriteResult(
+		existing, ok, lookupErr := s.lookupTokenFileRef(
 			ctx, partitionKey, token)
 		if lookupErr != nil {
-			return WriteResult{}, fmt.Errorf(
+			return FileRef{}, fmt.Errorf(
 				"token-race re-lookup: %w", lookupErr)
 		}
 		s.metrics.recordLookupByToken(ctx, ok)
 		if !ok {
-			return WriteResult{}, errors.New(
+			return FileRef{}, errors.New(
 				"token UNIQUE conflict but lookup " +
 					"found no row (concurrent rollback)")
 		}
@@ -504,9 +506,9 @@ func (s *Store[T]) translateWriteTxErr(
 	}
 	if errors.Is(err, ErrVersionConflict) {
 		s.metrics.recordOCCConflict(ctx)
-		return WriteResult{}, ErrVersionConflict
+		return FileRef{}, ErrVersionConflict
 	}
-	return WriteResult{}, fmt.Errorf("catalog tx: %w", err)
+	return FileRef{}, fmt.Errorf("catalog tx: %w", err)
 }
 
 // insertPendingWriteDetachedTx writes the orphan-tracking row

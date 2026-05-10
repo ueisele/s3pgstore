@@ -624,10 +624,10 @@ func TestReadIter_NoFiltersYieldsNothing(t *testing.T) {
 	}
 }
 
-// TestReadRangeIter_TimeWindow: writes seeded across two
-// distinct sequencer runs land in different feed_seq_at
-// buckets; the time-window walk should pick up only rows
-// whose feed_seq_at falls in the range.
+// TestReadRangeIter_TimeWindow: two writes seeded with a
+// timestamp captured between them land in different written_at
+// buckets; the time-window walk should pick up only rows whose
+// written_at falls in the range.
 func TestReadRangeIter_TimeWindow(t *testing.T) {
 	f := newFixture(t)
 	store := newIterStore(t, f)
@@ -636,7 +636,6 @@ func TestReadRangeIter_TimeWindow(t *testing.T) {
 		[]iterRec{{Customer: "alice", Value: 1}}); err != nil {
 		t.Fatalf("Write 1: %v", err)
 	}
-	runIterSequencer(t, f)
 	mid := time.Now()
 	time.Sleep(50 * time.Millisecond)
 
@@ -644,7 +643,9 @@ func TestReadRangeIter_TimeWindow(t *testing.T) {
 		[]iterRec{{Customer: "bob", Value: 2}}); err != nil {
 		t.Fatalf("Write 2: %v", err)
 	}
-	runIterSequencer(t, f)
+	// No sequencer call: ReadRangeIter filters by written_at and
+	// is decoupled from feed_seq assignment per CLAUDE.md's
+	// atomic-visibility-on-commit invariant.
 
 	// since=mid, until=zero (live tip): only the second write.
 	got := []int64{}
@@ -674,7 +675,7 @@ func TestReadRangeIter_TimeWindow(t *testing.T) {
 }
 
 // TestReadRangeIter_UnboundedReturnsAll: zero/zero bounds
-// yield every sequenced row.
+// yield every committed row.
 func TestReadRangeIter_UnboundedReturnsAll(t *testing.T) {
 	f := newFixture(t)
 	store := newIterStore(t, f)
@@ -685,7 +686,6 @@ func TestReadRangeIter_UnboundedReturnsAll(t *testing.T) {
 			t.Fatalf("Write: %v", err)
 		}
 	}
-	runIterSequencer(t, f)
 
 	count := 0
 	for _, err := range store.ReadRangeIter(t.Context(),
@@ -700,10 +700,10 @@ func TestReadRangeIter_UnboundedReturnsAll(t *testing.T) {
 	}
 }
 
-// TestReadEntriesIter_DecodesPolledEntries: poll → filter →
-// decode round-trip. Confirms ReadEntriesIter correctly
+// TestReadFileRefsIter_DecodesPolledEntries: poll → filter →
+// decode round-trip. Confirms ReadFileRefsIter correctly
 // decodes the parquet bodies pointed to by Poll output.
-func TestReadEntriesIter_DecodesPolledEntries(t *testing.T) {
+func TestReadFileRefsIter_DecodesPolledEntries(t *testing.T) {
 	f := newFixture(t)
 	store := newIterStore(t, f)
 
@@ -724,7 +724,7 @@ func TestReadEntriesIter_DecodesPolledEntries(t *testing.T) {
 	}
 
 	got := []int64{}
-	for r, err := range store.ReadEntriesIter(t.Context(), entries) {
+	for r, err := range store.ReadFileRefsIter(t.Context(), entries) {
 		if err != nil {
 			t.Fatalf("yield: %v", err)
 		}
@@ -735,26 +735,26 @@ func TestReadEntriesIter_DecodesPolledEntries(t *testing.T) {
 	}
 }
 
-// TestReadEntriesIter_RejectsForeignEntries: an entry whose
-// DataPath doesn't live under this Store's data prefix is
+// TestReadFileRefsIter_RejectsForeignEntries: an entry whose
+// S3Key doesn't live under this Store's data prefix is
 // rejected before any S3 traffic.
-func TestReadEntriesIter_RejectsForeignEntries(t *testing.T) {
+func TestReadFileRefsIter_RejectsForeignEntries(t *testing.T) {
 	f := newFixture(t)
 	store := newIterStore(t, f)
 
-	bad := []s3pgstore.StreamEntry{
-		{Offset: 1, Key: "customer=alice",
-			DataPath: "different-prefix/data/customer=alice/x.parquet"},
+	bad := []s3pgstore.FileRef{
+		{Offset: 1, PartitionKey: "customer=alice",
+			S3Key: "different-prefix/data/customer=alice/x.parquet"},
 	}
 	var captured error
-	for _, err := range store.ReadEntriesIter(t.Context(), bad) {
+	for _, err := range store.ReadFileRefsIter(t.Context(), bad) {
 		if err != nil {
 			captured = err
 			break
 		}
 	}
 	if captured == nil {
-		t.Fatal("expected validation error for foreign DataPath")
+		t.Fatal("expected validation error for foreign S3Key")
 	}
 	if !strings.Contains(captured.Error(),
 		"does not belong to this Store") {
@@ -762,10 +762,10 @@ func TestReadEntriesIter_RejectsForeignEntries(t *testing.T) {
 	}
 }
 
-// TestReadPartitionEntriesIter_GroupsByKey: entries are grouped
+// TestReadPartitionFileRefsIter_GroupsByKey: entries are grouped
 // by Key (partition); per-partition output reflects that
 // grouping.
-func TestReadPartitionEntriesIter_GroupsByKey(t *testing.T) {
+func TestReadPartitionFileRefsIter_GroupsByKey(t *testing.T) {
 	f := newFixture(t)
 	store := newIterStore(t, f)
 
@@ -784,7 +784,7 @@ func TestReadPartitionEntriesIter_GroupsByKey(t *testing.T) {
 	}
 
 	parts := []string{}
-	for p, err := range store.ReadPartitionEntriesIter(
+	for p, err := range store.ReadPartitionFileRefsIter(
 		t.Context(), entries) {
 		if err != nil {
 			t.Fatalf("yield: %v", err)

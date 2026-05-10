@@ -326,7 +326,7 @@ func TestWrite_IdempotentTokenConcurrentRetries(t *testing.T) {
 	const N = 10
 	var wg sync.WaitGroup
 	wg.Add(N)
-	results := make([]s3pgstore.WriteResult, N)
+	results := make([]s3pgstore.FileRef, N)
 	errs := make([]error, N)
 
 	for i := range N {

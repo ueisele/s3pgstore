@@ -355,21 +355,16 @@ func (s *Store[T]) fetchAndDecodeIter(
 		return
 	}
 
-	// bodyCap bounds the per-call in-memory compressed-body
-	// footprint: the submitter blocks on acquireBodySlot once
-	// cap slots are held; the decoder releases slots as it nils
-	// each body. Default (WithFetchAheadFiles unset or <= 0)
-	// tracks the shared pool's MaxConcurrent so a single reader
-	// can saturate the pool's S3-op budget; small pool ⇒ small
-	// per-call body buffer, large pool ⇒ enough lookahead to
-	// keep the decoder fed with many tiny partitions in flight
-	// in parallel. Operators in shared-pool deployments can dial
-	// this down via WithFetchAheadFiles to bound aggregate
-	// resident body memory across concurrent readers. Floor at
-	// the largest partition's file count so a single oversized
-	// partition still fits — otherwise its last few files would
-	// block on the cap and the decoder would block on those
-	// files, producing a deadlock.
+	// bodyCap bounds the per-call resident compressed bodies:
+	// fetcher acquires a slot per file; decoder releases on
+	// nil-out. Defaults to pool.MaxConcurrent so a single reader
+	// saturates the pool's S3-op budget; WithFetchAheadFiles
+	// dials it down for shared-pool deployments where each
+	// reader holding the full budget inflates aggregate body
+	// memory. Floor at max(filesPerPartition) keeps oversized
+	// partitions live — without it the fetcher blocks on the cap
+	// with the decoder waiting for the partition's remaining
+	// files (deadlock).
 	bodyCap := opts.fetchAheadFiles
 	if bodyCap <= 0 {
 		bodyCap = s.resolved.WorkerPool.MaxConcurrent()
@@ -423,15 +418,12 @@ func (s *Store[T]) fetchAndDecodeIter(
 	// branch fires and the decoder forwards hardErr
 	// (= context.Cause(state.ctx)).
 	//
-	// We don't need to recordHardErr g.Wait's return value:
-	// for any non-nil g.Wait result, state.ctx is already
-	// cancelled with the appropriate cause — either by the
-	// failing task itself (task error path) or by parent
-	// propagation (all-success-then-parent-cancel path). The
-	// g.Wait call exists purely to drain in-flight tasks
-	// before the fetcher goroutine exits, so wg.Wait sees
-	// all pool work complete before fetchAndDecodeIter
-	// returns and the streamState is dropped.
+	// g.Wait's return is ignored — for any non-nil result
+	// state.ctx is already cancelled with the right cause (task
+	// error path or parent propagation). The g.Wait call exists
+	// only to drain in-flight tasks before this goroutine exits
+	// so wg.Wait sees all pool work complete before
+	// fetchAndDecodeIter returns and the streamState is dropped.
 	g, gctx := s.resolved.WorkerPool.WithContext(state.ctx)
 	wg.Go(func() {
 		s.runFetcher(gctx, g, state)
@@ -587,64 +579,39 @@ type partState struct {
 	done         chan struct{}
 }
 
-// streamState carries the shared mutable state of the pipeline:
-// per-partition download counters, the decoded-bytes
-// reservation, the body-slot semaphore, and the per-partition /
-// byte-budget signal channels used to coordinate across stages
-// (download completion, decoded-byte release).
+// streamState is the shared mutable state coordinating the
+// fetcher, decoder, and emit loop.
 //
-// ctx + cancel form the single cancellation source for every
-// stage of the pipeline. Built via context.WithCancelCause from
-// the parent ctx so that:
-//
-//   - Parent cancellation auto-propagates with its cause
-//     intact (consumer's ctx.Cause is what the iter surfaces).
-//   - recordHardErr cancels ctx with the abort reason as cause,
-//     atomically with the close of ctx.Done — any goroutine
-//     that observes ctx.Done and reads context.Cause(ctx) is
-//     guaranteed to see the cause (no race between cancel and
-//     err-read).
-//   - First cancel wins; subsequent cancels are no-ops, so
-//     "first hard err wins" semantics are preserved.
-//
-// Replaces the earlier two-channel design (firstHardErr field
-// + outer ctx) where the cancel signal and the cause were set
-// independently and a parent-ctx cancel could race the
-// recordHardErr write, leaving the decoder reading a nil
-// firstHardErr after observing ctx.Done.
+// ctx + cancel are the single cancellation source for every
+// stage, built via context.WithCancelCause from the parent.
+// recordHardErr cancels with the abort reason as cause,
+// atomically with the close of ctx.Done — any observer that
+// sees ctx.Done and reads context.Cause(ctx) is guaranteed the
+// cause (no race between cancel and err-read). Parent cancel
+// auto-propagates with its cause intact. First cancel wins;
+// subsequent cancels are no-ops, preserving "first hard err
+// wins" semantics. Replaces an earlier two-channel design
+// (separate firstHardErr field + outer ctx) where a parent-ctx
+// cancel could race the recordHardErr write.
 //
 // slotCh is the body-slot semaphore, a buffered channel with
-// cap = bodyCap. Senders that find the buffer full park in the
-// channel's sendq, which the Go runtime drains FIFO on every
-// receive — so a release always wakes the longest-waiting
-// downloader. Replaces an earlier cond + counter design that
-// allowed scheduler-biased starvation: with cond.Broadcast all
-// waiters race for the mutex after wake, and whichever the
-// scheduler picked first incremented the counter, with the rest
-// re-Waiting. On a busy pipeline the same worker could
-// consistently win the race, leaving one specific worker's
-// pending pull permanently unmarked — and once the decoder
-// reached that pull's partition, the pipeline deadlocked.
-// Channel-based acquire is strictly FIFO and removes the
-// fairness window. See CLAUDE.md "Concurrency invariants".
+// cap = bodyCap. Go's runtime drains a channel's sendq FIFO on
+// every receive, so releaseBodySlots wakes the earliest-parked
+// sender. The chan-based shape removes a scheduler-biased
+// starvation window in the prior cond+counter design — see
+// CLAUDE.md "Concurrency invariants" for the deadlock trace.
 //
-// byteWake is the byte-budget wake bell, a chan(1) edge-trigger
-// signal. releaseBytes does a non-blocking send; reserveBytes
-// selects on byteWake / ctx.Done in the predicate loop.
-// Coalesces multiple releases between checks (single waiter —
-// the decoder). A stale signal from a previous wait round is
-// harmless: the loop always re-checks the predicate after the
-// receive, and only the decoder itself reserves, so
-// bufferedBytes can only stay the same or decrease while the
-// decoder is parked.
+// byteWake is the byte-budget wake bell, chan(1) edge-trigger.
+// releaseBytes does a non-blocking send; reserveBytes selects
+// on byteWake / ctx.Done in the predicate loop. Single waiter
+// (the decoder), so a stale signal is harmless — the loop
+// re-checks the predicate after the receive, and bufferedBytes
+// can only stay the same or decrease while parked.
 //
-// m is the optional metrics handle. acquireBodySlot and
-// reserveBytes report wait duration via
-// metrics.recordIterBodySlotWait /
-// recordIterByteBudgetWait when the call blocked and ended in
-// success, so operators can see body-slot pool / byte-budget
-// contention. Cancel-during-wait is not recorded (shutdown
-// noise).
+// m is the metrics handle. acquireBodySlot and reserveBytes
+// report wait duration when the call blocked and succeeded;
+// cancel-during-wait is not recorded (shutdown noise would
+// drown out the saturation signal).
 type streamState struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc
@@ -718,20 +685,10 @@ func (s *streamState) recordHardErr(err error) {
 // when ctx is cancelled while waiting — caller can use the
 // returned error directly without a separate hardErr lookup.
 //
-// The pool counts compressed parquet bodies that downloaders
-// have stored into per-partition slots and the decoder has not
-// yet cleared. It bounds the worst-case compressed-byte
-// footprint of the pipeline to roughly cap × largest_compressed_size.
-//
-// Implemented as a buffered channel `send`. The Go runtime
-// drains blocked senders FIFO on every receive, so
-// releaseBodySlots always wakes the earliest-parked downloader.
-// This is the load-bearing piece for the deterministic-deadlock
-// fix: an earlier cond + counter shape allowed scheduler-biased
-// starvation (Broadcast wakes everyone, the scheduler picks an
-// arbitrary winner, the rest re-Wait), which on busy pipelines
-// could leave one specific worker's pending pull permanently
-// unmarked.
+// The pool bounds the worst-case compressed-byte footprint of
+// the pipeline to roughly cap × largest_compressed_size.
+// Implemented via streamState.slotCh; see its type comment for
+// the FIFO + deadlock-fix rationale.
 //
 // Records to metrics.recordIterBodySlotWait only when the slot
 // wasn't immediately available AND the acquire eventually
@@ -841,13 +798,10 @@ func (s *streamState) waitForPartition(
 // Returns nil on successful reservation; non-nil error
 // (= context.Cause(ctx)) when ctx is cancelled while waiting.
 //
-// Predicate-loop shape: lock, check, unlock, wait on byteWake
-// or ctx.Done, retry. Stale signals are harmless — only the
-// decoder reserves and the loop always re-checks the predicate
-// after the receive, so bufferedBytes can only stay the same
-// or decrease while parked. The bell coalesces multiple
-// releases between checks because the chan has cap 1 and
-// releaseBytes uses a non-blocking send.
+// Stale byteWake signals are harmless — only the decoder
+// reserves, so bufferedBytes can only stay the same or decrease
+// while parked, and the loop re-checks the predicate after each
+// receive.
 //
 // Records to metrics.recordIterByteBudgetWait only when the
 // wait fired AND the reservation succeeded — same shape as
@@ -942,12 +896,11 @@ func (s *streamState) releaseBytes(uncomp int64) {
 // in s.target.get and bail.
 //
 // Body-slot leak on submit-skip is harmless. If gctx is
-// cancelled between our acquireBodySlot and pool.Group.Submit's
-// internal Acquire, the task fn never runs and the body slot
-// stays held — but slotCh is per-call state torn down by
-// fetchAndDecodeIter's deferred wg.Wait, and waitForPartition
-// for files we never markComplete'd observes ctx.Done and
-// returns false. No deadlock, no observable leak.
+// cancelled between acquireBodySlot and g.Submit, the task fn
+// never runs and the slot stays held — but slotCh is per-call
+// state torn down by fetchAndDecodeIter's deferred wg.Wait, and
+// waitForPartition observes ctx.Done. No deadlock, no observable
+// leak.
 func (s *Store[T]) runFetcher(
 	ctx context.Context, g *pool.Group, state *streamState,
 ) {

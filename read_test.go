@@ -18,20 +18,27 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
-func newTestStreamState() *streamState {
-	return &streamState{}
+func newTestMetrics(t *testing.T) *metrics {
+	t.Helper()
+	m, err := newMetrics(metricsConfig{})
+	if err != nil {
+		t.Fatalf("newMetrics: %v", err)
+	}
+	return m
 }
 
-// withSlotCap attaches a body-slot semaphore of the given
-// capacity. Mirrors how fetchAndDecodeIter wires up slotCh
-// in production. cap == 0 leaves slotCh nil — the
-// no-back-pressure path the live pipeline never takes but that
-// test cases exercise to confirm the disabled-cap branch
-// returns immediately.
-func (s *streamState) withSlotCap(cap int) *streamState {
-	if cap > 0 {
-		s.slotCh = make(chan struct{}, cap)
-	}
+// newTestReadState builds a readState with a default cap-1
+// body-slot semaphore so s.slots is always usable. Tests that
+// care about the cap call withSlotCap to rebuild.
+func newTestReadState(t *testing.T) *readState {
+	return &readState{slots: newBodySlots(1, newTestMetrics(t))}
+}
+
+// withSlotCap rebuilds the body-slot semaphore at the given
+// capacity. Mirrors how fetchAndDecodeIter wires up slots in
+// production.
+func (s *readState) withSlotCap(cap int) *readState {
+	s.slots = newBodySlots(cap, s.slots.m)
 	return s
 }
 
@@ -155,20 +162,20 @@ func TestReserveBytes_CtxCancellation(t *testing.T) {
 
 // TestAcquireBodySlot_BlocksUntilRelease verifies the body-pool
 // back-pressure: once cap slots are held, the next acquire
-// blocks until releaseBodySlots returns one.
+// blocks until release returns one.
 func TestAcquireBodySlot_BlocksUntilRelease(t *testing.T) {
-	s := newTestStreamState().withSlotCap(2)
+	s := newTestReadState(t).withSlotCap(2)
 
-	if err := s.acquireBodySlot(context.Background()); err != nil {
+	if err := s.slots.acquire(context.Background()); err != nil {
 		t.Fatalf("first acquire should succeed, got %v", err)
 	}
-	if err := s.acquireBodySlot(context.Background()); err != nil {
+	if err := s.slots.acquire(context.Background()); err != nil {
 		t.Fatalf("second acquire should succeed, got %v", err)
 	}
 
 	done := make(chan struct{})
 	go func() {
-		_ = s.acquireBodySlot(context.Background())
+		_ = s.slots.acquire(context.Background())
 		close(done)
 	}()
 	select {
@@ -177,43 +184,30 @@ func TestAcquireBodySlot_BlocksUntilRelease(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 
-	s.releaseBodySlots(1)
+	s.slots.release()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("third acquire should have unblocked after release")
 	}
 
-	if got := len(s.slotCh); got != 2 {
-		t.Errorf("slotCh occupancy = %d, want 2", got)
-	}
-}
-
-// TestAcquireBodySlot_NoCap returns nil immediately when
-// slotCh is nil (semaphore disabled — the test-helper path).
-func TestAcquireBodySlot_NoCap(t *testing.T) {
-	s := newTestStreamState()
-	if err := s.acquireBodySlot(context.Background()); err != nil {
-		t.Fatalf("acquireBodySlot with nil slotCh should return nil, got %v", err)
-	}
-	if s.slotCh != nil {
-		t.Errorf("slotCh = %v, want nil (no-cap path should not allocate)",
-			s.slotCh)
+	if got := s.slots.occupancy(); got != 2 {
+		t.Errorf("slot occupancy = %d, want 2", got)
 	}
 }
 
 // TestAcquireBodySlot_CtxCancellation guards that a blocked
 // acquire returns the cancel cause when ctx is cancelled.
 func TestAcquireBodySlot_CtxCancellation(t *testing.T) {
-	s := newTestStreamState().withSlotCap(1)
-	if err := s.acquireBodySlot(context.Background()); err != nil {
+	s := newTestReadState(t).withSlotCap(1)
+	if err := s.slots.acquire(context.Background()); err != nil {
 		t.Fatalf("first acquire should succeed, got %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	got := make(chan error, 1)
 	go func() {
-		got <- s.acquireBodySlot(ctx)
+		got <- s.slots.acquire(ctx)
 	}()
 	time.Sleep(10 * time.Millisecond)
 
@@ -222,10 +216,10 @@ func TestAcquireBodySlot_CtxCancellation(t *testing.T) {
 	select {
 	case err := <-got:
 		if err == nil {
-			t.Error("acquireBodySlot should return a cancel err")
+			t.Error("acquire should return a cancel err")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("acquireBodySlot did not return after ctx cancel")
+		t.Fatal("acquire did not return after ctx cancel")
 	}
 }
 
@@ -251,16 +245,17 @@ func TestDeadlockObserver_FiresOnStall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newMetrics: %v", err)
 	}
-	s := newTestStreamState().withSlotCap(2)
-	s.m = m
-	s.lastProgressNs.Store(time.Now().Add(-time.Second).UnixNano())
+	s := newTestReadState(t).withSlotCap(2)
+	s.slots.m = m
+	s.slots.lastProgressNs.Store(time.Now().Add(-time.Second).UnixNano())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.runDeadlockObserver(ctx, "ReadIter",
+		runDeadlockObserver(ctx, m, "ReadIter", "read",
+			s.slots, "decoder_partition", s.decoderPi.Load,
 			5*time.Millisecond, 50*time.Millisecond)
 	}()
 
@@ -299,12 +294,12 @@ func TestDeadlockObserver_NoSignalWhenProgress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newMetrics: %v", err)
 	}
-	s := newTestStreamState().withSlotCap(2)
-	s.m = m
+	s := newTestReadState(t).withSlotCap(2)
+	s.slots.m = m
 	// Seed lastProgressNs to "now" so the first tick (before
 	// the bumper goroutine even starts) doesn't trip on the
 	// initial window.
-	s.lastProgressNs.Store(time.Now().UnixNano())
+	s.slots.lastProgressNs.Store(time.Now().UnixNano())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -319,7 +314,7 @@ func TestDeadlockObserver_NoSignalWhenProgress(t *testing.T) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				s.lastProgressNs.Store(time.Now().UnixNano())
+				s.slots.lastProgressNs.Store(time.Now().UnixNano())
 			}
 		}
 	}()
@@ -327,7 +322,8 @@ func TestDeadlockObserver_NoSignalWhenProgress(t *testing.T) {
 	obsDone := make(chan struct{})
 	go func() {
 		defer close(obsDone)
-		s.runDeadlockObserver(ctx, "ReadIter",
+		runDeadlockObserver(ctx, m, "ReadIter", "read",
+			s.slots, "decoder_partition", s.decoderPi.Load,
 			5*time.Millisecond, 100*time.Millisecond)
 	}()
 
@@ -354,13 +350,15 @@ func TestDeadlockObserver_NoSignalWhenProgress(t *testing.T) {
 // Required so fetchAndDecodeIter's deferred wg.Wait()
 // doesn't leak the observer past the pipeline's lifetime.
 func TestDeadlockObserver_ExitsOnCtxDone(t *testing.T) {
-	s := newTestStreamState().withSlotCap(2)
+	s := newTestReadState(t).withSlotCap(2)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.runDeadlockObserver(ctx, "ReadIter", time.Hour, time.Hour)
+		runDeadlockObserver(ctx, s.slots.m, "ReadIter", "read",
+			s.slots, "decoder_partition", s.decoderPi.Load,
+			time.Hour, time.Hour)
 	}()
 
 	cancel()
@@ -374,7 +372,7 @@ func TestDeadlockObserver_ExitsOnCtxDone(t *testing.T) {
 // TestWaitForPartition_BlocksUntilComplete verifies that the
 // decoder's wait actually unblocks when downloaders finish.
 func TestWaitForPartition_BlocksUntilComplete(t *testing.T) {
-	s := newTestStreamState()
+	s := newTestReadState(t)
 	s.parts = []*partState{
 		{
 			files:  make([]FileRef, 3),

@@ -18,20 +18,11 @@ package s3pgstore
 //     coordination, no per-partition decoded slice pre-sizing,
 //     no in-memory sort.
 //
-// The shape that DOES carry over from read.go (because both
-// pipelines need the same correctness properties):
-//
-//   - Body-slot semaphore (bounded compressed-body memory; FIFO
-//     wake order via Go's sendq).
-//   - context.WithCancelCause + recordHardErr for unified abort
-//     reason across goroutines.
-//   - Per-decode-worker byte budget for emit-side back-pressure.
-//   - Stall observer (pure observer; never cancels).
-//
-// We keep these as parallel implementations rather than shared
-// helpers in this first cut. After both pipelines ship and the
-// boundaries are stable we can revisit factoring out the
-// primitives that are textually identical.
+// The load-bearing primitives (body-slot semaphore, per-worker
+// byte budget, stall observer, race-free batch send) live in
+// iter_pipeline_shared.go and are reused verbatim from the read
+// pipeline — see that file for the FIFO sendq + WithCancelCause
+// rationale.
 
 import (
 	"bytes"
@@ -39,7 +30,6 @@ import (
 	"errors"
 	"fmt"
 	"iter"
-	"log/slog"
 	"runtime"
 	"strings"
 	"sync"
@@ -285,36 +275,23 @@ type fileState struct {
 }
 
 // pollState coordinates the fetcher, decode workers, and emit
-// loop. ctx + cancel mirror read.go's streamState — single
+// loop. ctx + cancel mirror read.go's readState — single
 // cancellation source via WithCancelCause; recordHardErr cancels
 // with the abort reason as cause atomically with ctx.Done close.
+//
+// slots is the body-slot semaphore — see iter_pipeline_shared.go
+// for FIFO sendq + watchdog progress-bump rationale.
 type pollState struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc
 
 	files []*fileState
-
-	// slotCh: body-slot semaphore — buffered chan, FIFO sendq.
-	// Acquire on the fetcher side before submitting download
-	// tasks; release in the decode worker after the body is
-	// nil'd (post-decode).
-	slotCh chan struct{}
-
-	// lastProgressNs: wall-clock timestamp (UnixNano) of the most
-	// recent decoder progress event. Bumped on every
-	// releaseBodySlot. Read by runPollDeadlockObserver to surface
-	// pipelines that have parked on body-slot acquire / byte-
-	// budget reservation / queue send for too long. Zero means
-	// "no decoder progress yet" — legitimate startup state, not
-	// a stall.
-	lastProgressNs atomic.Int64
+	slots *bodySlots
 
 	// decoderFi: emit's current file index — atomic so the stall
 	// observer can read it without locking. Logged in slog
 	// alongside the stall warn for context.
 	decoderFi atomic.Int64
-
-	m *metrics
 }
 
 // recordHardErr cancels state.ctx with err as the cause. First
@@ -324,122 +301,6 @@ type pollState struct {
 // is guaranteed to see the cause set atomically with the close.
 func (state *pollState) recordHardErr(err error) {
 	state.cancel(err)
-}
-
-// acquireBodySlot blocks until a body slot is available or ctx
-// is cancelled. Returns context.Cause(ctx) on cancellation, nil
-// on success.
-//
-// Records to metrics.recordIterBodySlotWait only when the slot
-// acquire fell through to the blocking select AND succeeded —
-// the cancel path is not recorded. The fast path (slot available
-// immediately) costs no metric observation.
-func (state *pollState) acquireBodySlot(ctx context.Context) error {
-	if state.slotCh == nil {
-		return context.Cause(ctx)
-	}
-	// Best-effort fast path before paying for a select.
-	select {
-	case state.slotCh <- struct{}{}:
-		return nil
-	default:
-	}
-	waitStart := time.Now()
-	select {
-	case state.slotCh <- struct{}{}:
-		state.m.recordIterBodySlotWait(ctx, time.Since(waitStart))
-		return nil
-	case <-ctx.Done():
-		return context.Cause(ctx)
-	}
-}
-
-// releaseBodySlot returns one slot to the semaphore. The receive
-// wakes the FIFO-earliest blocked downloader (per Go's runtime
-// sendq guarantee). Also bumps lastProgressNs so
-// runPollDeadlockObserver sees decoder-side progress (slot freed
-// = the decoder is making its way through files).
-func (state *pollState) releaseBodySlot() {
-	if state.slotCh == nil {
-		return
-	}
-	<-state.slotCh
-	state.lastProgressNs.Store(time.Now().UnixNano())
-}
-
-// pollWorkerState is the per-worker state for the poll pipeline.
-// Mirrors read.go's workerState but on FileRef-grain decoded
-// batches.
-type pollWorkerState[T any] struct {
-	queue chan decodedPollBatch[T]
-
-	mu            sync.Mutex
-	bufferedBytes int64
-	releaseSig    chan struct{}
-
-	m *metrics
-}
-
-func newPollWorkerState[T any](queueCap int, m *metrics) *pollWorkerState[T] {
-	return &pollWorkerState[T]{
-		queue:      make(chan decodedPollBatch[T], queueCap),
-		releaseSig: make(chan struct{}, 1),
-		m:          m,
-	}
-}
-
-// reserveBytes accounts uncomp bytes against the per-worker cap
-// (same single-waiter discipline as read.go's workerState).
-// Empty-buffer escape lets a single oversized file flow.
-func (ws *pollWorkerState[T]) reserveBytes(
-	ctx context.Context, uncomp, cap int64,
-) error {
-	if cap <= 0 || uncomp <= 0 {
-		return context.Cause(ctx)
-	}
-	var waitStart time.Time
-	waited := false
-	for {
-		ws.mu.Lock()
-		fits := ws.bufferedBytes <= 0 || ws.bufferedBytes+uncomp <= cap
-		if fits {
-			ws.bufferedBytes += uncomp
-			ws.mu.Unlock()
-			if waited {
-				ws.m.recordIterByteBudgetWait(ctx, time.Since(waitStart))
-			}
-			return nil
-		}
-		ws.mu.Unlock()
-		if err := context.Cause(ctx); err != nil {
-			return err
-		}
-		if !waited {
-			waitStart = time.Now()
-			waited = true
-		}
-		select {
-		case <-ws.releaseSig:
-		case <-ctx.Done():
-			return context.Cause(ctx)
-		}
-	}
-}
-
-// releaseBytes is called by the emit loop after a file's records
-// have been forwarded; frees the reservation so the owning
-// worker can pick the next file.
-func (ws *pollWorkerState[T]) releaseBytes(uncomp int64) {
-	if uncomp <= 0 {
-		return
-	}
-	ws.mu.Lock()
-	ws.bufferedBytes -= uncomp
-	ws.mu.Unlock()
-	select {
-	case ws.releaseSig <- struct{}{}:
-	default:
-	}
 }
 
 // decodedPollBatch is one file's decoded records (or a single
@@ -524,8 +385,7 @@ func (s *Store[T]) pollFetchAndDecodeIter(
 		ctx:    stateCtx,
 		cancel: cancel,
 		files:  files,
-		slotCh: make(chan struct{}, bodyCap),
-		m:      s.metrics,
+		slots:  newBodySlots(bodyCap, s.metrics),
 	}
 
 	var wg sync.WaitGroup
@@ -546,9 +406,9 @@ func (s *Store[T]) pollFetchAndDecodeIter(
 	// Stage 2: decode workers. Each handles files where
 	// fi % decodeWorkers == workerIdx and writes results to its
 	// own queue (cap = decodeAheadFiles).
-	workers := make([]*pollWorkerState[T], opts.decodeWorkers)
+	workers := make([]*workerState[decodedPollBatch[T]], opts.decodeWorkers)
 	for w := range workers {
-		workers[w] = newPollWorkerState[T](*opts.decodeAheadFiles, s.metrics)
+		workers[w] = newWorkerState[decodedPollBatch[T]](*opts.decodeAheadFiles, s.metrics)
 	}
 	for w := range workers {
 		wg.Go(func() {
@@ -559,7 +419,8 @@ func (s *Store[T]) pollFetchAndDecodeIter(
 
 	// Stall watchdog — pure observer; never cancels.
 	wg.Go(func() {
-		state.runPollDeadlockObserver(state.ctx, method,
+		runDeadlockObserver(state.ctx, s.metrics, method, "poll",
+			state.slots, "decoder_file", state.decoderFi.Load,
 			stallTickInterval, stallThreshold)
 	})
 
@@ -591,16 +452,17 @@ func (s *Store[T]) pollFetchAndDecodeIter(
 // never block on per-call coordination — see CLAUDE.md.
 //
 // On download success the task sets fs.body, closes fs.done,
-// and bumps lastProgressNs (the watchdog's progress signal).
-// On download failure: releaseBodySlot, recordHardErr (cancels
-// state.ctx with the wrapped err as cause), then close(fs.done)
-// — order matters: cause is set before done closes so the
-// decoder's waitForFile observes both atomically.
+// and bumps the body-slot watchdog timestamp (the watchdog's
+// progress signal). On download failure: release the slot,
+// recordHardErr (cancels state.ctx with the wrapped err as
+// cause), then close(fs.done) — order matters: cause is set
+// before done closes so the decoder's waitForFile observes
+// both atomically.
 func (s *Store[T]) runPollFetcher(
 	ctx context.Context, g *pool.Group, state *pollState,
 ) {
 	for fi := range state.files {
-		if state.acquireBodySlot(ctx) != nil {
+		if state.slots.acquire(ctx) != nil {
 			return
 		}
 		fs := state.files[fi]
@@ -608,7 +470,7 @@ func (s *Store[T]) runPollFetcher(
 		g.Submit(ctx, func(ctx context.Context) error {
 			body, err := s.target.get(ctx, key)
 			if err != nil {
-				state.releaseBodySlot()
+				state.slots.release()
 				wrapped := fmt.Errorf("get %s: %w", key, err)
 				state.recordHardErr(wrapped)
 				close(fs.done)
@@ -617,34 +479,20 @@ func (s *Store[T]) runPollFetcher(
 			// Slot stays held; decoder releases after nil-out.
 			fs.body = body
 			close(fs.done)
-			state.lastProgressNs.Store(time.Now().UnixNano())
+			state.slots.bumpProgress()
 			return nil
 		})
 	}
 }
 
 // waitForFile blocks until file fi's download has completed
-// (done closed) or ctx is cancelled. Returns nil on completion,
-// context.Cause(ctx) on cancellation. The download task either
-// sets fs.body (success) or calls recordHardErr (failure) before
-// closing done; on success the caller must check fs.body for nil
-// against the ctx-cause to detect "downloader recorded a hard
-// err" — but the standard pattern is: if waitForFile returns
-// nil AND fs.body is non-nil, decode proceeds.
+// (done closed) or ctx is cancelled. Returns nil on completion
+// AND ctx still alive, context.Cause(ctx) otherwise — so the
+// "download recorded a hard err and closed done" case (which
+// always cancels state.ctx via recordHardErr first) is folded
+// into the same return value the worker forwards.
 func (state *pollState) waitForFile(ctx context.Context, fi int) error {
-	fs := state.files[fi]
-	select {
-	case <-fs.done:
-		// Distinguish "download succeeded" from "download recorded
-		// a hard err and closed done." The latter sets ctx-cause;
-		// returning the cause lets the worker forward it directly.
-		if err := context.Cause(ctx); err != nil {
-			return err
-		}
-		return nil
-	case <-ctx.Done():
-		return context.Cause(ctx)
-	}
+	return waitOrCancel(ctx, state.files[fi].done)
 }
 
 // runPollDecodeWorker handles files assigned to worker w via
@@ -654,12 +502,12 @@ func (state *pollState) waitForFile(ctx context.Context, fi int) error {
 // result to ws.queue. Emit drains ws.queue in input order.
 func (s *Store[T]) runPollDecodeWorker(
 	ctx context.Context, state *pollState,
-	ws *pollWorkerState[T], workerIdx, numWorkers int,
+	ws *workerState[decodedPollBatch[T]], workerIdx, numWorkers int,
 	opts *pollOpts,
 ) {
 	for fi := workerIdx; fi < len(state.files); fi += numWorkers {
 		if err := state.waitForFile(ctx, fi); err != nil {
-			sendPollBatch(ctx, ws.queue, decodedPollBatch[T]{err: err})
+			sendBatch(ctx, ws.queue, decodedPollBatch[T]{err: err})
 			return
 		}
 		fs := state.files[fi]
@@ -669,9 +517,9 @@ func (s *Store[T]) runPollDecodeWorker(
 		// (decodeParquet allocates as needed for one file).
 		uncomp, err := pollFooterUncomp(fs.body)
 		if err != nil {
-			state.releaseBodySlot()
+			state.slots.release()
 			fs.body = nil
-			sendPollBatch(ctx, ws.queue, decodedPollBatch[T]{
+			sendBatch(ctx, ws.queue, decodedPollBatch[T]{
 				err: fmt.Errorf("footer %s: %w", fs.file.S3Key, err),
 			})
 			return
@@ -679,27 +527,27 @@ func (s *Store[T]) runPollDecodeWorker(
 
 		// Gate on this worker's byte budget if configured.
 		if err := ws.reserveBytes(ctx, uncomp, opts.decodeAheadBytes); err != nil {
-			state.releaseBodySlot()
+			state.slots.release()
 			fs.body = nil
-			sendPollBatch(ctx, ws.queue, decodedPollBatch[T]{err: err})
+			sendBatch(ctx, ws.queue, decodedPollBatch[T]{err: err})
 			return
 		}
 
 		decodeStart := time.Now()
 		recs, err := decodeParquet[T](fs.body)
-		state.m.recordIterDecodeDuration(ctx, time.Since(decodeStart))
+		s.metrics.recordIterDecodeDuration(ctx, time.Since(decodeStart))
 		// Free the body and slot regardless of decode outcome.
 		fs.body = nil
-		state.releaseBodySlot()
+		state.slots.release()
 		if err != nil {
 			ws.releaseBytes(uncomp)
-			sendPollBatch(ctx, ws.queue, decodedPollBatch[T]{
+			sendBatch(ctx, ws.queue, decodedPollBatch[T]{
 				err: fmt.Errorf("decode %s: %w", fs.file.S3Key, err),
 			})
 			return
 		}
 
-		if !sendPollBatch(ctx, ws.queue, decodedPollBatch[T]{
+		if !sendBatch(ctx, ws.queue, decodedPollBatch[T]{
 			file:        fs.file,
 			records:     recs,
 			uncompBytes: uncomp,
@@ -725,82 +573,6 @@ func pollFooterUncomp(body []byte) (int64, error) {
 		uncomp += rg.TotalByteSize
 	}
 	return uncomp, nil
-}
-
-// sendPollBatch pushes a batch onto ws.queue, returning false on
-// ctx cancellation so the caller can clean up the byte
-// reservation it might have just made.
-//
-// Best-effort delivery — same rationale as read.go's sendBatch:
-// race-free non-blocking send first to avoid Go's select
-// non-determinism dropping an error batch when the buffer has
-// capacity AND ctx is cancelled.
-func sendPollBatch[T any](
-	ctx context.Context, q chan<- decodedPollBatch[T],
-	b decodedPollBatch[T],
-) bool {
-	select {
-	case q <- b:
-		return true
-	default:
-	}
-	select {
-	case q <- b:
-		return true
-	case <-ctx.Done():
-		return false
-	}
-}
-
-// runPollDeadlockObserver surfaces stalls (no decoder progress
-// within stallThreshold) via slog.Warn + the
-// s3pgstore.read.iter.stall.count counter. Pure observer — never
-// cancels. Mirrors read.go's runDeadlockObserver: tracks
-// decoder-side progress (lastProgressNs bumped by releaseBodySlot)
-// and logs the emit position (decoderFi) for context.
-//
-// Pure-observer rationale matches read.go: auto-cancelling on
-// stall would mask information needed to diagnose the underlying
-// issue and risk false-positive aborts of legitimately slow
-// consumers. Hard ceilings belong at the call site via
-// ctx.WithTimeout.
-func (state *pollState) runPollDeadlockObserver(
-	ctx context.Context, method string,
-	tick, threshold time.Duration,
-) {
-	t := time.NewTicker(tick)
-	defer t.Stop()
-	thresholdNs := threshold.Nanoseconds()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case now := <-t.C:
-			last := state.lastProgressNs.Load()
-			if last == 0 {
-				// Pipeline hasn't logged any decoder progress
-				// yet; either the very-first download is still
-				// in flight (a single GET that exceeds the
-				// threshold is a legitimate reason to skip the
-				// alert) or the pipeline is empty and about to
-				// exit.
-				continue
-			}
-			staleNs := now.UnixNano() - last
-			if staleNs < thresholdNs {
-				continue
-			}
-			slog.Warn(
-				"s3pgstore: poll pipeline made no forward progress within watchdog window",
-				"method", method,
-				"stale_seconds", time.Duration(staleNs).Seconds(),
-				"decoder_file", state.decoderFi.Load(),
-				"slot_occupancy", len(state.slotCh),
-				"slot_capacity", cap(state.slotCh),
-			)
-			state.m.recordIterStall(ctx, method)
-		}
-	}
 }
 
 // PollRecordsIter walks the half-open offset range

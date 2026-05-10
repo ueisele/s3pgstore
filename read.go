@@ -58,7 +58,6 @@ import (
 	"context"
 	"fmt"
 	"iter"
-	"log/slog"
 	"runtime"
 	"slices"
 	"strings"
@@ -701,7 +700,7 @@ func partitionCollectEmit[T any](
 // false. On success, emit returns true to keep going.
 //
 // Pool-worker shape: the submitted task does only the S3 GET
-// and a markComplete / state.releaseBodySlots / recordHardErr
+// and a markComplete / state.slots.release / recordHardErr
 // update. It never blocks on per-call coordination — body-slot
 // acquire is on the fetcher, decoder back-pressure is in the
 // (non-pool) decoder goroutine. This satisfies the shared-pool
@@ -762,15 +761,14 @@ func (s *Store[T]) fetchAndDecodeIter(
 	// state.ctx is the single cancellation source for every
 	// stage. WithCancelCause propagates the parent's cause
 	// automatically and lets us attach an abort reason
-	// atomically with our own cancels — see streamState's
+	// atomically with our own cancels — see readState's
 	// type comment for the rationale.
 	stateCtx, cancel := context.WithCancelCause(ctx)
-	state := &streamState{
+	state := &readState{
 		ctx:    stateCtx,
 		cancel: cancel,
 		parts:  parts,
-		slotCh: make(chan struct{}, bodyCap),
-		m:      s.metrics,
+		slots:  newBodySlots(bodyCap, s.metrics),
 	}
 
 	// One WaitGroup covers every helper goroutine so the deferred
@@ -793,7 +791,7 @@ func (s *Store[T]) fetchAndDecodeIter(
 	// (cancelling state.ctx with the wrapped err as cause)
 	// before markComplete. gctx is derived from state.ctx, so
 	// it auto-cancels too — fetcher sees gctx done in
-	// acquireBodySlot, sibling tasks observe gctx done in
+	// state.slots.acquire, sibling tasks observe gctx done in
 	// s.target.get. Files past the fetcher's exit point are
 	// deliberately NOT markComplete'd; their partitions' done
 	// channels would block waitForPartition forever, except
@@ -806,14 +804,14 @@ func (s *Store[T]) fetchAndDecodeIter(
 	// error path or parent propagation). The g.Wait call exists
 	// only to drain in-flight tasks before this goroutine exits
 	// so wg.Wait sees all pool work complete before
-	// fetchAndDecodeIter returns and the streamState is dropped.
+	// fetchAndDecodeIter returns and the readState is dropped.
 	g, gctx := s.resolved.WorkerPool.WithContext(state.ctx)
 	wg.Go(func() {
 		s.runFetcher(gctx, g, state)
 		_ = g.Wait()
 	})
 	// No cancel-broadcast helper goroutine: every blocking
-	// primitive (slotCh acquire, partState.done wait,
+	// primitive (bodySlots.acquire, partState.done wait,
 	// workerState.releaseSig bell) selects on state.ctx.Done()
 	// natively. See CLAUDE.md "Concurrency invariants".
 
@@ -827,9 +825,9 @@ func (s *Store[T]) fetchAndDecodeIter(
 	// applyDefaults + the clamp above guarantee
 	// decodeWorkers in [1, len(parts)] and
 	// decodeAheadPartitions != nil — no fallbacks needed here.
-	workers := make([]*workerState[T], opts.decodeWorkers)
+	workers := make([]*workerState[decodedBatch[T]], opts.decodeWorkers)
 	for w := range workers {
-		workers[w] = newWorkerState[T](*opts.decodeAheadPartitions, s.metrics)
+		workers[w] = newWorkerState[decodedBatch[T]](*opts.decodeAheadPartitions, s.metrics)
 	}
 	for w := range workers {
 		wg.Go(func() {
@@ -843,7 +841,8 @@ func (s *Store[T]) fetchAndDecodeIter(
 	// s3pgstore.read.iter.stall.count, never cancels. See
 	// runDeadlockObserver for the rationale.
 	wg.Go(func() {
-		state.runDeadlockObserver(state.ctx, method,
+		runDeadlockObserver(state.ctx, s.metrics, method, "read",
+			state.slots, "decoder_partition", state.decoderPi.Load,
 			stallTickInterval, stallThreshold)
 	})
 
@@ -940,7 +939,7 @@ func (s *Store[T]) preparePartitions(
 // partState holds per-partition download progress. partitionKey,
 // files, and version are fixed at preparePartitions time;
 // bodies + completed are mutated by pool tasks under
-// streamState.mu.
+// readState.mu.
 //
 // done is a per-partition completion signal. markComplete closes
 // it when the final file lands; waitForPartition selects on it
@@ -963,7 +962,7 @@ type partState struct {
 	done         chan struct{}
 }
 
-// streamState is the shared mutable state coordinating the
+// readState is the shared mutable state coordinating the
 // fetcher, decode workers, and emit loop. The byte budget
 // (WithDecodeAheadBytes) is per-decode-worker and lives on
 // workerState — keeping it off the shared struct removes the
@@ -981,36 +980,16 @@ type partState struct {
 // (separate firstHardErr field + outer ctx) where a parent-ctx
 // cancel could race the recordHardErr write.
 //
-// slotCh is the body-slot semaphore, a buffered channel with
-// cap = bodyCap. Go's runtime drains a channel's sendq FIFO on
-// every receive, so releaseBodySlots wakes the earliest-parked
-// sender. The chan-based shape removes a scheduler-biased
-// starvation window in the prior cond+counter design — see
-// CLAUDE.md "Concurrency invariants" for the deadlock trace.
-//
-// m is the metrics handle. acquireBodySlot reports wait duration
-// when the call blocked and succeeded; cancel-during-wait is
-// not recorded (shutdown noise would drown out the saturation
-// signal).
-type streamState struct {
+// slots is the body-slot semaphore — see iter_pipeline_shared.go
+// for FIFO sendq + watchdog progress-bump rationale.
+type readState struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc
 
-	mu     sync.Mutex
-	parts  []*partState
-	slotCh chan struct{}
-	m      *metrics
+	mu    sync.Mutex
+	parts []*partState
+	slots *bodySlots
 
-	// lastProgressNs is the wall-clock timestamp (UnixNano) of
-	// the most recent forward-progress event in the pipeline:
-	// markComplete (a download landed) or releaseBodySlots (the
-	// decoder advanced through a file). Read by
-	// runDeadlockObserver to surface pipelines that have parked
-	// indefinitely. Atomic so the observer reads lock-free;
-	// staleness from a recent progress event between the load
-	// and the threshold check is fine — the observer fires at
-	// most every tick anyway.
-	lastProgressNs atomic.Int64
 	// decoderPi is the partition index the emit loop is currently
 	// waiting for. Surfaced by the observer to point operators at
 	// the stuck partition. With multiple decode workers, this
@@ -1021,16 +1000,8 @@ type streamState struct {
 
 // recordHardErr cancels state.ctx with cause = err. First call
 // sets the cause; subsequent calls are no-ops (cancel is
-// idempotent and only the first cause sticks). Used by:
-//
-//   - pool task error path: surfaces the wrapped GET err to
-//     the consumer.
-//   - submitter cancel-detected path: defensive — state.ctx is
-//     already cancelled by whoever cancelled it (parent or a
-//     sibling task), so this is a no-op but documents intent.
-//   - submitter goroutine after g.Wait: covers the case where
-//     g.Wait returned an err that no in-tree path recorded
-//     (e.g., parent cancel during in-flight tasks).
+// idempotent and only the first cause sticks). Called only
+// from the pool task error path with a non-nil wrapped err.
 //
 // Cancel is immediate. Listeners on state.ctx (decoder,
 // watchdog, in-flight pool tasks via gctx, submitter via gctx)
@@ -1052,63 +1023,8 @@ type streamState struct {
 // surfacing the abort reason quickly and reliably is more
 // important than guaranteeing one extra batch on slow
 // consumers.
-func (s *streamState) recordHardErr(err error) {
-	if err == nil {
-		return
-	}
+func (s *readState) recordHardErr(err error) {
 	s.cancel(err)
-}
-
-// acquireBodySlot reserves one slot in the compressed-body
-// pool. Blocks while the pool is full and ctx is alive. Returns
-// nil on successful acquire; non-nil error (= context.Cause(ctx))
-// when ctx is cancelled while waiting — caller can use the
-// returned error directly without a separate hardErr lookup.
-//
-// The pool bounds the worst-case compressed-byte footprint of
-// the pipeline to roughly cap × largest_compressed_size.
-// Implemented via streamState.slotCh; see its type comment for
-// the FIFO + deadlock-fix rationale.
-//
-// Records to metrics.recordIterBodySlotWait only when the slot
-// wasn't immediately available AND the acquire eventually
-// succeeded — cancel-during-wait is intentionally not recorded
-// (shutdown noise, near-zero duration would drown out the
-// saturation signal).
-func (s *streamState) acquireBodySlot(ctx context.Context) error {
-	if s.slotCh == nil {
-		return context.Cause(ctx)
-	}
-	// Non-blocking fast path: slot available, no wait
-	// observation.
-	select {
-	case s.slotCh <- struct{}{}:
-		return nil
-	default:
-	}
-	waitStart := time.Now()
-	select {
-	case s.slotCh <- struct{}{}:
-		s.m.recordIterBodySlotWait(ctx, time.Since(waitStart))
-		return nil
-	case <-ctx.Done():
-		return context.Cause(ctx)
-	}
-}
-
-// releaseBodySlots returns n slots to the pool. Each receive on
-// slotCh wakes the FIFO-earliest blocked downloader (per Go's
-// channel sendq). Also bumps lastProgressNs so
-// runDeadlockObserver sees decoder-side progress (slots being
-// freed = the decoder is making its way through partitions).
-func (s *streamState) releaseBodySlots(n int) {
-	if n <= 0 || s.slotCh == nil {
-		return
-	}
-	for range n {
-		<-s.slotCh
-	}
-	s.lastProgressNs.Store(time.Now().UnixNano())
 }
 
 // markComplete is the pool-task-side update: store the body in
@@ -1127,10 +1043,10 @@ func (s *streamState) releaseBodySlots(n int) {
 // the critical section so we don't hold mu across the
 // channel-close runtime call.
 //
-// Bumps lastProgressNs after the mutex is released so
-// runDeadlockObserver observes a fresh timestamp on every
-// downloaded file, lock-free.
-func (s *streamState) markComplete(
+// Bumps the body-slot watchdog timestamp after the mutex is
+// released so runDeadlockObserver observes a fresh forward-
+// progress event on every downloaded file, lock-free.
+func (s *readState) markComplete(
 	partIdx, fileIdx int, body []byte,
 ) {
 	p := s.parts[partIdx]
@@ -1142,7 +1058,7 @@ func (s *streamState) markComplete(
 	if finalFile {
 		close(p.done)
 	}
-	s.lastProgressNs.Store(time.Now().UnixNano())
+	s.slots.bumpProgress()
 }
 
 // waitForPartition blocks until every file in partition pi has
@@ -1160,114 +1076,10 @@ func (s *streamState) markComplete(
 // forward it without an extra hardErr lookup; without it, the
 // decoder could silently emit a partial PartitionResult (some
 // bodies present, some marked nil by failed tasks).
-func (s *streamState) waitForPartition(
+func (s *readState) waitForPartition(
 	ctx context.Context, pi int,
 ) error {
-	p := s.parts[pi]
-	select {
-	case <-p.done:
-	case <-ctx.Done():
-	}
-	return context.Cause(ctx)
-}
-
-// workerState is the per-decode-worker state: an output queue
-// the worker fills with decoded batches and a private byte
-// budget. Each worker is the sole reserver against its own
-// budget; emit is the sole releaser. Single-waiter semantics on
-// releaseSig (this worker), so the same chan(1) edge-trigger
-// pattern as the prior shared byteWake works without multi-
-// waiter coordination.
-//
-// Workers self-assign partitions round-robin (worker w handles
-// pi where pi % W == w); emit drains queues in lex pi order so
-// the deterministic-emission contract holds.
-type workerState[T any] struct {
-	queue chan decodedBatch[T]
-
-	mu            sync.Mutex
-	bufferedBytes int64
-	releaseSig    chan struct{}
-
-	m *metrics
-}
-
-func newWorkerState[T any](queueCap int, m *metrics) *workerState[T] {
-	return &workerState[T]{
-		queue:      make(chan decodedBatch[T], queueCap),
-		releaseSig: make(chan struct{}, 1),
-		m:          m,
-	}
-}
-
-// reserveBytes accounts uncomp bytes against the per-worker cap.
-// Blocks while bufferedBytes + uncomp would exceed cap AND the
-// buffer is non-empty; the empty-buffer escape lets a single
-// oversized partition through (otherwise the worker would block
-// on the cap with emit waiting for the result). Returns nil on
-// successful reservation; non-nil error (= context.Cause(ctx))
-// when ctx is cancelled while waiting.
-//
-// Single-waiter discipline: only this worker reserves against
-// ws; only emit releases. While the worker is parked,
-// bufferedBytes can only stay the same or decrease (no other
-// worker writes to ws). Stale releaseSig signals are therefore
-// harmless — the loop always re-checks the predicate.
-//
-// Records to metrics.recordIterByteBudgetWait only when the
-// wait fired AND the reservation succeeded — cancel path is
-// not recorded.
-func (ws *workerState[T]) reserveBytes(
-	ctx context.Context, uncomp, cap int64,
-) error {
-	if cap <= 0 || uncomp <= 0 {
-		return context.Cause(ctx)
-	}
-	var waitStart time.Time
-	waited := false
-	for {
-		ws.mu.Lock()
-		fits := ws.bufferedBytes <= 0 || ws.bufferedBytes+uncomp <= cap
-		if fits {
-			ws.bufferedBytes += uncomp
-			ws.mu.Unlock()
-			if waited {
-				ws.m.recordIterByteBudgetWait(ctx, time.Since(waitStart))
-			}
-			return nil
-		}
-		ws.mu.Unlock()
-		if err := context.Cause(ctx); err != nil {
-			return err
-		}
-		if !waited {
-			waitStart = time.Now()
-			waited = true
-		}
-		select {
-		case <-ws.releaseSig:
-		case <-ctx.Done():
-			return context.Cause(ctx)
-		}
-	}
-}
-
-// releaseBytes is called by the emit loop after a partition's
-// records have been forwarded; frees the reservation so the
-// owning worker can pick the next partition. The non-blocking
-// send on releaseSig is the bell-ring: a coalesced wake costs
-// at most one extra trip through the predicate loop.
-func (ws *workerState[T]) releaseBytes(uncomp int64) {
-	if uncomp <= 0 {
-		return
-	}
-	ws.mu.Lock()
-	ws.bufferedBytes -= uncomp
-	ws.mu.Unlock()
-	select {
-	case ws.releaseSig <- struct{}{}:
-	default:
-	}
+	return waitOrCancel(ctx, s.parts[pi].done)
 }
 
 // runFetcher walks partitions in order and submits
@@ -1281,7 +1093,7 @@ func (ws *workerState[T]) releaseBytes(uncomp int64) {
 //
 // Concurrency model:
 //
-//   - Fetcher is one goroutine; acquireBodySlot blocks here
+//   - Fetcher is one goroutine; state.slots.acquire blocks here
 //     when the per-call slot pool is full, so the fetcher
 //     itself paces the pipeline.
 //   - g.Submit blocks when the shared pool has no free slot.
@@ -1298,17 +1110,17 @@ func (ws *workerState[T]) releaseBytes(uncomp int64) {
 // in s.target.get and bail.
 //
 // Body-slot leak on submit-skip is harmless. If gctx is
-// cancelled between acquireBodySlot and g.Submit, the task fn
-// never runs and the slot stays held — but slotCh is per-call
-// state torn down by fetchAndDecodeIter's deferred wg.Wait, and
-// waitForPartition observes ctx.Done. No deadlock, no observable
-// leak.
+// cancelled between state.slots.acquire and g.Submit, the task
+// fn never runs and the slot stays held — but state.slots is
+// per-call state torn down by fetchAndDecodeIter's deferred
+// wg.Wait, and waitForPartition observes ctx.Done. No deadlock,
+// no observable leak.
 func (s *Store[T]) runFetcher(
-	ctx context.Context, g *pool.Group, state *streamState,
+	ctx context.Context, g *pool.Group, state *readState,
 ) {
 	for pi := range state.parts {
 		for fi := range state.parts[pi].files {
-			if state.acquireBodySlot(ctx) != nil {
+			if state.slots.acquire(ctx) != nil {
 				// state.ctx is already cancelled with a cause
 				// set (either parent propagation or a sibling
 				// task's recordHardErr — the failing task
@@ -1325,7 +1137,7 @@ func (s *Store[T]) runFetcher(
 				body, err := s.target.get(ctx, key)
 				if err != nil {
 					// No body materialised — return the slot.
-					state.releaseBodySlots(1)
+					state.slots.release()
 					wrapped := fmt.Errorf("get %s: %w", key, err)
 					state.recordHardErr(wrapped)
 					state.markComplete(pi, fi, nil)
@@ -1359,8 +1171,8 @@ func (s *Store[T]) runFetcher(
 // alive) folds in the "did a sibling task error?" check, so no
 // extra pre/post checks around the wait.
 func (s *Store[T]) runDecodeWorker(
-	ctx context.Context, state *streamState,
-	ws *workerState[T], workerIdx, numWorkers int, opts *readOpts,
+	ctx context.Context, state *readState,
+	ws *workerState[decodedBatch[T]], workerIdx, numWorkers int, opts *readOpts,
 ) {
 	for pi := workerIdx; pi < len(state.parts); pi += numWorkers {
 		if err := state.waitForPartition(ctx, pi); err != nil {
@@ -1395,7 +1207,7 @@ func (s *Store[T]) runDecodeWorker(
 		decodeStart := time.Now()
 		recs, err := s.decodePartition(state, ps, totalRows,
 			opts.includeHistory)
-		state.m.recordIterDecodeDuration(ctx, time.Since(decodeStart))
+		s.metrics.recordIterDecodeDuration(ctx, time.Since(decodeStart))
 		// decodePartition nils each body + releases its
 		// body-pool slot per-file; nothing else to clean up at
 		// the partition level.
@@ -1432,7 +1244,7 @@ func (s *Store[T]) runDecodeWorker(
 // in-place and returns out[:n] — same backing array, length
 // truncated to the survivor count.
 func (s *Store[T]) decodePartition(
-	state *streamState, ps *partState, totalRows int64,
+	state *readState, ps *partState, totalRows int64,
 	includeHistory bool,
 ) ([]T, error) {
 	out := make([]T, 0, totalRows)
@@ -1444,7 +1256,7 @@ func (s *Store[T]) decodePartition(
 		// Free the body and return its slot regardless of
 		// decode outcome — we're done with it either way.
 		ps.bodies[fi] = nil
-		state.releaseBodySlots(1)
+		state.slots.release()
 		if err != nil {
 			return nil, fmt.Errorf(
 				"decode %s: %w", ps.files[fi].S3Key, err)
@@ -1475,36 +1287,6 @@ type decodedBatch[T any] struct {
 	err          error
 }
 
-// sendBatch pushes a batch onto decodedCh, returning false on
-// ctx cancellation so the caller can clean up the byte
-// reservation it might have just made.
-//
-// Best-effort delivery: try the non-blocking send first.
-// Without this the select below would race ctx.Done against a
-// ready send, and Go's non-deterministic select could drop an
-// error batch when the buffer has capacity AND ctx is already
-// cancelled — a silent-drop hole on the strict-error path
-// where the downloader's cancel() runs before the decoder's
-// send arrives. Only fall back to the racing select when the
-// buffer is full (consumer abandoned the iter and the deferred
-// cancel keeps the pipeline from deadlocking).
-func sendBatch[T any](
-	ctx context.Context, decodedCh chan<- decodedBatch[T],
-	b decodedBatch[T],
-) bool {
-	select {
-	case decodedCh <- b:
-		return true
-	default:
-	}
-	select {
-	case decodedCh <- b:
-		return true
-	case <-ctx.Done():
-		return false
-	}
-}
-
 // footerStats opens each non-nil body via parquet-go's footer
 // parser and returns the partition's totals: uncompressed bytes
 // (per-row-group total_byte_size, which the parquet spec
@@ -1533,86 +1315,4 @@ func footerStats(p *partState) (uncomp, totalRows int64, err error) {
 		}
 	}
 	return uncomp, totalRows, nil
-}
-
-// Stall watchdog defaults. Production fetchAndDecodeIter
-// wires these via runDeadlockObserver; tests can override with
-// shorter intervals so a stall signal fires within milliseconds
-// rather than minutes (currently no test does so — left here
-// as the upstream-vendored knob).
-//
-// stallTickInterval is generous: the observer is a background
-// safety net, not a hot-path metric. A 30s tick on a stuck
-// pipeline means at most 30s of latency between the stall
-// starting and the first slog.Warn — operators see it long
-// before SIGQUIT-debugging is needed.
-//
-// stallThreshold is double the tick: a single missed tick is
-// not a stall (that would just be timing noise on a slow
-// consumer that's about to pull the next batch). Two missed
-// ticks signals a real lack of forward progress.
-const (
-	stallTickInterval = 30 * time.Second
-	stallThreshold    = 60 * time.Second
-)
-
-// runDeadlockObserver is the iter pipeline's stall watchdog —
-// pure observer, never cancels. Periodically wakes and emits a
-// slog.Warn + s3pgstore.read.iter.stall.count increment if the
-// pipeline made no forward progress (markComplete or
-// releaseBodySlots) within the threshold window.
-//
-// The observer is a regression detector: the FIFO channel-based
-// slot semaphore makes the cond+counter starvation deadlock
-// unreachable, but a future change introducing a different
-// stall would otherwise be silent. Operators set an alert on a
-// non-zero rate of s3pgstore.read.iter.stall.count to surface
-// deadlocks (real bugs) and slow consumers (heavy yield-side
-// processing) — both worth seeing.
-//
-// Pure-observer rationale: auto-canceling on stall would mask
-// information needed to diagnose the underlying issue
-// (goroutine state for SIGQUIT, channel occupancy, decoder
-// partition) and risk false-positive aborts of legitimately
-// slow consumers. Users who want a hard ceiling pass
-// ctx.WithTimeout at the call site — that propagates through
-// every layer uniformly. A circuit-breaker at the iter layer is
-// straightforward to add in caller code on top of this metric
-// if a specific operational scenario needs it.
-func (s *streamState) runDeadlockObserver(
-	ctx context.Context, method string,
-	tickInterval, threshold time.Duration,
-) {
-	t := time.NewTicker(tickInterval)
-	defer t.Stop()
-	thresholdNs := threshold.Nanoseconds()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case now := <-t.C:
-			last := s.lastProgressNs.Load()
-			if last == 0 {
-				// Pipeline hasn't logged any progress yet;
-				// either the very-first download is still in
-				// flight (a single GET that exceeds the
-				// threshold is a legitimate reason to skip the
-				// alert) or the pipeline is empty and about to
-				// exit.
-				continue
-			}
-			staleNs := now.UnixNano() - last
-			if staleNs < thresholdNs {
-				continue
-			}
-			slog.Warn(
-				"s3pgstore: iter pipeline made no forward progress within watchdog window",
-				"method", method,
-				"stale_seconds", time.Duration(staleNs).Seconds(),
-				"decoder_partition", s.decoderPi.Load(),
-				"slot_occupancy", len(s.slotCh),
-				"slot_capacity", cap(s.slotCh))
-			s.m.recordIterStall(ctx, method)
-		}
-	}
 }

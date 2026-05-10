@@ -382,14 +382,16 @@ func TestSubmit_DeadlockDetection_AllowsFreshGoroutine(t *testing.T) {
 }
 
 // TestSubmit_FifoOrderUnderSaturation verifies the documented
-// FIFO behavior of semaphore.Weighted — submitters are unblocked
-// in the order they Acquired. We saturate the pool, then queue a
-// dozen Submits each tagged with their submission index, and
-// check that completion order matches submission order.
+// FIFO behavior of the buffered-channel semaphore — submitters
+// are unblocked in the order they queued (Go runtime drains a
+// channel's sendq strictly FIFO on every receive). We saturate
+// the pool, then queue a dozen Submits each tagged with their
+// submission index, and check that completion order matches
+// submission order.
 //
-// The acquire happens on the submit goroutine (single goroutine
-// in this test driving all Submits), so Acquires are serialized
-// and FIFO is observable.
+// The slot send happens on the submit goroutine (single
+// goroutine in this test driving all Submits), so sends are
+// serialized and FIFO is observable.
 func TestSubmit_FifoOrderUnderSaturation(t *testing.T) {
 	p, err := New(1, nil) // serialised channel
 	if err != nil {

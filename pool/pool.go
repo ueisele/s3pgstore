@@ -15,13 +15,14 @@
 // topology changes.
 //
 // Why goroutine-per-task. The pool blocks at submit time on a
-// shared semaphore; once admitted, it spawns one short-lived
-// goroutine per task and releases the slot when the task
-// returns. At I/O latencies (~10-100 ms per S3 op), goroutine
-// spawn cost (~1 µs) is rounding error — measurably no worse
-// than persistent workers and avoids the worker-lifecycle
-// state machine. The submitter blocks ⇒ natural backpressure;
-// no unbounded queue, no body-memory blow-up.
+// shared buffered-channel semaphore; once admitted, it spawns
+// one short-lived goroutine per task and releases the slot
+// when the task returns. At I/O latencies (~10-100 ms per S3
+// op), goroutine spawn cost (~1 µs) is rounding error —
+// measurably no worse than persistent workers and avoids the
+// worker-lifecycle state machine. The submitter blocks ⇒
+// natural backpressure; no unbounded queue, no body-memory
+// blow-up.
 //
 // Pattern at the call site:
 //
@@ -55,18 +56,17 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 	"golang.org/x/sync/errgroup"
-	"golang.org/x/sync/semaphore"
 )
 
 // Pool is a shared concurrency budget for I/O-bound work.
 // Submissions across all Groups bound to the pool compete for
-// its MaxConcurrent slots in FIFO order
-// (semaphore.Weighted.Acquire is FIFO).
+// its MaxConcurrent slots in FIFO order (Go's runtime drains a
+// channel's sendq strictly FIFO on every receive).
 //
 // The zero value is not usable; construct via New.
 type Pool struct {
-	sem *semaphore.Weighted
-	n   int
+	slots chan struct{}
+	n     int
 
 	// Metrics. Always non-nil after New (noop fallback when no
 	// meter is provided), so call sites don't branch on nil.
@@ -115,7 +115,7 @@ func New(maxConcurrent int, meter metric.Meter) (*Pool, error) {
 		return nil, fmt.Errorf("pool: register queue.wait.duration: %w", err)
 	}
 	return &Pool{
-		sem:      semaphore.NewWeighted(int64(maxConcurrent)),
+		slots:    make(chan struct{}, maxConcurrent),
 		n:        maxConcurrent,
 		inFlight: inFlight,
 		waitDur:  waitDur,
@@ -208,7 +208,9 @@ func (g *Group) Submit(
 			"or spawn a fresh goroutine for nested work")
 	}
 	start := time.Now()
-	if err := g.pool.sem.Acquire(g.ctx, 1); err != nil {
+	select {
+	case g.pool.slots <- struct{}{}:
+	case <-g.ctx.Done():
 		// Group ctx cancelled (parent cancel or sibling error).
 		// Wait surfaces the cause.
 		return
@@ -218,7 +220,7 @@ func (g *Group) Submit(
 	g.eg.Go(func() (err error) {
 		defer func() {
 			g.pool.inFlight.Add(g.ctx, -1)
-			g.pool.sem.Release(1)
+			<-g.pool.slots
 		}()
 		defer func() {
 			if p := recover(); p != nil {

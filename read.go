@@ -113,8 +113,6 @@ func (withHistoryOpt) applyRead(o *readOpts) { o.includeHistory = true }
 // oversized partition still flows in full — without that floor
 // the fetcher would block on the cap with the decoder waiting
 // on the partition's remaining files.
-//
-// No effect on the buffered Read path.
 func WithFetchAheadFiles(n int) ReadOption {
 	if n < 0 {
 		n = 0
@@ -129,20 +127,28 @@ func (o withFetchAheadFilesOpt) applyRead(opts *readOpts) {
 }
 
 // WithDecodeWorkers sets the number of parallel decoder
-// goroutines for the iter pipeline. Default (option not supplied
-// or n <= 0) is 1 — single-decoder behavior, deterministic
-// CPU footprint at one core.
+// goroutines for the iter pipeline. Default for ReadIter / its
+// variants is 1 (single-decoder, deterministic CPU footprint).
+// Default for Read / ReadPartition is auto-tuned to
+// min(WorkerPool.MaxConcurrent(), GOMAXPROCS, lenParts) so batch
+// reads parallelize across cores out of the box.
 //
 // n > 1 fans out decode across n goroutines. Workers self-assign
 // partitions round-robin: worker w handles partitions where
 // pi % n == w. Emit drains worker queues in lex partition order
 // so the deterministic-emission contract is preserved.
 //
-// Use for batch-analytics workloads where decode dominates the
-// per-call wall-time (many partitions, reasonably uniform sizes,
-// throughput-bound consumer). Streaming workloads with small
-// records and a slow consumer see no benefit — decode time is
-// already small relative to consumer yield.
+// Use on the iter family for batch-analytics workloads where
+// decode dominates per-call wall-time (many partitions,
+// reasonably uniform sizes, throughput-bound consumer).
+// Streaming workloads with small records and a slow consumer
+// see no benefit — decode time is already small relative to
+// consumer yield.
+//
+// Pair with WithDecodeAheadPartitions on skewed workloads.
+// With K=1 (the iter default), fast workers stall after one
+// batch ahead while emit waits on a slow sibling. A larger K
+// lets fast workers race ahead during slow-partition decodes.
 //
 // Round-robin assignment can imbalance load when partition sizes
 // are strongly correlated with pi mod n; for typical workloads
@@ -152,8 +158,6 @@ func (o withFetchAheadFilesOpt) applyRead(opts *readOpts) {
 // Memory implications: WithDecodeAheadPartitions and
 // WithDecodeAheadBytes are PER WORKER — total in-flight decoded
 // memory is multiplied by n. Account for this when tuning.
-//
-// No effect on the buffered Read path.
 func WithDecodeWorkers(n int) ReadOption {
 	if n < 1 {
 		n = 1
@@ -185,9 +189,6 @@ func (o withDecodeWorkersOpt) applyRead(opts *readOpts) {
 // total of buffered decoded partitions is W × n. Memory:
 // O((W × n + 1) partitions) — workers' queues + the one being
 // yielded.
-//
-// No effect on the buffered Read path (which materialises every
-// partition concurrently by design).
 func WithDecodeAheadPartitions(n int) ReadOption {
 	if n < 0 {
 		n = 0
@@ -226,8 +227,6 @@ func (o withDecodeAheadPartitionsOpt) applyRead(opts *readOpts) {
 //
 // Per-worker semantics: with WithDecodeWorkers(W), the per-call
 // total of decoded uncompressed bytes is W × n.
-//
-// No effect on the buffered Read path.
 func WithDecodeAheadBytes(n int64) ReadOption {
 	if n < 0 {
 		n = 0
@@ -241,149 +240,73 @@ func (o withDecodeAheadBytesOpt) applyRead(opts *readOpts) {
 	opts.decodeAheadBytes = o.n
 }
 
-// Read returns one PartitionResult[T] per partition matched by
-// filters. Records are deduplicated by (EntityKeyOf,
+// Read returns every record matching filters as a flat slice
+// in lex partition order, deduplicated by (EntityKeyOf,
 // VersionOf) when both are configured (pass WithHistory to
 // opt out).
 //
-// Single SQL query against s3pgstore_files (no per-file
-// filtering, no LIMIT — every file row for every matched
-// partition comes back, per CLAUDE.md). Every (partition,
-// file) pair across the result set is fetched + decoded in
-// parallel through the shared Config.WorkerPool (defaulted to
-// 64 slots; bounded globally by s3client.Options.MaxOpenConnections
-// at the HTTP transport). Records are then concatenated per
-// partition in s3_key order and deduplicated once per
-// partition on the calling goroutine.
+// Backed by the same chan-based fetch+decode pipeline as
+// ReadIter, but auto-tunes for batch use: WithDecodeWorkers
+// defaults to min(WorkerPool.MaxConcurrent(), GOMAXPROCS,
+// lenParts) and WithDecodeAheadPartitions to ceil(lenParts/W),
+// so decode runs at near-linear CPU parallelism out of the box
+// for many-partition reads. Caller-supplied options always win.
+//
+// Materialises every record before returning — memory is O(all
+// matched records). Use ReadIter for streaming consumption with
+// bounded memory.
 //
 // Empty filters slice returns (nil, nil) — no partitions
 // matched, no S3 traffic.
 func (s *Store[T]) Read(
 	ctx context.Context, filters []PartitionFilter, opts ...ReadOption,
-) (parts []PartitionResult[T], err error) {
+) (out []T, err error) {
 	defer s.metrics.methodScope(ctx, "Read", &err).end()
-
 	if len(filters) == 0 {
 		return nil, nil
 	}
-	var o readOpts
-	for _, opt := range opts {
-		opt.applyRead(&o)
-	}
-
 	rows, err := s.selectFileRows(ctx, filters)
 	if err != nil {
 		return nil, err
 	}
-	if len(rows) == 0 {
+	o := resolveIterOpts(opts)
+	var iterErr error
+	s.fetchAndDecodeIter(ctx, "Read", rows, &o,
+		s.readBatchDefaults, recordCollectEmit(&out, &iterErr))
+	if iterErr != nil {
+		return nil, iterErr
+	}
+	return out, nil
+}
+
+// ReadPartition returns one PartitionResult[T] per partition
+// matched by filters, preserving per-partition Version and
+// FileExtensions alongside the records. Records within each
+// partition are deduplicated by (EntityKeyOf, VersionOf) when
+// both are configured (pass WithHistory to opt out).
+//
+// Same backend pipeline and auto-tuning as Read; same materialise-
+// everything memory profile. Use ReadPartitionIter for streaming.
+//
+// Empty filters slice returns (nil, nil) — no partitions
+// matched, no S3 traffic.
+func (s *Store[T]) ReadPartition(
+	ctx context.Context, filters []PartitionFilter, opts ...ReadOption,
+) (out []PartitionResult[T], err error) {
+	defer s.metrics.methodScope(ctx, "ReadPartition", &err).end()
+	if len(filters) == 0 {
 		return nil, nil
 	}
-
-	// Group rows by partition_key. Single pass; partitions
-	// emit in lex order (ORDER BY partition_key in the SQL).
-	type group struct {
-		key   string
-		files []fileRow
-	}
-	var groups []group
-	current := group{}
-	for _, r := range rows {
-		if r.partitionKey != current.key {
-			if current.key != "" {
-				groups = append(groups, current)
-			}
-			current = group{key: r.partitionKey}
-		}
-		current.files = append(current.files, r)
-	}
-	groups = append(groups, current)
-
-	// Flat fan-out across every (partition, file) pair. The
-	// shared pool's deadlock detector forbids same-pool
-	// reentrancy (a pool task that calls g.Submit on the same
-	// pool would hold a slot while waiting for another), so we
-	// can't nest "fan-out partitions × fan-out files" — flatten
-	// to a single fan-out and group bodies back together
-	// afterward.
-	//
-	// Slot-indexed writes preserve per-group + per-file order:
-	// each task writes to bodies[gi][fi] without coordination.
-	// Concatenation + dedup runs once on the main goroutine
-	// after all GETs complete; decode is done in-task to
-	// parallelise the parquet decode across pool workers.
-	bodies := make([][][]T, len(groups))
-	type job struct {
-		gi, fi int
-		f      fileRow
-	}
-	totalFiles := 0
-	for gi := range groups {
-		bodies[gi] = make([][]T, len(groups[gi].files))
-		totalFiles += len(groups[gi].files)
-	}
-	jobs := make([]job, 0, totalFiles)
-	for gi, g := range groups {
-		for fi, f := range g.files {
-			jobs = append(jobs, job{gi: gi, fi: fi, f: f})
-		}
-	}
-	if err := fanOutPool(ctx, s.resolved.WorkerPool, jobs, nil,
-		func(ctx context.Context, _ int, j job) error {
-			data, err := s.target.get(ctx, j.f.s3Key)
-			if err != nil {
-				return fmt.Errorf("GET %s: %w", j.f.s3Key, err)
-			}
-			recs, err := decodeParquet[T](data)
-			if err != nil {
-				return fmt.Errorf("decode %s: %w", j.f.s3Key, err)
-			}
-			bodies[j.gi][j.fi] = recs
-			return nil
-		},
-	); err != nil {
+	rows, err := s.selectFileRows(ctx, filters)
+	if err != nil {
 		return nil, err
 	}
-
-	out := make([]PartitionResult[T], len(groups))
-	for gi, g := range groups {
-		total := 0
-		for _, b := range bodies[gi] {
-			total += len(b)
-		}
-		records := make([]T, 0, total)
-		for _, b := range bodies[gi] {
-			records = append(records, b...)
-		}
-
-		var version int64
-		exts := make([]FileExtensions, 0, len(g.files))
-		for _, f := range g.files {
-			if f.writtenAtVersion > version {
-				version = f.writtenAtVersion
-			}
-			extMap := make(map[string]any,
-				len(s.resolved.ExtensionColumns))
-			for j, c := range s.resolved.ExtensionColumns {
-				if j < len(f.extValues) && f.extValues[j] != nil {
-					extMap[c.Name] = f.extValues[j]
-				}
-			}
-			exts = append(exts, FileExtensions{
-				FileID:     f.fileID,
-				Extensions: extMap,
-			})
-		}
-
-		records = sortAndDedup(records,
-			s.resolved.EntityKeyOf, s.resolved.VersionOf,
-			o.includeHistory)
-
-		out[gi] = PartitionResult[T]{
-			PartitionKey:   g.key,
-			Records:        records,
-			Version:        version,
-			FileExtensions: exts,
-		}
+	o := resolveIterOpts(opts)
+	var iterErr error
+	s.fetchAndDecodeIter(ctx, "ReadPartition", rows, &o,
+		s.readBatchDefaults, partitionCollectEmit(&out, &iterErr))
+	if iterErr != nil {
+		return nil, iterErr
 	}
 	return out, nil
 }

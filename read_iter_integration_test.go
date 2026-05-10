@@ -81,15 +81,13 @@ func TestReadIter_MatchesRead(t *testing.T) {
 		s3pgstore.GE("customer", "alice"),
 	}
 
-	bufferedParts, err := store.Read(t.Context(), filters)
+	bufferedRecs, err := store.Read(t.Context(), filters)
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
 	want := []int64{}
-	for _, p := range bufferedParts {
-		for _, r := range p.Records {
-			want = append(want, r.Value)
-		}
+	for _, r := range bufferedRecs {
+		want = append(want, r.Value)
 	}
 
 	got := []int64{}
@@ -772,5 +770,86 @@ func TestReadIter_WithDecodeWorkers_PerWorkerByteBudget(t *testing.T) {
 		t.Errorf("yielded %d records, want %d (per-worker byte cap "+
 			"must permit oversized partitions via empty-buffer escape)",
 			count, numPartitions)
+	}
+}
+
+// TestRead_FlatRecordSlice verifies the new Read returns a flat
+// []T across all matched partitions, with records in lex
+// partition order. Auto-defaults the batch parallel-decode path
+// — no explicit WithDecodeWorkers needed.
+func TestRead_FlatRecordSlice(t *testing.T) {
+	f := newFixture(t)
+	store := newIterStore(t, f)
+
+	customers := []string{"alice", "bob", "carol", "dave"}
+	for _, c := range customers {
+		if _, err := store.Write(t.Context(),
+			[]iterRec{{Customer: c, Value: 1}, {Customer: c, Value: 2}},
+		); err != nil {
+			t.Fatalf("Write %s: %v", c, err)
+		}
+	}
+
+	got, err := store.Read(t.Context(),
+		[]s3pgstore.PartitionFilter{s3pgstore.GE("customer", "alice")})
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != len(customers)*2 {
+		t.Fatalf("len(got)=%d, want %d",
+			len(got), len(customers)*2)
+	}
+	// Records arrive in lex partition-key order, then in write
+	// order within a partition.
+	for i, want := range customers {
+		if got[i*2].Customer != want || got[i*2+1].Customer != want {
+			t.Errorf("got[%d..%d] customer = %q,%q, want %q",
+				i*2, i*2+1, got[i*2].Customer,
+				got[i*2+1].Customer, want)
+		}
+	}
+}
+
+// TestReadPartition_PerPartitionResults verifies the per-partition
+// variant returns []PartitionResult[T] with Records, Version, and
+// FileExtensions populated; same auto-default behavior as Read.
+func TestReadPartition_PerPartitionResults(t *testing.T) {
+	f := newFixture(t)
+	store := newIterStore(t, f)
+
+	customers := []string{"alice", "bob", "carol"}
+	for _, c := range customers {
+		if _, err := store.Write(t.Context(),
+			[]iterRec{{Customer: c, Value: 7}}); err != nil {
+			t.Fatalf("Write %s: %v", c, err)
+		}
+	}
+
+	got, err := store.ReadPartition(t.Context(),
+		[]s3pgstore.PartitionFilter{s3pgstore.GE("customer", "alice")})
+	if err != nil {
+		t.Fatalf("ReadPartition: %v", err)
+	}
+	if len(got) != len(customers) {
+		t.Fatalf("len(got)=%d, want %d", len(got), len(customers))
+	}
+	for i, want := range customers {
+		wantKey := "customer=" + want
+		if got[i].PartitionKey != wantKey {
+			t.Errorf("got[%d].PartitionKey = %q, want %q",
+				i, got[i].PartitionKey, wantKey)
+		}
+		if got[i].Version != 1 {
+			t.Errorf("got[%d].Version = %d, want 1",
+				i, got[i].Version)
+		}
+		if len(got[i].Records) != 1 {
+			t.Errorf("got[%d].Records: len=%d, want 1",
+				i, len(got[i].Records))
+		}
+		if len(got[i].FileExtensions) != 1 {
+			t.Errorf("got[%d].FileExtensions: len=%d, want 1",
+				i, len(got[i].FileExtensions))
+		}
 	}
 }

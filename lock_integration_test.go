@@ -183,7 +183,7 @@ func TestLockPartition_DoesNotBlockReader(t *testing.T) {
 	readCtx, cancel := context.WithTimeout(t.Context(),
 		3*time.Second)
 	defer cancel()
-	results, err := store.Read(readCtx,
+	results, err := store.ReadPartition(readCtx,
 		[]s3pgstore.PartitionFilter{s3pgstore.Eq("customer", "alice")})
 	if err != nil {
 		t.Fatalf("Read while LockPartition held: %v", err)

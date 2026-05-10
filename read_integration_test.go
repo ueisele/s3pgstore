@@ -54,9 +54,9 @@ func newReadStore(t *testing.T, f *fixture) *s3pgstore.Store[readRec] {
 	return store
 }
 
-// TestRead_RoundTripSinglePartition: write a batch, read it
+// TestReadPartition_RoundTripSinglePartition: write a batch, read it
 // back, verify records and Version match.
-func TestRead_RoundTripSinglePartition(t *testing.T) {
+func TestReadPartition_RoundTripSinglePartition(t *testing.T) {
 	f := newFixture(t)
 	store := newReadStore(t, f)
 
@@ -70,7 +70,7 @@ func TestRead_RoundTripSinglePartition(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	got, err := store.Read(t.Context(), []s3pgstore.PartitionFilter{
+	got, err := store.ReadPartition(t.Context(), []s3pgstore.PartitionFilter{
 		s3pgstore.Eq("charge_period", "2026-03-17"),
 		s3pgstore.Eq("customer", "abc"),
 	})
@@ -91,10 +91,10 @@ func TestRead_RoundTripSinglePartition(t *testing.T) {
 	}
 }
 
-// TestRead_DerivesVersionFromMaxFile: two writes to the same
+// TestReadPartition_DerivesVersionFromMaxFile: two writes to the same
 // partition produce versions 1 and 2; the read must report
 // Version=2.
-func TestRead_DerivesVersionFromMaxFile(t *testing.T) {
+func TestReadPartition_DerivesVersionFromMaxFile(t *testing.T) {
 	f := newFixture(t)
 	store := newReadStore(t, f)
 
@@ -110,7 +110,7 @@ func TestRead_DerivesVersionFromMaxFile(t *testing.T) {
 		t.Fatalf("Write 2: %v", err)
 	}
 
-	got, err := store.Read(t.Context(), []s3pgstore.PartitionFilter{
+	got, err := store.ReadPartition(t.Context(), []s3pgstore.PartitionFilter{
 		s3pgstore.Eq("charge_period", "2026-03-17"),
 		s3pgstore.Eq("customer", "abc"),
 	})
@@ -130,9 +130,9 @@ func TestRead_DerivesVersionFromMaxFile(t *testing.T) {
 	}
 }
 
-// TestRead_DedupLatestPerEntity: two writes of the same entity
+// TestReadPartition_DedupLatestPerEntity: two writes of the same entity
 // at different versions; default Read returns only the latest.
-func TestRead_DedupLatestPerEntity(t *testing.T) {
+func TestReadPartition_DedupLatestPerEntity(t *testing.T) {
 	f := newFixture(t)
 	store := newReadStore(t, f)
 
@@ -148,7 +148,7 @@ func TestRead_DedupLatestPerEntity(t *testing.T) {
 		t.Fatalf("Write new: %v", err)
 	}
 
-	got, err := store.Read(t.Context(), []s3pgstore.PartitionFilter{
+	got, err := store.ReadPartition(t.Context(), []s3pgstore.PartitionFilter{
 		s3pgstore.Eq("charge_period", "2026-03-17"),
 		s3pgstore.Eq("customer", "abc"),
 	})
@@ -163,9 +163,9 @@ func TestRead_DedupLatestPerEntity(t *testing.T) {
 	}
 }
 
-// TestRead_WithHistory: WithHistory disables dedup; both
+// TestReadPartition_WithHistory: WithHistory disables dedup; both
 // versions of the same entity come back.
-func TestRead_WithHistory(t *testing.T) {
+func TestReadPartition_WithHistory(t *testing.T) {
 	f := newFixture(t)
 	store := newReadStore(t, f)
 
@@ -180,7 +180,7 @@ func TestRead_WithHistory(t *testing.T) {
 		t.Fatalf("Write new: %v", err)
 	}
 
-	got, err := store.Read(t.Context(), []s3pgstore.PartitionFilter{
+	got, err := store.ReadPartition(t.Context(), []s3pgstore.PartitionFilter{
 		s3pgstore.Eq("charge_period", "2026-03-17"),
 		s3pgstore.Eq("customer", "abc"),
 	}, s3pgstore.WithHistory())
@@ -192,9 +192,9 @@ func TestRead_WithHistory(t *testing.T) {
 	}
 }
 
-// TestRead_MultiPartition: filters across multiple partitions
+// TestReadPartition_MultiPartition: filters across multiple partitions
 // return them in lex order of partition key.
-func TestRead_MultiPartition(t *testing.T) {
+func TestReadPartition_MultiPartition(t *testing.T) {
 	f := newFixture(t)
 	store := newReadStore(t, f)
 
@@ -207,7 +207,7 @@ func TestRead_MultiPartition(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	got, err := store.Read(t.Context(), []s3pgstore.PartitionFilter{
+	got, err := store.ReadPartition(t.Context(), []s3pgstore.PartitionFilter{
 		s3pgstore.Eq("charge_period", "2026-03-17"),
 	})
 	if err != nil {
@@ -228,9 +228,9 @@ func TestRead_MultiPartition(t *testing.T) {
 	}
 }
 
-// TestRead_FilterCompositions: Or + And produce the expected
+// TestReadPartition_FilterCompositions: Or + And produce the expected
 // row sets.
-func TestRead_FilterCompositions(t *testing.T) {
+func TestReadPartition_FilterCompositions(t *testing.T) {
 	f := newFixture(t)
 	store := newReadStore(t, f)
 
@@ -244,7 +244,7 @@ func TestRead_FilterCompositions(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	got, err := store.Read(t.Context(), []s3pgstore.PartitionFilter{
+	got, err := store.ReadPartition(t.Context(), []s3pgstore.PartitionFilter{
 		s3pgstore.Or(
 			s3pgstore.And(
 				s3pgstore.Eq("charge_period", "2026-03-17"),
@@ -275,9 +275,9 @@ func TestRead_FilterCompositions(t *testing.T) {
 	}
 }
 
-// TestRead_Between: half-open range filter selects the right
+// TestReadPartition_Between: half-open range filter selects the right
 // partitions.
-func TestRead_Between(t *testing.T) {
+func TestReadPartition_Between(t *testing.T) {
 	f := newFixture(t)
 	store := newReadStore(t, f)
 
@@ -291,7 +291,7 @@ func TestRead_Between(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	got, err := store.Read(t.Context(), []s3pgstore.PartitionFilter{
+	got, err := store.ReadPartition(t.Context(), []s3pgstore.PartitionFilter{
 		s3pgstore.Between("charge_period", "2026-03-01", "2026-04-01"),
 	})
 	if err != nil {
@@ -303,12 +303,12 @@ func TestRead_Between(t *testing.T) {
 	}
 }
 
-// TestRead_NoMatch: filters that match no rows return nil.
-func TestRead_NoMatch(t *testing.T) {
+// TestReadPartition_NoMatch: filters that match no rows return nil.
+func TestReadPartition_NoMatch(t *testing.T) {
 	f := newFixture(t)
 	store := newReadStore(t, f)
 
-	got, err := store.Read(t.Context(), []s3pgstore.PartitionFilter{
+	got, err := store.ReadPartition(t.Context(), []s3pgstore.PartitionFilter{
 		s3pgstore.Eq("charge_period", "1999-01-01"),
 	})
 	if err != nil {
@@ -319,13 +319,13 @@ func TestRead_NoMatch(t *testing.T) {
 	}
 }
 
-// TestRead_EmptyFilters: empty filter slice → nil result, no
+// TestReadPartition_EmptyFilters: empty filter slice → nil result, no
 // SQL query, no S3 traffic.
-func TestRead_EmptyFilters(t *testing.T) {
+func TestReadPartition_EmptyFilters(t *testing.T) {
 	f := newFixture(t)
 	store := newReadStore(t, f)
 
-	got, err := store.Read(t.Context(), nil)
+	got, err := store.ReadPartition(t.Context(), nil)
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -334,12 +334,12 @@ func TestRead_EmptyFilters(t *testing.T) {
 	}
 }
 
-// TestRead_UnknownFilterPart: a filter referencing a part that
+// TestReadPartition_UnknownFilterPart: a filter referencing a part that
 // isn't declared errors at translation, before any SQL executes.
-func TestRead_UnknownFilterPart(t *testing.T) {
+func TestReadPartition_UnknownFilterPart(t *testing.T) {
 	f := newFixture(t)
 	store := newReadStore(t, f)
-	_, err := store.Read(t.Context(), []s3pgstore.PartitionFilter{
+	_, err := store.ReadPartition(t.Context(), []s3pgstore.PartitionFilter{
 		s3pgstore.Eq("not_declared", "x"),
 	})
 	if err == nil {
@@ -347,10 +347,10 @@ func TestRead_UnknownFilterPart(t *testing.T) {
 	}
 }
 
-// TestRead_AfterRollback: a write that rolls back is invisible
+// TestReadPartition_AfterRollback: a write that rolls back is invisible
 // to subsequent Read calls — the atomic-visibility-on-commit
 // invariant from CLAUDE.md.
-func TestRead_AfterRollback(t *testing.T) {
+func TestReadPartition_AfterRollback(t *testing.T) {
 	f := newFixture(t)
 	store := newReadStore(t, f)
 
@@ -371,7 +371,7 @@ func TestRead_AfterRollback(t *testing.T) {
 		t.Fatalf("rollback: %v", err)
 	}
 
-	got, err := store.Read(t.Context(), []s3pgstore.PartitionFilter{
+	got, err := store.ReadPartition(t.Context(), []s3pgstore.PartitionFilter{
 		s3pgstore.Eq("charge_period", "2026-03-17"),
 		s3pgstore.Eq("customer", "abc"),
 	})
@@ -383,10 +383,10 @@ func TestRead_AfterRollback(t *testing.T) {
 	}
 }
 
-// TestRead_StableAcrossCalls: two consecutive Read calls with
+// TestReadPartition_StableAcrossCalls: two consecutive Read calls with
 // no intervening writes return the same records in the same
 // order. CLAUDE.md's read-stability invariant.
-func TestRead_StableAcrossCalls(t *testing.T) {
+func TestReadPartition_StableAcrossCalls(t *testing.T) {
 	f := newFixture(t)
 	store := newReadStore(t, f)
 
@@ -399,13 +399,13 @@ func TestRead_StableAcrossCalls(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	got1, err := store.Read(t.Context(), []s3pgstore.PartitionFilter{
+	got1, err := store.ReadPartition(t.Context(), []s3pgstore.PartitionFilter{
 		s3pgstore.Eq("charge_period", "2026-03-17"),
 	})
 	if err != nil {
 		t.Fatalf("Read 1: %v", err)
 	}
-	got2, err := store.Read(t.Context(), []s3pgstore.PartitionFilter{
+	got2, err := store.ReadPartition(t.Context(), []s3pgstore.PartitionFilter{
 		s3pgstore.Eq("charge_period", "2026-03-17"),
 	})
 	if err != nil {

@@ -52,6 +52,7 @@ import (
 	"fmt"
 	"iter"
 	"log/slog"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -100,7 +101,7 @@ func (s *Store[T]) ReadIter(
 			return
 		}
 		s.fetchAndDecodeIter(ctx, "ReadIter", rows, &o,
-			s.recordEmit(yield, &iterErr))
+			iterStreamDefaults, s.recordEmit(yield, &iterErr))
 	}
 }
 
@@ -126,7 +127,7 @@ func (s *Store[T]) ReadPartitionIter(
 			return
 		}
 		s.fetchAndDecodeIter(ctx, "ReadPartitionIter", rows, &o,
-			s.partitionEmit(yield, &iterErr))
+			iterStreamDefaults, s.partitionEmit(yield, &iterErr))
 	}
 }
 
@@ -161,7 +162,7 @@ func (s *Store[T]) ReadRangeIter(
 			return
 		}
 		s.fetchAndDecodeIter(ctx, "ReadRangeIter", rows, &o,
-			s.recordEmit(yield, &iterErr))
+			iterStreamDefaults, s.recordEmit(yield, &iterErr))
 	}
 }
 
@@ -183,7 +184,7 @@ func (s *Store[T]) ReadPartitionRangeIter(
 			return
 		}
 		s.fetchAndDecodeIter(ctx, "ReadPartitionRangeIter", rows, &o,
-			s.partitionEmit(yield, &iterErr))
+			iterStreamDefaults, s.partitionEmit(yield, &iterErr))
 	}
 }
 
@@ -213,7 +214,7 @@ func (s *Store[T]) ReadEntriesIter(
 		}
 		rows := entriesToFileRows(entries, s.resolved.ExtensionColumns)
 		s.fetchAndDecodeIter(ctx, "ReadEntriesIter", rows, &o,
-			s.recordEmit(yield, &iterErr))
+			iterStreamDefaults, s.recordEmit(yield, &iterErr))
 	}
 }
 
@@ -234,7 +235,7 @@ func (s *Store[T]) ReadPartitionEntriesIter(
 		}
 		rows := entriesToFileRows(entries, s.resolved.ExtensionColumns)
 		s.fetchAndDecodeIter(ctx, "ReadPartitionEntriesIter", rows, &o,
-			s.partitionEmit(yield, &iterErr))
+			iterStreamDefaults, s.partitionEmit(yield, &iterErr))
 	}
 }
 
@@ -246,6 +247,59 @@ func resolveIterOpts(opts []ReadOption) readOpts {
 		opt.applyRead(&o)
 	}
 	return o
+}
+
+// iterStreamDefaults fills the iter family's per-call defaults
+// (W=1, K=1) into any field the user left unset. Designed for
+// streaming consumers — single-decoder, minimum lookahead. Pass
+// to fetchAndDecodeIter from every ReadIter / ReadPartitionIter /
+// ReadRangeIter / ReadEntriesIter call.
+//
+// User-supplied options always win: WithDecodeWorkers(N) /
+// WithDecodeAheadPartitions(K) set the field before this runs;
+// the helper only fills the unset case.
+func iterStreamDefaults(o *readOpts, _ int) {
+	if o.decodeWorkers == 0 {
+		o.decodeWorkers = 1
+	}
+	if o.decodeAheadPartitions == nil {
+		n := 1
+		o.decodeAheadPartitions = &n
+	}
+}
+
+// readBatchDefaults fills the Read / ReadPartition family's
+// auto-tuned defaults: W = min(pool, GOMAXPROCS, lenParts),
+// K = ceil(lenParts/W). Both bound by lenParts so we never spawn
+// idle workers or oversize per-worker queues. The W formula
+// caps at the smallest of:
+//
+//   - pool.MaxConcurrent — no point having more decoders than
+//     the I/O pool can feed bodies to;
+//   - runtime.GOMAXPROCS — decode is CPU-bound, oversubscribing
+//     hurts latency more than it helps;
+//   - lenParts — no work for surplus workers.
+//
+// K = ceil(lenParts/W) lets each worker buffer all of its
+// round-robin assignments. Memory cost is absorbed by the
+// already-large result slice (Read materialises everything),
+// while the high K removes the "fast worker stalls during slow
+// sibling's decode" hazard from skewed workloads.
+//
+// User-supplied options always win.
+func (s *Store[T]) readBatchDefaults(o *readOpts, lenParts int) {
+	if o.decodeWorkers == 0 {
+		o.decodeWorkers = min(
+			s.resolved.WorkerPool.MaxConcurrent(),
+			runtime.GOMAXPROCS(0),
+			lenParts,
+		)
+	}
+	if o.decodeAheadPartitions == nil {
+		wc := max(o.decodeWorkers, 1)
+		n := (lenParts + wc - 1) / wc
+		o.decodeAheadPartitions = &n
+	}
 }
 
 // recordEmit returns the per-batch emit callback that flattens
@@ -302,6 +356,47 @@ func (s *Store[T]) partitionEmit(
 	}
 }
 
+// recordCollectEmit returns the per-batch emit callback that
+// appends each partition's records into the *out slice. Used by
+// Read — collects every record across every partition into one
+// flat result. On a hard pipeline error: sets *iterErr and
+// returns false to terminate the emit loop.
+func recordCollectEmit[T any](
+	out *[]T, iterErr *error,
+) func(decodedBatch[T]) bool {
+	return func(b decodedBatch[T]) bool {
+		if b.err != nil {
+			*iterErr = b.err
+			return false
+		}
+		*out = append(*out, b.records...)
+		return true
+	}
+}
+
+// partitionCollectEmit returns the per-batch emit callback that
+// appends each PartitionResult into the *out slice. Used by
+// ReadPartition — preserves per-partition Version and
+// FileExtensions alongside records. On a hard pipeline error:
+// sets *iterErr and returns false.
+func partitionCollectEmit[T any](
+	out *[]PartitionResult[T], iterErr *error,
+) func(decodedBatch[T]) bool {
+	return func(b decodedBatch[T]) bool {
+		if b.err != nil {
+			*iterErr = b.err
+			return false
+		}
+		*out = append(*out, PartitionResult[T]{
+			PartitionKey:   b.partitionKey,
+			Records:        b.records,
+			Version:        b.version,
+			FileExtensions: b.exts,
+		})
+		return true
+	}
+}
+
 // fetchAndDecodeIter is the chan-based streaming pipeline
 // backing every ReadIter / ReadPartitionIter / ReadRangeIter /
 // ReadPartitionRangeIter / ReadEntriesIter /
@@ -345,7 +440,8 @@ func (s *Store[T]) partitionEmit(
 // sharing the pool.
 func (s *Store[T]) fetchAndDecodeIter(
 	ctx context.Context, method string, rows []fileRow,
-	opts *readOpts, emitOne func(decodedBatch[T]) bool,
+	opts *readOpts, applyDefaults func(*readOpts, int),
+	emitOne func(decodedBatch[T]) bool,
 ) {
 	if len(rows) == 0 {
 		return
@@ -353,6 +449,24 @@ func (s *Store[T]) fetchAndDecodeIter(
 	parts := s.preparePartitions(rows)
 	if len(parts) == 0 {
 		return
+	}
+
+	// Apply per-call defaults — iterStreamDefaults for the iter
+	// family (W=1, K=1) or s.readBatchDefaults for Read /
+	// ReadPartition (auto-tuned from pool / GOMAXPROCS / lenParts).
+	// Caller-supplied options always take precedence; the defaulter
+	// only fills fields the user left unset.
+	applyDefaults(opts, len(parts))
+
+	// Universal clamp: surplus workers (W > len(parts)) would
+	// spawn only to exit immediately because their loop's
+	// `pi := workerIdx; pi < len(parts)` start is past the end.
+	// emit's `pi % W` over pi < len(parts) never indexes them, so
+	// this is purely allocation savings — same access pattern, no
+	// behavior change. Applied here (not in the defaulters) so it
+	// catches user-supplied W > len(parts) too.
+	if opts.decodeWorkers > len(parts) {
+		opts.decodeWorkers = len(parts)
 	}
 
 	// bodyCap bounds the per-call resident compressed bodies:
@@ -434,35 +548,23 @@ func (s *Store[T]) fetchAndDecodeIter(
 	// natively. See CLAUDE.md "Concurrency invariants".
 
 	// Stage 2: decode workers. Each worker handles partitions
-	// where pi % numWorkers == workerIdx and writes results to
-	// its own queue (cap = decodeAheadPartitions). Per-worker
+	// where pi % decodeWorkers == workerIdx and writes results
+	// to its own queue (cap = decodeAheadPartitions). Per-worker
 	// queues replace a shared decodedCh so workers don't compete
 	// on a single buffer; lex emit order is preserved by the
 	// emit loop reading queue[(pi mod W)] sequentially.
 	//
-	// Clamp at len(parts): with W > len(parts), the surplus
-	// workers would spawn only to exit immediately (their
-	// loop's `pi := workerIdx; pi < len(parts)` start is past
-	// the end). emit's `pi % W` over pi < len(parts) never
-	// indexes the surplus workers, so the clamp is purely
-	// allocation savings — same access pattern, no behavior
-	// change.
-	numWorkers := 1
-	if opts.decodeWorkers > 0 {
-		numWorkers = opts.decodeWorkers
-	}
-	numWorkers = min(numWorkers, len(parts))
-	queueCap := 1
-	if opts.decodeAheadPartitions != nil {
-		queueCap = *opts.decodeAheadPartitions
-	}
-	workers := make([]*workerState[T], numWorkers)
+	// applyDefaults + the clamp above guarantee
+	// decodeWorkers in [1, len(parts)] and
+	// decodeAheadPartitions != nil — no fallbacks needed here.
+	workers := make([]*workerState[T], opts.decodeWorkers)
 	for w := range workers {
-		workers[w] = newWorkerState[T](queueCap, s.metrics)
+		workers[w] = newWorkerState[T](*opts.decodeAheadPartitions, s.metrics)
 	}
 	for w := range workers {
 		wg.Go(func() {
-			s.runDecodeWorker(state.ctx, state, workers[w], w, numWorkers, opts)
+			s.runDecodeWorker(state.ctx, state, workers[w],
+				w, opts.decodeWorkers, opts)
 		})
 	}
 
@@ -483,8 +585,7 @@ func (s *Store[T]) fetchAndDecodeIter(
 		// Surface emit position to the observer so a stalled
 		// pipeline's slog.Warn points at the right partition.
 		state.decoderPi.Store(int64(pi))
-		w := pi % numWorkers
-		ws := workers[w]
+		ws := workers[pi%opts.decodeWorkers]
 		var batch decodedBatch[T]
 		select {
 		case batch = <-ws.queue:

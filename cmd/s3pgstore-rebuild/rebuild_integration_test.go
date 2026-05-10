@@ -262,7 +262,7 @@ func TestRebuild_RoundTrip(t *testing.T) {
 	// Read back and verify each partition has the same Values
 	// (order-independent; rebuild assigns version by S3-key
 	// lex, which may not match the original write order).
-	parts, err := store.Read(t.Context(),
+	parts, err := store.ReadPartition(t.Context(),
 		[]s3pgstore.PartitionFilter{
 			s3pgstore.GE("customer", ""),
 		})

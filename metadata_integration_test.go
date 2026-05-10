@@ -97,7 +97,7 @@ func TestWithMetadata_RoundTrip(t *testing.T) {
 	}
 
 	// Read returns the same metadata.
-	got, err := store.Read(t.Context(), []s3pgstore.PartitionFilter{
+	got, err := store.ReadPartition(t.Context(), []s3pgstore.PartitionFilter{
 		s3pgstore.Eq("charge_period", "2026-03-17"),
 		s3pgstore.Eq("customer", "abc"),
 	})
@@ -154,7 +154,7 @@ func TestWithMetadata_PartialPopulation(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	got, err := store.Read(t.Context(), []s3pgstore.PartitionFilter{
+	got, err := store.ReadPartition(t.Context(), []s3pgstore.PartitionFilter{
 		s3pgstore.Eq("charge_period", "2026-03-17"),
 		s3pgstore.Eq("customer", "abc"),
 	})
@@ -199,7 +199,7 @@ func TestWithMetadata_FirstWriteWinsUnderIdempotency(t *testing.T) {
 	}
 
 	// The catalog row's metadata must still be the FIRST write's.
-	got, err := store.Read(t.Context(), []s3pgstore.PartitionFilter{
+	got, err := store.ReadPartition(t.Context(), []s3pgstore.PartitionFilter{
 		s3pgstore.Eq("charge_period", "2026-03-17"),
 		s3pgstore.Eq("customer", "abc"),
 	})

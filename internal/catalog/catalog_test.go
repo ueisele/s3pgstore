@@ -45,6 +45,7 @@ func TestRenderAll_BasicRoundTrip(t *testing.T) {
 	mustContain(t, out, "feed_seq             BIGINT UNIQUE")
 	mustContain(t, out, `s3pgstore_files_token_idx`)
 	mustContain(t, out, `WHERE idempotency_token IS NOT NULL`)
+	mustContain(t, out, `s3pgstore_files_written_at_idx`)
 }
 
 func TestRenderAll_ExtensionColumns(t *testing.T) {

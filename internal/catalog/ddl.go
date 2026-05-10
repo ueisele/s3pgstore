@@ -128,6 +128,15 @@ func renderFiles(sb *strings.Builder, in DDLInput) error {
 		"CREATE INDEX IF NOT EXISTS %s_partition_written_idx "+
 			"ON %s (partition_key, written_at);\n",
 		bare, files)
+	// Unconditional written_at index — backs Store.ResolveFileRefsInRange
+	// (range scan over committed files in [since, until)). Distinct from
+	// the partial _seq_scan_idx (which only covers feed_seq IS NULL rows
+	// for the sequencer's hot scan; replacing that with a full index
+	// would 100x its size on large deployments).
+	fmt.Fprintf(sb,
+		"CREATE INDEX IF NOT EXISTS %s_written_at_idx "+
+			"ON %s (written_at);\n",
+		bare, files)
 	fmt.Fprintf(sb,
 		"CREATE INDEX IF NOT EXISTS %s_feed_seq_idx "+
 			"ON %s (feed_seq) WHERE feed_seq IS NOT NULL;\n",

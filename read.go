@@ -2,8 +2,8 @@ package s3pgstore
 
 // read.go is the read path for s3pgstore: the public entry
 // points (Read / ReadPartition / ReadIter and its variants),
-// the catalog SELECT helpers (selectFileRows /
-// selectFileRowsByRange / queryFileRows), and the chan-based
+// the catalog SELECT helpers (ResolveFileRefs /
+// ResolveFileRefsInRange / queryFileRows), and the chan-based
 // fetch+decode pipeline (fetchAndDecodeIter and the stream/worker
 // state machinery) that backs every entry point.
 //
@@ -90,313 +90,35 @@ type PartitionResult[T any] struct {
 	FileRefs     []FileRef
 }
 
-// iterStreamDefaults fills the iter family's per-call defaults
-// (W=1, K=1) into any field the user left unset. Designed for
-// streaming consumers — single-decoder, minimum lookahead. Pass
-// to fetchAndDecodeIter from every ReadIter / ReadPartitionIter /
-// ReadRangeIter / ReadFileRefsIter call.
+// ResolveFileRefs translates a partition-filter expression into
+// the matching catalog rows (FileRef) without fetching or
+// decoding the parquet bodies. Useful when the caller wants to
+// inspect the catalog (sizes, record counts, tokens, extension
+// columns) before committing to the S3 + decode cost — pass the
+// returned slice straight to ReadFileRefsIter to round-trip into
+// records.
 //
-// User-supplied options always win: WithDecodeWorkers(N) /
-// WithDecodeAheadPartitions(K) set the field before this runs;
-// the helper only fills the unset case.
-func iterStreamDefaults(o *readOpts, _ int) {
-	if o.decodeWorkers == 0 {
-		o.decodeWorkers = 1
-	}
-	if o.decodeAheadPartitions == nil {
-		n := 1
-		o.decodeAheadPartitions = &n
-	}
-}
-
-// readBatchDefaults fills the Read / ReadPartition family's
-// auto-tuned defaults: W = min(pool, GOMAXPROCS, lenParts),
-// K = ceil(lenParts/W). Both bound by lenParts so we never spawn
-// idle workers or oversize per-worker queues. The W formula
-// caps at the smallest of:
+// The returned slice carries every FileRef field the catalog
+// stores (FileID, PartitionKey, S3Key, Version, WrittenAt,
+// FileSize, UncompressedSize, RecordCount, Extensions). Offset
+// is populated when the row has been sequenced (feed_seq IS NOT
+// NULL); NoOffset otherwise.
 //
-//   - pool.MaxConcurrent — no point having more decoders than
-//     the I/O pool can feed bodies to;
-//   - runtime.GOMAXPROCS — decode is CPU-bound, oversubscribing
-//     hurts latency more than it helps;
-//   - lenParts — no work for surplus workers.
+// Filters compose with the same semantics as Read / ReadIter:
+// each PartitionFilter narrows the partition-key space, every
+// matched partition contributes every committed file (no
+// per-file filter, no LIMIT — same construction invariant as
+// Read; see CLAUDE.md "Read returns the complete file set per
+// matched partition").
 //
-// K = ceil(lenParts/W) lets each worker buffer all of its
-// round-robin assignments. Memory cost is absorbed by the
-// already-large result slice (Read materialises everything),
-// while the high K removes the "fast worker stalls during slow
-// sibling's decode" hazard from skewed workloads.
-//
-// User-supplied options always win.
-func (s *Store[T]) readBatchDefaults(o *readOpts, lenParts int) {
-	if o.decodeWorkers == 0 {
-		o.decodeWorkers = min(
-			s.resolved.WorkerPool.MaxConcurrent(),
-			runtime.GOMAXPROCS(0),
-			lenParts,
-		)
-	}
-	if o.decodeAheadPartitions == nil {
-		wc := max(o.decodeWorkers, 1)
-		n := (lenParts + wc - 1) / wc
-		o.decodeAheadPartitions = &n
-	}
-}
-
-// Read returns every record matching filters as a flat slice
-// in lex partition order, deduplicated by (EntityKeyOf,
-// VersionOf) when both are configured (pass WithHistory to
-// opt out).
-//
-// Backed by the same chan-based fetch+decode pipeline as
-// ReadIter, but auto-tunes for batch use: WithDecodeWorkers
-// defaults to min(WorkerPool.MaxConcurrent(), GOMAXPROCS,
-// lenParts) and WithDecodeAheadPartitions to ceil(lenParts/W),
-// so decode runs at near-linear CPU parallelism out of the box
-// for many-partition reads. Caller-supplied options always win.
-//
-// Materialises every record before returning — memory is O(all
-// matched records). Use ReadIter for streaming consumption with
-// bounded memory.
-//
-// Empty filters slice returns (nil, nil) — no partitions
-// matched, no S3 traffic.
-func (s *Store[T]) Read(
-	ctx context.Context, filters []PartitionFilter, opts ...ReadOption,
-) (out []T, err error) {
-	defer s.metrics.methodScope(ctx, "Read", &err).end()
-	if len(filters) == 0 {
-		return nil, nil
-	}
-	rows, err := s.selectFileRows(ctx, filters)
-	if err != nil {
-		return nil, err
-	}
-	o := resolveIterOpts(opts)
-	var iterErr error
-	s.fetchAndDecodeIter(ctx, "Read", rows, &o,
-		s.readBatchDefaults, recordCollectEmit(&out, &iterErr))
-	if iterErr != nil {
-		return nil, iterErr
-	}
-	return out, nil
-}
-
-// ReadPartition returns one PartitionResult[T] per partition
-// matched by filters, preserving per-partition Version and
-// FileRefs alongside the records. Records within each
-// partition are deduplicated by (EntityKeyOf, VersionOf) when
-// both are configured (pass WithHistory to opt out).
-//
-// Same backend pipeline and auto-tuning as Read; same materialise-
-// everything memory profile. Use ReadPartitionIter for streaming.
-//
-// Empty filters slice returns (nil, nil) — no partitions
-// matched, no S3 traffic.
-func (s *Store[T]) ReadPartition(
-	ctx context.Context, filters []PartitionFilter, opts ...ReadOption,
-) (out []PartitionResult[T], err error) {
-	defer s.metrics.methodScope(ctx, "ReadPartition", &err).end()
-	if len(filters) == 0 {
-		return nil, nil
-	}
-	rows, err := s.selectFileRows(ctx, filters)
-	if err != nil {
-		return nil, err
-	}
-	o := resolveIterOpts(opts)
-	var iterErr error
-	s.fetchAndDecodeIter(ctx, "ReadPartition", rows, &o,
-		s.readBatchDefaults, partitionCollectEmit(&out, &iterErr))
-	if iterErr != nil {
-		return nil, iterErr
-	}
-	return out, nil
-}
-
-// ReadIter returns an iter.Seq2[T, error] that yields every
-// record matching filters, lazily one partition at a time
-// through the chan-based pipeline.
-//
-// Memory: O((WithDecodeAheadPartitions + 1) partitions' decoded
-// records) by default; cap with WithDecodeAheadBytes to bound the
-// uncompressed-bytes footprint. Without options, one partition's
-// records sit in memory at any time.
-//
-// Cancellation: yielding `false` from the loop body cancels
-// in-flight S3 GETs through ctx propagation. Iteration also
-// terminates immediately on the first per-partition error.
-//
-// Emission order: lex by partition key, then per-partition
-// (entity, version) ascending after dedup (if configured) or
-// decode/insertion order without it. Same input yields byte-
-// identical sequences across runs per CLAUDE.md.
-//
-// Empty filters yields nothing without touching the database.
-func (s *Store[T]) ReadIter(
-	ctx context.Context, filters []PartitionFilter,
-	opts ...ReadOption,
-) iter.Seq2[T, error] {
-	return func(yield func(T, error) bool) {
-		var iterErr error
-		defer s.metrics.methodScope(ctx, "ReadIter", &iterErr).end()
-		o := resolveIterOpts(opts)
-		if len(filters) == 0 {
-			return
-		}
-		rows, err := s.selectFileRows(ctx, filters)
-		if err != nil {
-			iterErr = err
-			yield(*new(T), err)
-			return
-		}
-		s.fetchAndDecodeIter(ctx, "ReadIter", rows, &o,
-			iterStreamDefaults, s.recordEmit(yield, &iterErr))
-	}
-}
-
-// ReadPartitionIter is the per-partition variant of ReadIter:
-// each yield is one PartitionResult[T] with Records, Version,
-// and FileRefs populated. Same memory bound and
-// cancellation semantics as ReadIter.
-func (s *Store[T]) ReadPartitionIter(
-	ctx context.Context, filters []PartitionFilter,
-	opts ...ReadOption,
-) iter.Seq2[PartitionResult[T], error] {
-	return func(yield func(PartitionResult[T], error) bool) {
-		var iterErr error
-		defer s.metrics.methodScope(ctx, "ReadPartitionIter", &iterErr).end()
-		o := resolveIterOpts(opts)
-		if len(filters) == 0 {
-			return
-		}
-		rows, err := s.selectFileRows(ctx, filters)
-		if err != nil {
-			iterErr = err
-			yield(PartitionResult[T]{}, err)
-			return
-		}
-		s.fetchAndDecodeIter(ctx, "ReadPartitionIter", rows, &o,
-			iterStreamDefaults, s.partitionEmit(yield, &iterErr))
-	}
-}
-
-// ReadRangeIter walks every record whose written_at falls in
-// [since, until). Bounds are resolved at call entry via the
-// SELECT's WHERE clause, so the upper bound stays stable under
-// concurrent writes — once the catalog SELECT runs, no new rows
-// can appear in the result set.
-//
-// Filters by write commit time, not sequencer-assignment time:
-// recently-written rows that the sequencer hasn't yet processed
-// are still visible (consistent with the atomic-visibility-on-
-// commit invariant in CLAUDE.md). Use Poll / PollRecords if you
-// need a sequenced-rows-only view.
-//
-// Half-open semantics:
-//   - since.IsZero() → start from the earliest write (unbounded
-//     below).
-//   - until.IsZero() → walk to the live tip (unbounded above —
-//     captured by the SELECT; rows committed after the SELECT
-//     don't contribute).
-//   - Records at since are included; records at until are not.
-//
-// No partition filter is applied — every partition with any
-// in-range row contributes records.
-func (s *Store[T]) ReadRangeIter(
-	ctx context.Context, since, until time.Time,
-	opts ...ReadOption,
-) iter.Seq2[T, error] {
-	return func(yield func(T, error) bool) {
-		var iterErr error
-		defer s.metrics.methodScope(ctx, "ReadRangeIter", &iterErr).end()
-		o := resolveIterOpts(opts)
-		rows, err := s.selectFileRowsByRange(ctx, since, until)
-		if err != nil {
-			iterErr = err
-			yield(*new(T), err)
-			return
-		}
-		s.fetchAndDecodeIter(ctx, "ReadRangeIter", rows, &o,
-			iterStreamDefaults, s.recordEmit(yield, &iterErr))
-	}
-}
-
-// ReadPartitionRangeIter is the per-partition variant of
-// ReadRangeIter — same time-bound resolution, per-partition
-// output shape.
-func (s *Store[T]) ReadPartitionRangeIter(
-	ctx context.Context, since, until time.Time,
-	opts ...ReadOption,
-) iter.Seq2[PartitionResult[T], error] {
-	return func(yield func(PartitionResult[T], error) bool) {
-		var iterErr error
-		defer s.metrics.methodScope(ctx, "ReadPartitionRangeIter", &iterErr).end()
-		o := resolveIterOpts(opts)
-		rows, err := s.selectFileRowsByRange(ctx, since, until)
-		if err != nil {
-			iterErr = err
-			yield(PartitionResult[T]{}, err)
-			return
-		}
-		s.fetchAndDecodeIter(ctx, "ReadPartitionRangeIter", rows, &o,
-			iterStreamDefaults, s.partitionEmit(yield, &iterErr))
-	}
-}
-
-// ReadFileRefsIter decodes pre-resolved FileRef slices without
-// re-querying the catalog. Each ref's S3Key is validated up
-// front against this Store's bucket+prefix; an entry from a
-// different Store fails with an error before any S3 traffic.
-//
-// Records emit in lex order of PartitionKey. The
-// pipeline groups by partition first and sorts the partition
-// keys lex before driving the producer — the input slice's
-// order is not preserved across partitions (per the
-// "Deterministic emission order" contract in CLAUDE.md).
-func (s *Store[T]) ReadFileRefsIter(
-	ctx context.Context, entries []FileRef,
-	opts ...ReadOption,
-) iter.Seq2[T, error] {
-	return func(yield func(T, error) bool) {
-		var iterErr error
-		defer s.metrics.methodScope(ctx, "ReadFileRefsIter", &iterErr).end()
-		o := resolveIterOpts(opts)
-		if err := s.validateFileRefs(entries); err != nil {
-			iterErr = err
-			yield(*new(T), err)
-			return
-		}
-		s.fetchAndDecodeIter(ctx, "ReadFileRefsIter", entries, &o,
-			iterStreamDefaults, s.recordEmit(yield, &iterErr))
-	}
-}
-
-// ReadPartitionFileRefsIter is the per-partition variant of
-// ReadFileRefsIter.
-func (s *Store[T]) ReadPartitionFileRefsIter(
-	ctx context.Context, entries []FileRef,
-	opts ...ReadOption,
-) iter.Seq2[PartitionResult[T], error] {
-	return func(yield func(PartitionResult[T], error) bool) {
-		var iterErr error
-		defer s.metrics.methodScope(ctx, "ReadPartitionFileRefsIter", &iterErr).end()
-		o := resolveIterOpts(opts)
-		if err := s.validateFileRefs(entries); err != nil {
-			iterErr = err
-			yield(PartitionResult[T]{}, err)
-			return
-		}
-		s.fetchAndDecodeIter(ctx, "ReadPartitionFileRefsIter", entries, &o,
-			iterStreamDefaults, s.partitionEmit(yield, &iterErr))
-	}
-}
-
-// selectFileRows resolves a partition-filter expression into a
-// WHERE clause and runs the catalog SELECT via queryFileRows.
-func (s *Store[T]) selectFileRows(
+// Empty filters returns (nil, nil) — no partitions match, no
+// query is issued.
+func (s *Store[T]) ResolveFileRefs(
 	ctx context.Context, filters []PartitionFilter,
 ) ([]FileRef, error) {
+	if len(filters) == 0 {
+		return nil, nil
+	}
 	where, args, err := translateFilters(filters,
 		partColResolver(s.resolved.PartitionKeyParts))
 	if err != nil {
@@ -405,11 +127,15 @@ func (s *Store[T]) selectFileRows(
 	return s.queryFileRows(ctx, where, args)
 }
 
-// selectFileRowsByRange runs the catalog SELECT filtered by
-// written_at (the row's INSERT-time timestamp; unbounded sides
-// default to open-ended). All committed rows in the window are
-// returned regardless of sequencer state — atomic-visibility-on-
-// commit per CLAUDE.md.
+// ResolveFileRefsInRange returns every catalog row whose
+// written_at falls in [since, until) without fetching or
+// decoding the parquet bodies. Useful for orchestration that
+// scopes work by ingest time — incremental MV rebuilds, audit
+// of a window, or pre-resolving refs to drive ReadFileRefsIter
+// in batches.
+//
+// All committed rows in the window are returned regardless of
+// sequencer state — atomic-visibility-on-commit per CLAUDE.md.
 //
 // Bound semantics:
 //   - since: written_at >= since (zero → unbounded below).
@@ -418,12 +144,15 @@ func (s *Store[T]) selectFileRows(
 //     the catalog row count is monotonically non-decreasing in
 //     v2.0 — files are never deleted).
 //
-// Note: no dedicated index on written_at exists today; this is a
-// seq scan. The (partition_key, written_at) composite is leading
-// on partition_key so it doesn't help cross-partition range
-// scans. Operators with hot range queries can add a (written_at)
-// index — separate change, no library knob required.
-func (s *Store[T]) selectFileRowsByRange(
+// Backed by the unconditional s3pgstore_files_written_at_idx
+// BTREE on (written_at) — added in DDL alongside the partial
+// _seq_scan_idx. The partial index can't serve this query because
+// it only covers rows with feed_seq IS NULL (sequencer hot scan);
+// the unconditional index covers both sequenced and unsequenced
+// rows. Operators on schemas predating the index need to add it
+// via their migration tool — SchemaManager.Validate doesn't
+// enforce index presence (columns only).
+func (s *Store[T]) ResolveFileRefsInRange(
 	ctx context.Context, since, until time.Time,
 ) ([]FileRef, error) {
 	parts := []string{}
@@ -518,6 +247,308 @@ func (s *Store[T]) queryFileRows(
 		return nil, fmt.Errorf("SELECT files: %w", err)
 	}
 	return out, nil
+}
+
+// iterStreamDefaults fills the iter family's per-call defaults
+// (W=1, K=1) into any field the user left unset. Designed for
+// streaming consumers — single-decoder, minimum lookahead. Pass
+// to fetchAndDecodeIter from every ReadIter / ReadPartitionIter /
+// ReadRangeIter / ReadFileRefsIter call.
+//
+// User-supplied options always win: WithDecodeWorkers(N) /
+// WithDecodeAheadPartitions(K) set the field before this runs;
+// the helper only fills the unset case.
+func iterStreamDefaults(o *readOpts, _ int) {
+	if o.decodeWorkers == 0 {
+		o.decodeWorkers = 1
+	}
+	if o.decodeAheadPartitions == nil {
+		n := 1
+		o.decodeAheadPartitions = &n
+	}
+}
+
+// readBatchDefaults fills the Read / ReadPartition family's
+// auto-tuned defaults: W = min(pool, GOMAXPROCS, lenParts),
+// K = ceil(lenParts/W). Both bound by lenParts so we never spawn
+// idle workers or oversize per-worker queues. The W formula
+// caps at the smallest of:
+//
+//   - pool.MaxConcurrent — no point having more decoders than
+//     the I/O pool can feed bodies to;
+//   - runtime.GOMAXPROCS — decode is CPU-bound, oversubscribing
+//     hurts latency more than it helps;
+//   - lenParts — no work for surplus workers.
+//
+// K = ceil(lenParts/W) lets each worker buffer all of its
+// round-robin assignments. Memory cost is absorbed by the
+// already-large result slice (Read materialises everything),
+// while the high K removes the "fast worker stalls during slow
+// sibling's decode" hazard from skewed workloads.
+//
+// User-supplied options always win.
+func (s *Store[T]) readBatchDefaults(o *readOpts, lenParts int) {
+	if o.decodeWorkers == 0 {
+		o.decodeWorkers = min(
+			s.resolved.WorkerPool.MaxConcurrent(),
+			runtime.GOMAXPROCS(0),
+			lenParts,
+		)
+	}
+	if o.decodeAheadPartitions == nil {
+		wc := max(o.decodeWorkers, 1)
+		n := (lenParts + wc - 1) / wc
+		o.decodeAheadPartitions = &n
+	}
+}
+
+// Read returns every record matching filters as a flat slice
+// in lex partition order, deduplicated by (EntityKeyOf,
+// VersionOf) when both are configured (pass WithHistory to
+// opt out).
+//
+// Backed by the same chan-based fetch+decode pipeline as
+// ReadIter, but auto-tunes for batch use: WithDecodeWorkers
+// defaults to min(WorkerPool.MaxConcurrent(), GOMAXPROCS,
+// lenParts) and WithDecodeAheadPartitions to ceil(lenParts/W),
+// so decode runs at near-linear CPU parallelism out of the box
+// for many-partition reads. Caller-supplied options always win.
+//
+// Materialises every record before returning — memory is O(all
+// matched records). Use ReadIter for streaming consumption with
+// bounded memory.
+//
+// Empty filters slice returns (nil, nil) — no partitions
+// matched, no S3 traffic.
+func (s *Store[T]) Read(
+	ctx context.Context, filters []PartitionFilter, opts ...ReadOption,
+) (out []T, err error) {
+	defer s.metrics.methodScope(ctx, "Read", &err).end()
+	if len(filters) == 0 {
+		return nil, nil
+	}
+	rows, err := s.ResolveFileRefs(ctx, filters)
+	if err != nil {
+		return nil, err
+	}
+	o := resolveIterOpts(opts)
+	var iterErr error
+	s.fetchAndDecodeIter(ctx, "Read", rows, &o,
+		s.readBatchDefaults, recordCollectEmit(&out, &iterErr))
+	if iterErr != nil {
+		return nil, iterErr
+	}
+	return out, nil
+}
+
+// ReadPartition returns one PartitionResult[T] per partition
+// matched by filters, preserving per-partition Version and
+// FileRefs alongside the records. Records within each
+// partition are deduplicated by (EntityKeyOf, VersionOf) when
+// both are configured (pass WithHistory to opt out).
+//
+// Same backend pipeline and auto-tuning as Read; same materialise-
+// everything memory profile. Use ReadPartitionIter for streaming.
+//
+// Empty filters slice returns (nil, nil) — no partitions
+// matched, no S3 traffic.
+func (s *Store[T]) ReadPartition(
+	ctx context.Context, filters []PartitionFilter, opts ...ReadOption,
+) (out []PartitionResult[T], err error) {
+	defer s.metrics.methodScope(ctx, "ReadPartition", &err).end()
+	if len(filters) == 0 {
+		return nil, nil
+	}
+	rows, err := s.ResolveFileRefs(ctx, filters)
+	if err != nil {
+		return nil, err
+	}
+	o := resolveIterOpts(opts)
+	var iterErr error
+	s.fetchAndDecodeIter(ctx, "ReadPartition", rows, &o,
+		s.readBatchDefaults, partitionCollectEmit(&out, &iterErr))
+	if iterErr != nil {
+		return nil, iterErr
+	}
+	return out, nil
+}
+
+// ReadIter returns an iter.Seq2[T, error] that yields every
+// record matching filters, lazily one partition at a time
+// through the chan-based pipeline.
+//
+// Memory: O((WithDecodeAheadPartitions + 1) partitions' decoded
+// records) by default; cap with WithDecodeAheadBytes to bound the
+// uncompressed-bytes footprint. Without options, one partition's
+// records sit in memory at any time.
+//
+// Cancellation: yielding `false` from the loop body cancels
+// in-flight S3 GETs through ctx propagation. Iteration also
+// terminates immediately on the first per-partition error.
+//
+// Emission order: lex by partition key, then per-partition
+// (entity, version) ascending after dedup (if configured) or
+// decode/insertion order without it. Same input yields byte-
+// identical sequences across runs per CLAUDE.md.
+//
+// Empty filters yields nothing without touching the database.
+func (s *Store[T]) ReadIter(
+	ctx context.Context, filters []PartitionFilter,
+	opts ...ReadOption,
+) iter.Seq2[T, error] {
+	return func(yield func(T, error) bool) {
+		var iterErr error
+		defer s.metrics.methodScope(ctx, "ReadIter", &iterErr).end()
+		o := resolveIterOpts(opts)
+		if len(filters) == 0 {
+			return
+		}
+		rows, err := s.ResolveFileRefs(ctx, filters)
+		if err != nil {
+			iterErr = err
+			yield(*new(T), err)
+			return
+		}
+		s.fetchAndDecodeIter(ctx, "ReadIter", rows, &o,
+			iterStreamDefaults, s.recordEmit(yield, &iterErr))
+	}
+}
+
+// ReadPartitionIter is the per-partition variant of ReadIter:
+// each yield is one PartitionResult[T] with Records, Version,
+// and FileRefs populated. Same memory bound and
+// cancellation semantics as ReadIter.
+func (s *Store[T]) ReadPartitionIter(
+	ctx context.Context, filters []PartitionFilter,
+	opts ...ReadOption,
+) iter.Seq2[PartitionResult[T], error] {
+	return func(yield func(PartitionResult[T], error) bool) {
+		var iterErr error
+		defer s.metrics.methodScope(ctx, "ReadPartitionIter", &iterErr).end()
+		o := resolveIterOpts(opts)
+		if len(filters) == 0 {
+			return
+		}
+		rows, err := s.ResolveFileRefs(ctx, filters)
+		if err != nil {
+			iterErr = err
+			yield(PartitionResult[T]{}, err)
+			return
+		}
+		s.fetchAndDecodeIter(ctx, "ReadPartitionIter", rows, &o,
+			iterStreamDefaults, s.partitionEmit(yield, &iterErr))
+	}
+}
+
+// ReadRangeIter walks every record whose written_at falls in
+// [since, until). Bounds are resolved at call entry via the
+// SELECT's WHERE clause, so the upper bound stays stable under
+// concurrent writes — once the catalog SELECT runs, no new rows
+// can appear in the result set.
+//
+// Filters by write commit time, not sequencer-assignment time:
+// recently-written rows that the sequencer hasn't yet processed
+// are still visible (consistent with the atomic-visibility-on-
+// commit invariant in CLAUDE.md). Use Poll / PollRecords if you
+// need a sequenced-rows-only view.
+//
+// Half-open semantics:
+//   - since.IsZero() → start from the earliest write (unbounded
+//     below).
+//   - until.IsZero() → walk to the live tip (unbounded above —
+//     captured by the SELECT; rows committed after the SELECT
+//     don't contribute).
+//   - Records at since are included; records at until are not.
+//
+// No partition filter is applied — every partition with any
+// in-range row contributes records.
+func (s *Store[T]) ReadRangeIter(
+	ctx context.Context, since, until time.Time,
+	opts ...ReadOption,
+) iter.Seq2[T, error] {
+	return func(yield func(T, error) bool) {
+		var iterErr error
+		defer s.metrics.methodScope(ctx, "ReadRangeIter", &iterErr).end()
+		o := resolveIterOpts(opts)
+		rows, err := s.ResolveFileRefsInRange(ctx, since, until)
+		if err != nil {
+			iterErr = err
+			yield(*new(T), err)
+			return
+		}
+		s.fetchAndDecodeIter(ctx, "ReadRangeIter", rows, &o,
+			iterStreamDefaults, s.recordEmit(yield, &iterErr))
+	}
+}
+
+// ReadPartitionRangeIter is the per-partition variant of
+// ReadRangeIter — same time-bound resolution, per-partition
+// output shape.
+func (s *Store[T]) ReadPartitionRangeIter(
+	ctx context.Context, since, until time.Time,
+	opts ...ReadOption,
+) iter.Seq2[PartitionResult[T], error] {
+	return func(yield func(PartitionResult[T], error) bool) {
+		var iterErr error
+		defer s.metrics.methodScope(ctx, "ReadPartitionRangeIter", &iterErr).end()
+		o := resolveIterOpts(opts)
+		rows, err := s.ResolveFileRefsInRange(ctx, since, until)
+		if err != nil {
+			iterErr = err
+			yield(PartitionResult[T]{}, err)
+			return
+		}
+		s.fetchAndDecodeIter(ctx, "ReadPartitionRangeIter", rows, &o,
+			iterStreamDefaults, s.partitionEmit(yield, &iterErr))
+	}
+}
+
+// ReadFileRefsIter decodes pre-resolved FileRef slices without
+// re-querying the catalog. Each ref's S3Key is validated up
+// front against this Store's bucket+prefix; an entry from a
+// different Store fails with an error before any S3 traffic.
+//
+// Records emit in lex order of PartitionKey. The
+// pipeline groups by partition first and sorts the partition
+// keys lex before driving the producer — the input slice's
+// order is not preserved across partitions (per the
+// "Deterministic emission order" contract in CLAUDE.md).
+func (s *Store[T]) ReadFileRefsIter(
+	ctx context.Context, entries []FileRef,
+	opts ...ReadOption,
+) iter.Seq2[T, error] {
+	return func(yield func(T, error) bool) {
+		var iterErr error
+		defer s.metrics.methodScope(ctx, "ReadFileRefsIter", &iterErr).end()
+		o := resolveIterOpts(opts)
+		if err := s.validateFileRefs(entries); err != nil {
+			iterErr = err
+			yield(*new(T), err)
+			return
+		}
+		s.fetchAndDecodeIter(ctx, "ReadFileRefsIter", entries, &o,
+			iterStreamDefaults, s.recordEmit(yield, &iterErr))
+	}
+}
+
+// ReadPartitionFileRefsIter is the per-partition variant of
+// ReadFileRefsIter.
+func (s *Store[T]) ReadPartitionFileRefsIter(
+	ctx context.Context, entries []FileRef,
+	opts ...ReadOption,
+) iter.Seq2[PartitionResult[T], error] {
+	return func(yield func(PartitionResult[T], error) bool) {
+		var iterErr error
+		defer s.metrics.methodScope(ctx, "ReadPartitionFileRefsIter", &iterErr).end()
+		o := resolveIterOpts(opts)
+		if err := s.validateFileRefs(entries); err != nil {
+			iterErr = err
+			yield(PartitionResult[T]{}, err)
+			return
+		}
+		s.fetchAndDecodeIter(ctx, "ReadPartitionFileRefsIter", entries, &o,
+			iterStreamDefaults, s.partitionEmit(yield, &iterErr))
+	}
 }
 
 // validateFileRefs verifies every entry's S3Key lives under

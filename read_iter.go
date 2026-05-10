@@ -429,14 +429,12 @@ func (s *Store[T]) downloadAndDecodeIter(
 	// idempotent so it harmlessly no-ops when state.ctx was
 	// already cancelled by an in-flight task.
 	g, gctx := s.resolved.WorkerPool.WithContext(state.ctx)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		s.runDownloadSubmitter(gctx, g, state)
 		if err := g.Wait(); err != nil {
 			state.recordHardErr(err)
 		}
-	}()
+	})
 	// No cancel-broadcast helper goroutine: every blocking
 	// primitive in streamState (slotCh acquire, partState.done
 	// wait, byteWake bell) selects on state.ctx.Done() natively.
@@ -454,22 +452,18 @@ func (s *Store[T]) downloadAndDecodeIter(
 		readAheadParts = *opts.readAheadPartitions
 	}
 	decodedCh := make(chan decodedBatch[T], readAheadParts)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		s.runDecoder(state.ctx, state, opts, decodedCh)
-	}()
+	})
 
 	// Stall watchdog. Pure observer — surfaces deadlocks
 	// (library regressions) and slow consumers via slog.Warn +
 	// s3pgstore.read.iter.stall.count, never cancels. See
 	// runDeadlockObserver for the rationale.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		state.runDeadlockObserver(state.ctx, method,
 			stallTickInterval, stallThreshold)
-	}()
+	})
 
 	// Stage 3: emit loop. Drains decodedCh, hands each batch to
 	// the per-method emit callback (record-by-record yield or

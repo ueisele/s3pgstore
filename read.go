@@ -3,9 +3,10 @@ package s3pgstore
 // read.go is the read path for s3pgstore: the public entry
 // points (Read / ReadPartition / ReadIter and its variants),
 // the catalog SELECT helpers (selectFileRows /
-// selectFileRowsByRange / entriesToFileRows), and the
-// chan-based fetch+decode pipeline (fetchAndDecodeIter and the
-// stream/worker state machinery) that backs every entry point.
+// selectFileRowsByRange / queryFileRows / entriesToFileRows),
+// and the chan-based fetch+decode pipeline (fetchAndDecodeIter
+// and the stream/worker state machinery) that backs every entry
+// point.
 //
 // The pipeline is vendored from
 // https://github.com/ueisele/s3store/blob/da75ca9/reader_iter.go
@@ -407,18 +408,8 @@ type fileRow struct {
 	extValues []any
 }
 
-// selectFileRows builds and runs the read-path SELECT against
-// s3pgstore_files. Every row for every matched partition comes
-// back (no per-file filter, no LIMIT). Ordered by
-// (partition_key, s3_key) so the caller can group rows in a
-// single pass and per-partition file order is deterministic
-// (lex by S3 key — required for the dedup tie-break per
-// CLAUDE.md).
-//
-// SELECT column list:
-//
-//	file_id, partition_key, s3_key, written_at_version,
-//	ext_<col1>, ext_<col2>, ...
+// selectFileRows resolves a partition-filter expression into a
+// WHERE clause and runs the catalog SELECT via queryFileRows.
 func (s *Store[T]) selectFileRows(
 	ctx context.Context, filters []PartitionFilter,
 ) ([]fileRow, error) {
@@ -427,58 +418,13 @@ func (s *Store[T]) selectFileRows(
 	if err != nil {
 		return nil, err
 	}
-
-	cols := []string{
-		"file_id", "partition_key", "s3_key", "written_at_version",
-	}
-	for _, c := range s.resolved.ExtensionColumns {
-		cols = append(cols, "ext_"+c.Name)
-	}
-	q := fmt.Sprintf(
-		`SELECT %s
-		FROM %s
-		WHERE %s
-		ORDER BY partition_key, s3_key`,
-		strings.Join(cols, ", "), s.names.Files(), where)
-
-	var out []fileRow
-	err = s.cfg.Executor.Run(ctx, func(d DBTX) error {
-		rows, err := d.Query(ctx, q, args...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			r := fileRow{
-				extValues: make([]any, len(s.resolved.ExtensionColumns)),
-			}
-			scanArgs := []any{
-				&r.fileID, &r.partitionKey,
-				&r.s3Key, &r.writtenAtVersion,
-			}
-			extPtrs := make([]any, len(s.resolved.ExtensionColumns))
-			for i := range extPtrs {
-				extPtrs[i] = &r.extValues[i]
-			}
-			scanArgs = append(scanArgs, extPtrs...)
-			if err := rows.Scan(scanArgs...); err != nil {
-				return err
-			}
-			out = append(out, r)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		return nil, fmt.Errorf("SELECT files: %w", err)
-	}
-	return out, nil
+	return s.queryFileRows(ctx, where, args)
 }
 
-// selectFileRowsByRange runs the time-range catalog SELECT,
-// filtered by feed_seq_at (unbounded sides default to
-// open-ended). Rows come back ordered by partition_key, s3_key
-// for the same group-then-decode pattern as the partition-
-// filter SELECT.
+// selectFileRowsByRange runs the catalog SELECT filtered by
+// feed_seq_at (unbounded sides default to open-ended). Rows
+// with feed_seq IS NULL (not yet sequenced) are excluded so the
+// result is stable under sequencer races.
 //
 // Bound semantics:
 //   - since: feed_seq_at >= since (zero → unbounded below).
@@ -486,11 +432,37 @@ func (s *Store[T]) selectFileRows(
 //     "live tip captured at call entry" property holds because
 //     the catalog row count is monotonically non-decreasing in
 //     v2.0 — files are never deleted).
-//
-// Rows with feed_seq IS NULL (not yet sequenced) are excluded
-// so the result is stable under sequencer races.
 func (s *Store[T]) selectFileRowsByRange(
 	ctx context.Context, since, until time.Time,
+) ([]fileRow, error) {
+	parts := []string{"feed_seq IS NOT NULL"}
+	args := []any{}
+	if !since.IsZero() {
+		args = append(args, since.UTC())
+		parts = append(parts,
+			fmt.Sprintf("feed_seq_at >= $%d", len(args)))
+	}
+	if !until.IsZero() {
+		args = append(args, until.UTC())
+		parts = append(parts,
+			fmt.Sprintf("feed_seq_at < $%d", len(args)))
+	}
+	return s.queryFileRows(ctx, strings.Join(parts, " AND "), args)
+}
+
+// queryFileRows runs a SELECT against s3pgstore_files with the
+// supplied WHERE clause + args. Every matching row comes back
+// (no per-file filter, no LIMIT) in (partition_key, s3_key)
+// order so the caller can group rows in a single pass and
+// per-partition file order is deterministic (lex by S3 key —
+// required for the dedup tie-break per CLAUDE.md).
+//
+// Projection is fixed to the shape consumed by preparePartitions:
+//
+//	file_id, partition_key, s3_key, written_at_version,
+//	ext_<col1>, ext_<col2>, ...
+func (s *Store[T]) queryFileRows(
+	ctx context.Context, where string, args []any,
 ) ([]fileRow, error) {
 	cols := []string{
 		"file_id", "partition_key", "s3_key", "written_at_version",
@@ -498,24 +470,11 @@ func (s *Store[T]) selectFileRowsByRange(
 	for _, c := range s.resolved.ExtensionColumns {
 		cols = append(cols, "ext_"+c.Name)
 	}
-	where := []string{"feed_seq IS NOT NULL"}
-	args := []any{}
-	if !since.IsZero() {
-		args = append(args, since.UTC())
-		where = append(where,
-			fmt.Sprintf("feed_seq_at >= $%d", len(args)))
-	}
-	if !until.IsZero() {
-		args = append(args, until.UTC())
-		where = append(where,
-			fmt.Sprintf("feed_seq_at < $%d", len(args)))
-	}
 	q := fmt.Sprintf(
 		`SELECT %s FROM %s
 		WHERE %s
 		ORDER BY partition_key, s3_key`,
-		strings.Join(cols, ", "), s.names.Files(),
-		strings.Join(where, " AND "))
+		strings.Join(cols, ", "), s.names.Files(), where)
 
 	var out []fileRow
 	err := s.cfg.Executor.Run(ctx, func(d DBTX) error {
@@ -543,7 +502,7 @@ func (s *Store[T]) selectFileRowsByRange(
 		return rows.Err()
 	})
 	if err != nil {
-		return nil, fmt.Errorf("SELECT files (range): %w", err)
+		return nil, fmt.Errorf("SELECT files: %w", err)
 	}
 	return out, nil
 }

@@ -296,6 +296,15 @@ func runDeadlockObserver(
 				// exit.
 				continue
 			}
+			if slots.occupancy() == 0 {
+				// Nothing in flight — there's nothing to
+				// deadlock on. Suppresses false positives
+				// during idle periods (notably the tail
+				// feeder's between-poll waits) and during
+				// pipeline shutdown after the last body has
+				// been released.
+				continue
+			}
 			staleNs := now.UnixNano() - last
 			if staleNs < thresholdNs {
 				continue

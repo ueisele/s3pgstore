@@ -1,11 +1,13 @@
 package s3pgstore
 
+import "time"
+
 // PollOption is the interface implemented by PollRecords /
-// PollRecordsIter modifiers. Distinct from ReadOption so the
-// surfaces don't cross-contaminate at the call site (a
-// Poll-specific WithDecodeAheadFiles passed to ReadIter is a
-// compile error). Knobs that work for both pipelines live in
-// iter_options.go and return IterOption (which satisfies both
+// PollRecordsIter / TailRecordsIter modifiers. Distinct from
+// ReadOption so the surfaces don't cross-contaminate at the call
+// site (a Poll-specific WithDecodeAheadFiles passed to ReadIter
+// is a compile error). Knobs that work for both pipelines live
+// in iter_options.go and return IterOption (which satisfies both
 // ReadOption and PollOption).
 type PollOption interface {
 	applyPoll(*pollOpts)
@@ -53,6 +55,21 @@ type pollOpts struct {
 	// total_byte_size) so the cap is exact, not a heuristic.
 	// With W > 1 workers the per-call total is W × n.
 	decodeAheadBytes int64
+
+	// tailBaseInterval is the wait after the first empty poll
+	// in TailRecordsIter. Subsequent consecutive empty polls
+	// double the wait up to tailMaxInterval. Reset to base on
+	// any non-empty poll. Zero (default) resolves to
+	// defaultTailBaseInterval (100ms). Tail-only — has no
+	// effect on PollRecords or PollRecordsIter.
+	tailBaseInterval time.Duration
+
+	// tailMaxInterval caps the exponential backoff between
+	// empty polls in TailRecordsIter. Zero (default) resolves
+	// to defaultTailMaxInterval (2s). When max < base, max is
+	// promoted to base by tailIntervals (no degenerate
+	// shrinking-cap configuration). Tail-only.
+	tailMaxInterval time.Duration
 }
 
 // resolvePollOpts collapses the variadic option list into a
@@ -93,4 +110,32 @@ type withDecodeAheadFilesOpt struct{ n int }
 func (o withDecodeAheadFilesOpt) applyPoll(opts *pollOpts) {
 	v := o.n
 	opts.decodeAheadFiles = &v
+}
+
+// WithTailIdleBackoff bounds TailRecordsIter's wait between
+// empty polls. base is the wait after the first empty poll;
+// each subsequent consecutive empty poll doubles the wait up
+// to max. Reset to base on any non-empty poll.
+//
+// Defaults (option not supplied): base=100ms, max=2s. The
+// defaults balance "react quickly to new data" against "don't
+// hammer the catalog when truly idle" — at the cap the
+// catalog sees one query per 2s per tail consumer.
+//
+// Non-positive values are treated as "use default" (per
+// dimension); max < base is promoted to max=base so the cap
+// is never below the floor. Effective range:
+// [max(base, 1ns), max(max, base)].
+//
+// Tail-only — has no effect on PollRecords or PollRecordsIter
+// (which return on EOS rather than wait for new data).
+func WithTailIdleBackoff(base, max time.Duration) PollOption {
+	return withTailIdleBackoffOpt{base: base, max: max}
+}
+
+type withTailIdleBackoffOpt struct{ base, max time.Duration }
+
+func (o withTailIdleBackoffOpt) applyPoll(opts *pollOpts) {
+	opts.tailBaseInterval = o.base
+	opts.tailMaxInterval = o.max
 }

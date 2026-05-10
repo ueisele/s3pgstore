@@ -247,6 +247,13 @@ func TestDeadlockObserver_FiresOnStall(t *testing.T) {
 	}
 	s := newTestReadState(t).withSlotCap(2)
 	s.slots.m = m
+	// Acquire a slot so occupancy() > 0 — the watchdog suppresses
+	// warnings when nothing is in flight (no deadlock is possible
+	// without a held resource), so a stall test must simulate
+	// in-flight work.
+	if err := s.slots.acquire(context.Background()); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
 	s.slots.lastProgressNs.Store(time.Now().Add(-time.Second).UnixNano())
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -296,6 +303,12 @@ func TestDeadlockObserver_NoSignalWhenProgress(t *testing.T) {
 	}
 	s := newTestReadState(t).withSlotCap(2)
 	s.slots.m = m
+	// Acquire a slot so occupancy() > 0 — exercises the
+	// "in-flight work, but bumper keeps pace" branch rather than
+	// the trivial occupancy==0 suppression.
+	if err := s.slots.acquire(context.Background()); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
 	// Seed lastProgressNs to "now" so the first tick (before
 	// the bumper goroutine even starts) doesn't trip on the
 	// initial window.

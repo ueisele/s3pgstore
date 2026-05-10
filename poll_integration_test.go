@@ -917,3 +917,270 @@ func TestPollRecordsIter_OptionsApply(t *testing.T) {
 		t.Errorf("yielded %d, want 4", count)
 	}
 }
+
+// TestTailRecordsIter_FollowsAppendedWrites is the load-bearing
+// tail test: write N records, start TailRecordsIter, observe
+// that it yields N; then write M more, observe it yields the
+// additional M in feed_seq order; cancel ctx, observe the
+// iterator returns silently (no error yield).
+//
+// Uses a tight backoff window (10ms / 50ms) so the second batch
+// arrives within the test deadline. The tail goroutine runs in
+// the background; the test thread synchronises via a channel
+// that the goroutine pushes each yielded offset onto.
+func TestTailRecordsIter_FollowsAppendedWrites(t *testing.T) {
+	f := newFixture(t)
+	store := newStreamStore(t, f)
+
+	const initial = 3
+	for i := range initial {
+		if _, err := store.Write(t.Context(),
+			[]streamRec{{ID: fmt.Sprintf("a%d", i),
+				Value: int64(i)}}); err != nil {
+			t.Fatalf("Write initial %d: %v", i, err)
+		}
+	}
+	runSequencerSync(t, f)
+
+	tailCtx, cancelTail := context.WithCancel(t.Context())
+	defer cancelTail()
+
+	// Buffered channel so the tail goroutine never blocks on
+	// the test thread. Capacity is generous for both batches.
+	yields := make(chan s3pgstore.FileResult[streamRec], 32)
+	errs := make(chan error, 1)
+	tailDone := make(chan struct{})
+	go func() {
+		defer close(tailDone)
+		for fr, err := range store.TailRecordsIter(tailCtx, 0,
+			s3pgstore.WithTailIdleBackoff(
+				10*time.Millisecond, 50*time.Millisecond)) {
+			if err != nil {
+				errs <- err
+				return
+			}
+			yields <- fr
+		}
+	}()
+
+	// Drain the initial batch from the yields channel.
+	got := drainYields(t, yields, initial, 3*time.Second)
+	if len(got) != initial {
+		t.Fatalf("initial yields: got %d, want %d", len(got), initial)
+	}
+	for i, fr := range got {
+		if fr.File.Offset != int64(i+1) {
+			t.Errorf("initial[%d] offset: got %d, want %d",
+				i, fr.File.Offset, i+1)
+		}
+	}
+
+	// Write more records and sequence them — the tail must
+	// pick them up via its next non-empty Poll.
+	const additional = 4
+	for i := range additional {
+		if _, err := store.Write(t.Context(),
+			[]streamRec{{ID: fmt.Sprintf("b%d", i),
+				Value: int64(initial + i)}}); err != nil {
+			t.Fatalf("Write additional %d: %v", i, err)
+		}
+	}
+	runSequencerSync(t, f)
+
+	got = drainYields(t, yields, additional, 3*time.Second)
+	if len(got) != additional {
+		t.Fatalf("additional yields: got %d, want %d",
+			len(got), additional)
+	}
+	for i, fr := range got {
+		wantOff := int64(initial + i + 1)
+		if fr.File.Offset != wantOff {
+			t.Errorf("additional[%d] offset: got %d, want %d",
+				i, fr.File.Offset, wantOff)
+		}
+	}
+
+	// Cancel — iterator should return cleanly (no error yield).
+	cancelTail()
+	select {
+	case <-tailDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("TailRecordsIter did not return after cancel")
+	}
+	select {
+	case err := <-errs:
+		t.Errorf("unexpected error yield on cancel: %v", err)
+	default:
+	}
+}
+
+// TestTailRecordsIter_ResumeAfterCancel verifies the documented
+// resume idiom: after a clean break, restart from
+// last.Offset+1 and observe no gaps and no duplicates.
+func TestTailRecordsIter_ResumeAfterCancel(t *testing.T) {
+	f := newFixture(t)
+	store := newStreamStore(t, f)
+
+	for i := range 5 {
+		if _, err := store.Write(t.Context(),
+			[]streamRec{{ID: fmt.Sprintf("c%d", i)}}); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	runSequencerSync(t, f)
+
+	// First tail: pull two records, then cancel.
+	ctx1, cancel1 := context.WithCancel(t.Context())
+	var (
+		got1 []s3pgstore.Offset
+		last s3pgstore.Offset
+	)
+	for fr, err := range store.TailRecordsIter(ctx1, 0,
+		s3pgstore.WithTailIdleBackoff(
+			10*time.Millisecond, 50*time.Millisecond)) {
+		if err != nil {
+			t.Fatalf("first tail yield: %v", err)
+		}
+		got1 = append(got1, fr.File.Offset)
+		last = fr.File.Offset
+		if len(got1) == 2 {
+			break
+		}
+	}
+	cancel1()
+	if len(got1) != 2 || got1[0] != 1 || got1[1] != 2 {
+		t.Fatalf("first tail offsets: got %v, want [1, 2]", got1)
+	}
+
+	// Second tail resumes from last+1.
+	ctx2, cancel2 := context.WithCancel(t.Context())
+	var got2 []s3pgstore.Offset
+	go func() {
+		// Cancel after we've pulled the remainder so the iter
+		// returns. Bound the wait so a stuck tail can't hang
+		// the test.
+		time.Sleep(2 * time.Second)
+		cancel2()
+	}()
+	for fr, err := range store.TailRecordsIter(ctx2, last+1,
+		s3pgstore.WithTailIdleBackoff(
+			10*time.Millisecond, 50*time.Millisecond)) {
+		if err != nil {
+			t.Fatalf("resume yield: %v", err)
+		}
+		got2 = append(got2, fr.File.Offset)
+		if len(got2) == 3 {
+			cancel2()
+			break
+		}
+	}
+	if len(got2) != 3 || got2[0] != 3 || got2[1] != 4 || got2[2] != 5 {
+		t.Errorf("resume offsets: got %v, want [3, 4, 5]", got2)
+	}
+}
+
+// TestTailRecordsIter_IdleBackoff exercises the empty-poll path:
+// against an empty store, the tail must NOT busy-loop — it
+// blocks with backoff until ctx is cancelled. We assert it
+// yields nothing and exits cleanly within a short window.
+func TestTailRecordsIter_IdleBackoff(t *testing.T) {
+	f := newFixture(t)
+	store := newStreamStore(t, f)
+
+	ctx, cancel := context.WithTimeout(t.Context(),
+		300*time.Millisecond)
+	defer cancel()
+
+	yielded := 0
+	for fr, err := range store.TailRecordsIter(ctx, 0,
+		s3pgstore.WithTailIdleBackoff(
+			10*time.Millisecond, 50*time.Millisecond)) {
+		// On empty store + ctx-cancel-during-sleep we expect
+		// no yields. If we DO see one it's a real bug — log it.
+		if err != nil {
+			// Only ctx-derived errors are acceptable here, and
+			// even those should not yield (sleep-cancel path).
+			t.Errorf("unexpected error yield (err=%v fr=%+v)",
+				err, fr)
+			continue
+		}
+		yielded++
+	}
+	if yielded != 0 {
+		t.Errorf("idle tail yielded %d records against empty store, want 0",
+			yielded)
+	}
+}
+
+// TestTailRecordsIter_PicksUpRecordsWrittenAfterStart guards the
+// race between iter-start and first write: tail must observe
+// records committed AFTER iter construction. Failure here would
+// mean the feeder is somehow snapshotting at start time
+// (regression to PollRecordsIter semantics) instead of
+// continually polling.
+func TestTailRecordsIter_PicksUpRecordsWrittenAfterStart(t *testing.T) {
+	f := newFixture(t)
+	store := newStreamStore(t, f)
+
+	tailCtx, cancelTail := context.WithCancel(t.Context())
+	defer cancelTail()
+
+	yields := make(chan s3pgstore.FileResult[streamRec], 8)
+	tailDone := make(chan struct{})
+	go func() {
+		defer close(tailDone)
+		for fr, err := range store.TailRecordsIter(tailCtx, 0,
+			s3pgstore.WithTailIdleBackoff(
+				10*time.Millisecond, 50*time.Millisecond)) {
+			if err != nil {
+				return
+			}
+			yields <- fr
+		}
+	}()
+
+	// Tiny pause to ensure the tail's first Poll returns empty
+	// (so we exercise the "wake up on next non-empty poll" path,
+	// not the "first poll already had the record" path).
+	time.Sleep(100 * time.Millisecond)
+
+	if _, err := store.Write(t.Context(),
+		[]streamRec{{ID: "after-start"}}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	runSequencerSync(t, f)
+
+	got := drainYields(t, yields, 1, 3*time.Second)
+	cancelTail()
+	<-tailDone
+
+	if len(got) != 1 {
+		t.Fatalf("got %d yields, want 1", len(got))
+	}
+	if got[0].Records[0].ID != "after-start" {
+		t.Errorf("ID: got %q, want %q",
+			got[0].Records[0].ID, "after-start")
+	}
+}
+
+// drainYields collects up to `want` results from yields, with a
+// per-test deadline. Returns the slice of yields received. The
+// helper exists so the test bodies don't repeat the same
+// "select with timeout" boilerplate for every batch.
+func drainYields(
+	t *testing.T,
+	yields <-chan s3pgstore.FileResult[streamRec],
+	want int, deadline time.Duration,
+) []s3pgstore.FileResult[streamRec] {
+	t.Helper()
+	out := make([]s3pgstore.FileResult[streamRec], 0, want)
+	end := time.Now().Add(deadline)
+	for len(out) < want && time.Now().Before(end) {
+		select {
+		case fr := <-yields:
+			out = append(out, fr)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	return out
+}

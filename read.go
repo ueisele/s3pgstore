@@ -40,7 +40,7 @@ package s3pgstore
 //     slice to the same pipeline.
 //   - Methods retain s3pgstore signatures: ReadIter takes
 //     `[]PartitionFilter`, ReadPartitionIter yields
-//     PartitionResult[T] (carrying Version + FileExtensions),
+//     PartitionResult[T] (carrying Version + FileRefs),
 //     not HivePartition[T].
 //
 // What we DO NOT vendor:
@@ -78,22 +78,16 @@ import (
 // s3pgstore_partitions.version by the catalog construction
 // invariant in CLAUDE.md).
 //
-// FileExtensions is populated in Phase 8 (ExtensionColumns).
-// In Phase 6 the slice is non-nil (one entry per file in
-// stable order) but every entry's Extensions map is empty.
+// FileRefs is the catalog rows backing this partition's records,
+// in deterministic S3Key order — same shape as the slice returned
+// by Write or yielded by Poll. Each entry's Extensions carries the
+// typed ext_<n> columns; the map is empty when no metadata was
+// written.
 type PartitionResult[T any] struct {
-	PartitionKey   string
-	Records        []T
-	Version        int64
-	FileExtensions []FileExtensions
-}
-
-// FileExtensions carries the typed ext_<n> columns for a
-// single file. Phase 6 populates FileID; the map is empty
-// until Phase 8 wires WithMetadata + ExtensionColumns.
-type FileExtensions struct {
-	FileID     int64
-	Extensions map[string]any
+	PartitionKey string
+	Records      []T
+	Version      int64
+	FileRefs     []FileRef
 }
 
 // iterStreamDefaults fills the iter family's per-call defaults
@@ -190,7 +184,7 @@ func (s *Store[T]) Read(
 
 // ReadPartition returns one PartitionResult[T] per partition
 // matched by filters, preserving per-partition Version and
-// FileExtensions alongside the records. Records within each
+// FileRefs alongside the records. Records within each
 // partition are deduplicated by (EntityKeyOf, VersionOf) when
 // both are configured (pass WithHistory to opt out).
 //
@@ -263,7 +257,7 @@ func (s *Store[T]) ReadIter(
 
 // ReadPartitionIter is the per-partition variant of ReadIter:
 // each yield is one PartitionResult[T] with Records, Version,
-// and FileExtensions populated. Same memory bound and
+// and FileRefs populated. Same memory bound and
 // cancellation semantics as ReadIter.
 func (s *Store[T]) ReadPartitionIter(
 	ctx context.Context, filters []PartitionFilter,
@@ -593,10 +587,10 @@ func (s *Store[T]) partitionEmit(
 			return false
 		}
 		return yield(PartitionResult[T]{
-			PartitionKey:   b.partitionKey,
-			Records:        b.records,
-			Version:        b.version,
-			FileExtensions: b.exts,
+			PartitionKey: b.partitionKey,
+			Records:      b.records,
+			Version:      b.version,
+			FileRefs:     b.files,
 		}, nil)
 	}
 }
@@ -622,7 +616,7 @@ func recordCollectEmit[T any](
 // partitionCollectEmit returns the per-batch emit callback that
 // appends each PartitionResult into the *out slice. Used by
 // ReadPartition — preserves per-partition Version and
-// FileExtensions alongside records. On a hard pipeline error:
+// FileRefs alongside records. On a hard pipeline error:
 // sets *iterErr and returns false.
 func partitionCollectEmit[T any](
 	out *[]PartitionResult[T], iterErr *error,
@@ -633,10 +627,10 @@ func partitionCollectEmit[T any](
 			return false
 		}
 		*out = append(*out, PartitionResult[T]{
-			PartitionKey:   b.partitionKey,
-			Records:        b.records,
-			Version:        b.version,
-			FileExtensions: b.exts,
+			PartitionKey: b.partitionKey,
+			Records:      b.records,
+			Version:      b.version,
+			FileRefs:     b.files,
 		})
 		return true
 	}
@@ -856,7 +850,7 @@ func (s *Store[T]) fetchAndDecodeIter(
 // Each partition's files are sorted by S3Key (deterministic
 // download order); per-file Version + Extensions are already on
 // the FileRef, so the decoded batch can carry PartitionResult's
-// Version + FileExtensions without a second pass.
+// Version + FileRefs without a second pass.
 func (s *Store[T]) preparePartitions(
 	entries []FileRef,
 ) []*partState {
@@ -892,15 +886,10 @@ func (s *Store[T]) preparePartitions(
 		})
 
 		var version int64
-		exts := make([]FileExtensions, 0, len(files))
 		for _, f := range files {
 			if f.Version > version {
 				version = f.Version
 			}
-			exts = append(exts, FileExtensions{
-				FileID:     f.FileID,
-				Extensions: f.Extensions,
-			})
 		}
 
 		// byPartition only emits non-empty buckets (every insert
@@ -910,7 +899,6 @@ func (s *Store[T]) preparePartitions(
 			partitionKey: k,
 			files:        files,
 			version:      version,
-			exts:         exts,
 			bodies:       make([][]byte, len(files)),
 			done:         make(chan struct{}),
 		})
@@ -919,7 +907,7 @@ func (s *Store[T]) preparePartitions(
 }
 
 // partState holds per-partition download progress. partitionKey,
-// files, version, and exts are fixed at preparePartitions time;
+// files, and version are fixed at preparePartitions time;
 // bodies + completed are mutated by pool tasks under
 // streamState.mu.
 //
@@ -939,7 +927,6 @@ type partState struct {
 	partitionKey string
 	files        []FileRef
 	version      int64
-	exts         []FileExtensions
 	bodies       [][]byte
 	completed    int
 	done         chan struct{}
@@ -1391,7 +1378,7 @@ func (s *Store[T]) runDecodeWorker(
 			partitionKey: ps.partitionKey,
 			records:      recs,
 			version:      ps.version,
-			exts:         ps.exts,
+			files:        ps.files,
 			uncompBytes:  uncomp,
 		}) {
 			ws.releaseBytes(uncomp)
@@ -1444,7 +1431,7 @@ func (s *Store[T]) decodePartition(
 // partitionKey is the partition the records came from (carried
 // so partition-emitting public methods can surface it).
 // records is already sort+dedup'd by decodePartition.
-// version + exts are populated at preparePartitions time
+// version + files are populated at preparePartitions time
 // (catalog-derived, no parquet decode required).
 // uncompBytes is what the decoder reserved; the emit loop
 // returns it via releaseBytes after the records are forwarded.
@@ -1452,7 +1439,7 @@ type decodedBatch[T any] struct {
 	partitionKey string
 	records      []T
 	version      int64
-	exts         []FileExtensions
+	files        []FileRef
 	uncompBytes  int64
 	err          error
 }

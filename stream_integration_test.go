@@ -580,7 +580,11 @@ func TestFileRef_CrossSourceConsistency(t *testing.T) {
 	store := newStreamStore(t, f)
 
 	const token = "test-token-cross-source"
-	before := time.Now().UTC()
+	// WrittenAt comes from Postgres now(), which can drift a few ms
+	// from the test process clock (testcontainers Docker host vs.
+	// container). Pad the bracket to absorb that skew.
+	const clockSkew = 2 * time.Second
+	before := time.Now().UTC().Add(-clockSkew)
 	written, err := store.Write(t.Context(),
 		[]streamRec{{ID: "alice", Value: 42}},
 		s3pgstore.WithIdempotencyToken(token),
@@ -588,7 +592,7 @@ func TestFileRef_CrossSourceConsistency(t *testing.T) {
 			"job_id": "job-xyz",
 		}),
 	)
-	after := time.Now().UTC()
+	after := time.Now().UTC().Add(clockSkew)
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}

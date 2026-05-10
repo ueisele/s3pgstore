@@ -131,9 +131,9 @@ func TestReadPartition_DerivesVersionFromMaxFile(t *testing.T) {
 		t.Errorf("Version: want 2 (MAX(written_at_version)), got %d",
 			got[0].Version)
 	}
-	if len(got[0].FileExtensions) != 2 {
-		t.Errorf("FileExtensions: want 2 entries, got %d",
-			len(got[0].FileExtensions))
+	if len(got[0].FileRefs) != 2 {
+		t.Errorf("FileRefs: want 2 entries, got %d",
+			len(got[0].FileRefs))
 	}
 }
 
@@ -558,7 +558,7 @@ func TestReadIter_BreakCancelsInFlight(t *testing.T) {
 
 // TestReadPartitionIter_EmitsPerPartitionResults verifies the
 // per-partition variant yields one PartitionResult per
-// matching partition with Records, Version, and FileExtensions
+// matching partition with Records, Version, and FileRefs
 // populated, in lex order of partition key.
 func TestReadPartitionIter_EmitsPerPartitionResults(t *testing.T) {
 	f := newFixture(t)
@@ -584,9 +584,9 @@ func TestReadPartitionIter_EmitsPerPartitionResults(t *testing.T) {
 			t.Errorf("Version for %q: got %d, want 1",
 				p.PartitionKey, p.Version)
 		}
-		if len(p.FileExtensions) != 1 {
-			t.Errorf("FileExtensions for %q: got %d, want 1",
-				p.PartitionKey, len(p.FileExtensions))
+		if len(p.FileRefs) != 1 {
+			t.Errorf("FileRefs for %q: got %d, want 1",
+				p.PartitionKey, len(p.FileRefs))
 		}
 	}
 	want := []string{
@@ -1228,7 +1228,7 @@ func TestRead_FlatRecordSlice(t *testing.T) {
 
 // TestReadPartition_PerPartitionResults verifies the per-partition
 // variant returns []PartitionResult[T] with Records, Version, and
-// FileExtensions populated; same auto-default behavior as Read.
+// FileRefs populated; same auto-default behavior as Read.
 func TestReadPartition_PerPartitionResults(t *testing.T) {
 	f := newFixture(t)
 	store := newIterStore(t, f)
@@ -1263,9 +1263,9 @@ func TestReadPartition_PerPartitionResults(t *testing.T) {
 			t.Errorf("got[%d].Records: len=%d, want 1",
 				i, len(got[i].Records))
 		}
-		if len(got[i].FileExtensions) != 1 {
-			t.Errorf("got[%d].FileExtensions: len=%d, want 1",
-				i, len(got[i].FileExtensions))
+		if len(got[i].FileRefs) != 1 {
+			t.Errorf("got[%d].FileRefs: len=%d, want 1",
+				i, len(got[i].FileRefs))
 		}
 	}
 }

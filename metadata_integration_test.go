@@ -107,10 +107,10 @@ func TestWithMetadata_RoundTrip(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("partitions: %d", len(got))
 	}
-	if len(got[0].FileExtensions) != 1 {
-		t.Fatalf("FileExtensions count: %d", len(got[0].FileExtensions))
+	if len(got[0].FileRefs) != 1 {
+		t.Fatalf("FileRefs count: %d", len(got[0].FileRefs))
 	}
-	ext := got[0].FileExtensions[0].Extensions
+	ext := got[0].FileRefs[0].Extensions
 	if ext["job_id"] != "job-007" {
 		t.Errorf("read ext.job_id: %v", ext["job_id"])
 	}
@@ -161,7 +161,7 @@ func TestWithMetadata_PartialPopulation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
-	ext := got[0].FileExtensions[0].Extensions
+	ext := got[0].FileRefs[0].Extensions
 	if ext["job_id"] != "j1" {
 		t.Errorf("job_id: %v", ext["job_id"])
 	}
@@ -206,8 +206,8 @@ func TestWithMetadata_FirstWriteWinsUnderIdempotency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
-	if got[0].FileExtensions[0].Extensions["job_id"] != "first" {
+	if got[0].FileRefs[0].Extensions["job_id"] != "first" {
 		t.Errorf("first-write-wins violated: %v",
-			got[0].FileExtensions[0].Extensions["job_id"])
+			got[0].FileRefs[0].Extensions["job_id"])
 	}
 }

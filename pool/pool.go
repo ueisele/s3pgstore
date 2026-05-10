@@ -37,12 +37,6 @@
 //	    })
 //	}
 //	return g.Wait()
-//
-// Submitter passes ctx (the marked group ctx if we're already
-// inside a worker) so the deadlock detector can fire if this
-// is a same-pool reentrant submit. fn receives a fresh
-// marked ctx so any nested Submit it makes will likewise
-// detect.
 package pool
 
 import (
@@ -54,7 +48,6 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/metric/noop"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -65,13 +58,9 @@ import (
 //
 // The zero value is not usable; construct via New.
 type Pool struct {
-	slots chan struct{}
-	n     int
-
-	// Metrics. Always non-nil after New (noop fallback when no
-	// meter is provided), so call sites don't branch on nil.
-	inFlight metric.Int64UpDownCounter
-	waitDur  metric.Float64Histogram
+	slots   chan struct{}
+	n       int
+	metrics *metrics
 }
 
 // New constructs a Pool with the given concurrency limit and
@@ -86,39 +75,14 @@ func New(maxConcurrent int, meter metric.Meter) (*Pool, error) {
 		return nil, fmt.Errorf(
 			"pool: maxConcurrent must be > 0, got %d", maxConcurrent)
 	}
-	if meter == nil {
-		meter = noop.NewMeterProvider().Meter(
-			"github.com/ueisele/s3pgstore/pool")
-	}
-	inFlight, err := meter.Int64UpDownCounter(
-		"s3pgstore.pool.in_flight",
-		metric.WithDescription(
-			"Concurrent I/O tasks executing on the shared pool. "+
-				"Approaches MaxConcurrent under saturation."),
-		metric.WithUnit("{task}"))
+	m, err := newMetrics(meter)
 	if err != nil {
-		return nil, fmt.Errorf("pool: register in_flight: %w", err)
-	}
-	// shortWaitBuckets mirrors the iter pipeline's body-slot
-	// wait shape — sub-millisecond when not saturated, seconds
-	// only under heavy contention.
-	waitDur, err := meter.Float64Histogram(
-		"s3pgstore.pool.queue.wait.duration",
-		metric.WithDescription(
-			"Time submitters spent waiting for a pool slot to free up "+
-				"before their task started. Sustained non-zero p95 "+
-				"indicates the pool is saturated."),
-		metric.WithUnit("s"),
-		metric.WithExplicitBucketBoundaries(
-			0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5))
-	if err != nil {
-		return nil, fmt.Errorf("pool: register queue.wait.duration: %w", err)
+		return nil, err
 	}
 	return &Pool{
-		slots:    make(chan struct{}, maxConcurrent),
-		n:        maxConcurrent,
-		inFlight: inFlight,
-		waitDur:  waitDur,
+		slots:   make(chan struct{}, maxConcurrent),
+		n:       maxConcurrent,
+		metrics: m,
 	}, nil
 }
 
@@ -158,11 +122,10 @@ func (p *Pool) WithContext(
 	}, gctx
 }
 
-// markerKey is per-pool — distinguishes "you're inside this
-// pool's worker" from "you're inside some other pool's
-// worker." Cross-pool reentrancy is safe (different worker
-// fleets); same-pool reentrancy would deadlock the pool's
-// budget by holding a slot while waiting for another.
+// markerKey tags the worker ctx so Submit can detect a
+// same-pool reentrant submission and panic, rather than letting
+// it manifest as a load-dependent hang under saturation.
+// Cross-pool reentrancy carries a different key and is safe.
 type markerKey struct{ pool *Pool }
 
 // Submit blocks until a Pool slot is available, then spawns a
@@ -183,29 +146,23 @@ type markerKey struct{ pool *Pool }
 //     WARN with the goroutine's stack, and surfaced as a
 //     normal error to Wait.
 //   - Deadlock detection: panics if ctx carries the marker
-//     indicating fn is already running on this pool's
-//     worker. Same-pool reentrancy would wedge the pool —
-//     the worker would hold a slot while waiting for another
-//     slot it would never get. Use a different pool or spawn
-//     a fresh goroutine for nested work.
+//     (fn is already running on this pool's worker). Same-pool
+//     reentrancy can wedge the pool under saturation; the
+//     panic surfaces the risk deterministically. Use a
+//     different pool or a fresh goroutine for nested work.
 //
-// The ctx parameter is used only for the deadlock-detection
-// marker check at submit time. The slot Acquire and fn both
-// observe the Group's ctx (cancelled on first error from any
-// sibling), so first-error semantics propagate uniformly
-// regardless of which ctx the caller passes here. Callers
-// inside a worker's fn should pass that fn's incoming ctx
-// (which carries the marker) so reentrancy panics fire; new
-// submissions from an unrelated goroutine can pass any ctx
-// (typically the group ctx returned from WithContext).
+// ctx is used only for the marker check; the slot wait and fn
+// observe Group's ctx. Pass the worker's incoming ctx from
+// inside fn so reentrancy panics fire; pass any ctx (typically
+// the WithContext-returned gctx) from outside.
 func (g *Group) Submit(
 	ctx context.Context,
 	fn func(ctx context.Context) error,
 ) {
 	if ctx != nil && ctx.Value(markerKey{g.pool}) != nil {
 		panic("s3pgstore/pool: nested submission to same pool from " +
-			"inside a worker would deadlock — use a different pool " +
-			"or spawn a fresh goroutine for nested work")
+			"inside a worker may deadlock under saturation — use a " +
+			"different pool or spawn a fresh goroutine for nested work")
 	}
 	start := time.Now()
 	select {
@@ -215,27 +172,21 @@ func (g *Group) Submit(
 		// Wait surfaces the cause.
 		return
 	}
-	g.pool.waitDur.Record(g.ctx, time.Since(start).Seconds())
-	g.pool.inFlight.Add(g.ctx, 1)
+	g.pool.metrics.recordWait(g.ctx, time.Since(start))
+	g.pool.metrics.addInFlight(g.ctx, 1)
 	g.eg.Go(func() (err error) {
 		defer func() {
-			g.pool.inFlight.Add(g.ctx, -1)
-			<-g.pool.slots
-		}()
-		defer func() {
 			if p := recover(); p != nil {
-				stack := debug.Stack()
 				slog.Warn("s3pgstore/pool: worker panic recovered",
 					"panic", fmt.Sprint(p),
-					"stack", string(stack))
+					"stack", string(debug.Stack()))
 				err = fmt.Errorf("pool worker panicked: %v", p)
 			}
+			g.pool.metrics.addInFlight(g.ctx, -1)
+			<-g.pool.slots
 		}()
-		// Inject the per-pool marker so a nested Submit on the
-		// same pool from inside fn panics with a clear message
-		// rather than wedging the pool.
-		markedCtx := context.WithValue(
-			g.ctx, markerKey{g.pool}, true)
+		// Inject reentrancy marker.
+		markedCtx := context.WithValue(g.ctx, markerKey{g.pool}, true)
 		return fn(markedCtx)
 	})
 }
@@ -251,15 +202,7 @@ func (g *Group) Submit(
 //   - nil if all tasks succeeded and the parent ctx is healthy.
 func (g *Group) Wait() error {
 	err := g.eg.Wait()
-	if err == nil {
-		return g.parentCtx.Err()
-	}
-	// Filter out context.Canceled — that's the cancel signal
-	// propagating from a sibling's real error, not the root
-	// cause. The first real error is what errgroup returns;
-	// the .Canceled filter handles the rare case where
-	// cancellation arrived before the real error.
-	if errors.Is(err, context.Canceled) {
+	if err == nil || errors.Is(err, context.Canceled) {
 		if perr := g.parentCtx.Err(); perr != nil {
 			return perr
 		}

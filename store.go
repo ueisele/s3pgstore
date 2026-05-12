@@ -40,25 +40,20 @@ const OffsetNone Offset = 0
 // value the sequencer ever assigns. Pass it as Poll's `since`
 // argument to drain from the very beginning of the feed:
 //
+//	tip, err := store.OffsetLatest(ctx)
+//	if err != nil { return err }
 //	for fr, err := range store.PollRecordsIter(ctx,
-//	    s3pgstore.OffsetEarliest, s3pgstore.OffsetLatest) { … }
+//	    s3pgstore.OffsetEarliest, tip) { … }
 //
 // Equivalent to passing 0 (since `feed_seq >= 0` and
 // `feed_seq >= 1` return the same rows when the sequencer
 // starts at 1), but reads more honestly at the call site.
-const OffsetEarliest Offset = 1
-
-// OffsetLatest is the sentinel passed as Poll/PollRecords/
-// PollRecordsIter's `until` argument to mean "no upper bound,
-// walk to whatever's currently in the catalog." Internally the
-// SQL upper-bound clause is omitted; the read sees every row
-// whose tx committed at or before the SELECT statement's
-// snapshot, then stops (no live tail).
 //
-// The negative value avoids collision with OffsetNone (0) and
-// with any live offset (the sequencer assigns positive values
-// starting at OffsetEarliest).
-const OffsetLatest Offset = -1
+// For bounded reads users typically pair OffsetEarliest with the
+// dynamic tip returned by Store.OffsetLatest; for unbounded
+// follow there's no upper-bound parameter at all (TailRecordsIter
+// / TailIter take only `since`).
+const OffsetEarliest Offset = 1
 
 // FileRef is a reference to a single file in the catalog. It
 // carries enough metadata to identify the file (FileID), locate

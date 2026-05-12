@@ -106,6 +106,54 @@ func TestWithTailIdleBackoff_StoresValues(t *testing.T) {
 	}
 }
 
+// TestWithPollPageSize_StoresValue verifies the option lands the
+// supplied value on pollOpts.pollPageSize verbatim. PollIter /
+// TailIter then read the field and fall back to the default
+// when it's <= 0.
+func TestWithPollPageSize_StoresValue(t *testing.T) {
+	o := resolvePollOpts([]PollOption{WithPollPageSize(2500)})
+	if o.pollPageSize != 2500 {
+		t.Errorf("pollPageSize: got %d, want 2500", o.pollPageSize)
+	}
+}
+
+// TestWithPollPageSize_NonPositiveStoredAsIs verifies that a
+// non-positive value lands on the field unmodified. PollIter /
+// TailIter handle the default-fallback at use time, so the
+// option doesn't need to massage the value at construction.
+func TestWithPollPageSize_NonPositiveStoredAsIs(t *testing.T) {
+	for _, n := range []int{0, -1, -100} {
+		o := resolvePollOpts([]PollOption{WithPollPageSize(n)})
+		if o.pollPageSize != n {
+			t.Errorf("WithPollPageSize(%d): got pollPageSize=%d, want %d",
+				n, o.pollPageSize, n)
+		}
+	}
+}
+
+// TestBridgeBufferSize_DefaultFromFetchAhead verifies the buffer
+// sizing logic: when WithFetchAheadFiles isn't supplied, the
+// buffer falls back to 2 × defaultWorkerPoolSize.
+func TestBridgeBufferSize_DefaultFromFetchAhead(t *testing.T) {
+	o := pollOpts{}
+	got := bridgeBufferSize(&o)
+	if got != 2*defaultWorkerPoolSize {
+		t.Errorf("bridgeBufferSize default: got %d, want %d",
+			got, 2*defaultWorkerPoolSize)
+	}
+}
+
+// TestBridgeBufferSize_HonorsExplicitFetchAhead verifies that an
+// explicit WithFetchAheadFiles value drives the buffer size.
+func TestBridgeBufferSize_HonorsExplicitFetchAhead(t *testing.T) {
+	o := pollOpts{fetchAheadFiles: 16}
+	got := bridgeBufferSize(&o)
+	if got != 32 {
+		t.Errorf("bridgeBufferSize with fetchAheadFiles=16: "+
+			"got %d, want 32", got)
+	}
+}
+
 // TestDeadlockObserver_OccupancyZeroSuppresses verifies the
 // watchdog stays quiet during idle periods even when
 // lastProgressNs is older than the threshold — required so

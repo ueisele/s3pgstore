@@ -83,9 +83,6 @@ func TestMetrics_NilReceiverHelpersSafe(t *testing.T) {
 	m.recordIterByteBudgetWait(ctx, time.Millisecond)
 	m.recordIterDecodeDuration(ctx, time.Millisecond)
 	m.recordIterStall(ctx, "ReadIter")
-	if obs := m.fanOutObserverFor("X"); obs != nil {
-		t.Fatalf("nil receiver should produce nil observer")
-	}
 }
 
 // TestMetrics_RecordedInstruments verifies every registered
@@ -124,9 +121,6 @@ func TestMetrics_RecordedInstruments(t *testing.T) {
 	m.recordOCCConflict(ctx)
 	m.recordLookupByToken(ctx, true)
 	m.recordLookupByToken(ctx, false)
-	if obs := m.fanOutObserverFor("Write"); obs != nil {
-		obs(ctx, 5)
-	}
 	// (s3.* metrics live in s3client now — covered by
 	// s3client/metrics_test.go.)
 
@@ -150,8 +144,6 @@ func TestMetrics_RecordedInstruments(t *testing.T) {
 		"s3pgstore.write.records",
 		"s3pgstore.write.encode_buf_dropped",
 		"s3pgstore.write.token_race.retry.count",
-		"s3pgstore.fanout.partitions",
-		"s3pgstore.fanout.items",
 		"s3pgstore.occ.version_conflict.count",
 		"s3pgstore.lookup_by_token.count",
 		"s3pgstore.poll.lag",

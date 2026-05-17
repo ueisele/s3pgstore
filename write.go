@@ -62,19 +62,21 @@ func (s *Store[T]) Write(
 	// order regardless of completion order. Concurrency caps at
 	// the pool's MaxConcurrent slot count.
 	//
-	// Partial-failure semantics: on first error fanOutPool cancels
-	// in-flight siblings, but partitions whose catalog tx already
-	// committed before cancel reaches them stay committed. The
-	// returned slice has length len(keys); failed partitions
-	// carry the zero FileRef (FileID == 0). Callers that
-	// retry should rely on WithIdempotencyToken — the
+	// Partial-failure semantics: g.Wait() blocks until every
+	// submitted task returns — Write never bails out early. On the
+	// first non-nil error the group ctx is cancelled, so siblings
+	// that observe ctx return ctx.Err(); siblings already mid-commit
+	// or mid-S3-PUT run to completion. The returned slice has
+	// length len(keys); slots for failed or ctx-cancelled partitions
+	// carry the zero FileRef (FileID == 0), and slots for partitions
+	// that committed before cancel arrived carry their real FileRef.
+	// Callers that retry should rely on WithIdempotencyToken — the
 	// partial-UNIQUE short-circuit collapses retries to the
-	// canonical row regardless of which partitions committed
-	// first.
+	// canonical row regardless of which partitions committed first.
 	out = make([]FileRef, len(keys))
-	if err := fanOutPool(ctx, s.resolved.WorkerPool, keys,
-		s.metrics.fanOutObserverFor("Write"),
-		func(ctx context.Context, i int, key string) error {
+	g, gctx := s.resolved.WorkerPool.WithContext(ctx)
+	for i, key := range keys {
+		g.Submit(gctx, func(ctx context.Context) error {
 			res, err := s.writePartition(ctx, key,
 				keyValues[key], groups[key], o)
 			if err != nil {
@@ -82,8 +84,9 @@ func (s *Store[T]) Write(
 			}
 			out[i] = res
 			return nil
-		},
-	); err != nil {
+		})
+	}
+	if err := g.Wait(); err != nil {
 		return out, err
 	}
 	return out, nil

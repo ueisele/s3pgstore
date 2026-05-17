@@ -235,45 +235,12 @@
       "type": "timeseries"
     },
 
-    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 57}, "id": 500, "panels": [], "title": "Fan-out shape", "type": "row"},
-    {
-      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "description": "Partitions per multi-partition Write call. Capacity planning — are users hitting the library with 10 partitions per call or 1000?",
-      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "short"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 59},
-      "id": 501,
-      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
-      "targets": [
-        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.50, sum by (le, method) (rate(s3pgstore_fanout_partitions_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P50 {{method}}", "interval": "1m", "refId": "A"},
-        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.95, sum by (le, method) (rate(s3pgstore_fanout_partitions_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P95 {{method}}", "interval": "1m", "refId": "B"},
-        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.99, sum by (le, method) (rate(s3pgstore_fanout_partitions_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P99 {{method}}", "interval": "1m", "refId": "C"},
-        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(1.0, sum by (le, method) (rate(s3pgstore_fanout_partitions_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P100 {{method}}", "interval": "1m", "refId": "D"}
-      ],
-      "title": "Fanout partitions per call (P50/P95/P99/P100)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
-      "description": "Items dispatched per fan-out call: Write = partitions, PollRecords = entries.",
-      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "short"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 59},
-      "id": 502,
-      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
-      "targets": [
-        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.95, sum by (le, method) (rate(s3pgstore_fanout_items_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P95 {{method}}", "interval": "1m", "refId": "A"},
-        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(0.99, sum by (le, method) (rate(s3pgstore_fanout_items_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P99 {{method}}", "interval": "1m", "refId": "B"},
-        {"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "histogram_quantile(1.0, sum by (le, method) (rate(s3pgstore_fanout_items_bucket{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval])))", "legendFormat": "P100 {{method}}", "interval": "1m", "refId": "C"}
-      ],
-      "title": "Fanout items per call (P95/P99/P100)",
-      "type": "timeseries"
-    },
-
-    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 67}, "id": 600, "panels": [], "title": "Sequencer & feed", "type": "row"},
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 57}, "id": 600, "panels": [], "title": "Sequencer & feed", "type": "row"},
     {
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "description": "End-to-end stream lag: now() − latest feed_seq_at. Sustained non-zero = sequencer not keeping up with write rate. Headline metric for stream consumers.",
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "s"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 68},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 58},
       "id": 601,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
       "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "max (s3pgstore_poll_lag_seconds{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"})", "legendFormat": "lag", "refId": "A"}],
@@ -284,7 +251,7 @@
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "description": "Sequencer pending backlog: count of files with feed_seq IS NULL waiting for assignment. Sustained growth = sequencer falling behind. Reported by the sequencer process.",
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "short"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 68},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 58},
       "id": 602,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
       "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "max (s3pgstore_sequencer_unsequenced{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\"})", "legendFormat": "unsequenced", "refId": "A"}],
@@ -295,7 +262,7 @@
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "description": "Sequencer assignment rate. Heartbeat: a flat-zero rate under sustained writes means the sequencer is alive but not making progress — investigate immediately.",
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "rps"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 68},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 58},
       "id": 603,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
       "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum (rate(s3pgstore_sequencer_assigned_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\"}[$__rate_interval]))", "legendFormat": "assigned/s", "interval": "1m", "refId": "A"}],
@@ -306,7 +273,7 @@
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "description": "Time spent acquiring the sequencer's pg_advisory_xact_lock before the assignment statement runs. Non-zero P95 = a duplicate sequencer is racing or another tx holds the same key.",
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "s"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 76},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 66},
       "id": 604,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
       "targets": [
@@ -318,12 +285,12 @@
       "type": "timeseries"
     },
 
-    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 84}, "id": 700, "panels": [], "title": "Catalog & locking", "type": "row"},
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 74}, "id": 700, "panels": [], "title": "Catalog & locking", "type": "row"},
     {
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "description": "LookupByToken outcome breakdown: hit = caller's idempotency token already had a canonical row; miss = new write. The hit-rate baseline tells you whether your idempotency tokens are doing useful dedup work.",
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "ops"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 85},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 75},
       "id": 701,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
       "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum by (result) (rate(s3pgstore_lookup_by_token_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval]))", "legendFormat": "{{result}}", "interval": "1m", "refId": "A"}],
@@ -334,7 +301,7 @@
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "description": "Current count of s3pgstore_pending_writes rows. Sustained growth = orphan creation outpacing GC reclaim — write-side bug or stuck GC. Pair with the gc.reclaimed counter (next row).",
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 100}, {"color": "red", "value": 1000}]}, "unit": "short"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 85},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 75},
       "id": 702,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
       "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "max (s3pgstore_pending_writes_depth{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"})", "legendFormat": "depth", "refId": "A"}],
@@ -342,12 +309,12 @@
       "type": "timeseries"
     },
 
-    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 93}, "id": 800, "panels": [], "title": "GC", "type": "row"},
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 83}, "id": 800, "panels": [], "title": "GC", "type": "row"},
     {
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "description": "Orphan rows reclaimed by the gc binary across every RunOnce call (S3 DELETE + catalog DELETE pair). Flat at zero with sustained pending_writes.depth growth = GC is not making progress.",
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "rps"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 94},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 84},
       "id": 801,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
       "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum (rate(s3pgstore_gc_reclaimed_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\"}[$__rate_interval]))", "legendFormat": "reclaimed/s", "interval": "1m", "refId": "A"}],
@@ -355,12 +322,12 @@
       "type": "timeseries"
     },
 
-    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 102}, "id": 900, "panels": [], "title": "Iter pipeline (ReadIter / ReadPartitionIter / ReadRangeIter / ReadPartitionRangeIter / ReadEntriesIter / ReadPartitionEntriesIter)", "type": "row"},
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 92}, "id": 900, "panels": [], "title": "Iter pipeline (ReadIter / ReadPartitionIter / ReadRangeIter / ReadPartitionRangeIter / ReadEntriesIter / ReadPartitionEntriesIter)", "type": "row"},
     {
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "description": "Time downloaders spent blocked acquiring a body-slot in the iter pipeline (recorded only when a wait actually occurred AND the acquire eventually succeeded). Sustained non-zero P95 = the consumer's per-record yield work is the bottleneck — bump WithReadAheadPartitions, raise Config.S3MaxConcurrentOpsPerMethod, or move heavy yield-side processing off the iter goroutine.",
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "s"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 103},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 93},
       "id": 901,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
       "targets": [
@@ -375,7 +342,7 @@
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "description": "Times the iter pipeline's body-slot pool was full and a downloader had to wait. Pair with the wait-duration panel — high rate + non-zero P95 latency confirms saturation is real.",
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.001}, {"color": "red", "value": 0.1}]}, "unit": "ops"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 103},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 93},
       "id": 902,
       "options": {"colorMode": "background", "graphMode": "area"},
       "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum (rate(s3pgstore_read_iter_body_slot_exhausted_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval]))", "interval": "1m", "refId": "A"}],
@@ -386,7 +353,7 @@
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "description": "Time the decoder spent blocked reserving uncompressed bytes against WithReadAheadBytes (recorded only when a wait actually occurred AND the reservation succeeded). Non-zero P95 = the byte cap is binding before partition cap; either the workload is skewed-large or the cap is undersized.",
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "s"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 111},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 101},
       "id": 903,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
       "targets": [
@@ -401,7 +368,7 @@
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "description": "Times the iter pipeline's byte budget was full and the decoder had to wait. WithReadAheadBytes is binding — bump it or raise WithReadAheadPartitions.",
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.001}, {"color": "red", "value": 0.1}]}, "unit": "ops"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 111},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 101},
       "id": 904,
       "options": {"colorMode": "background", "graphMode": "area"},
       "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum (rate(s3pgstore_read_iter_byte_budget_exhausted_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval]))", "interval": "1m", "refId": "A"}],
@@ -412,7 +379,7 @@
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "description": "Wall-clock parquet decode time per partition (excludes byte-budget wait and download time). Flat ~ms = healthy; tail growth indicates large partitions or CPU-bound decode contention.",
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "s"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 119},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 109},
       "id": 905,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
       "targets": [
@@ -427,7 +394,7 @@
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "description": "Pipeline made no forward progress (markComplete or slot release) within the watchdog window. Pure observer — does NOT cancel. Non-zero rate indicates a deadlock (library bug — open an issue) or a slow consumer (heavy yield-side processing). Aggregated across all entry-point methods; drill down by `method` label in Explore.",
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.001}, {"color": "red", "value": 0.1}]}, "unit": "ops"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 119},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 109},
       "id": 906,
       "options": {"colorMode": "background", "graphMode": "area"},
       "targets": [{"datasource": {"type": "prometheus", "uid": "${datasource_metrics}"}, "expr": "sum (rate(s3pgstore_read_iter_stall_count_total{cluster=~\"$cluster\", stage=~\"$stage\", k8s_namespace_name=~\"$namespace\", s3pgstore_bucket=~\"$bucket\", s3pgstore_prefix=~\"$prefix\"}[$__rate_interval]))", "interval": "1m", "refId": "A"}],
@@ -435,12 +402,12 @@
       "type": "stat"
     },
 
-    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 127}, "id": 1000, "panels": [], "title": "Shared I/O worker pool (Config.WorkerPool — multi-Store deployments)", "type": "row"},
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 117}, "id": 1000, "panels": [], "title": "Shared I/O worker pool (Config.WorkerPool — multi-Store deployments)", "type": "row"},
     {
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "description": "Tasks currently executing on the shared pool. Approaches MaxConcurrent under saturation; sustained at MaxConcurrent means submitters are queueing on Acquire (see queue.wait.duration). Process-wide metric — no bucket/prefix filter, the pool is shared across Stores by construction.",
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "none"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 128},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 118},
       "id": 1001,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
       "targets": [
@@ -453,7 +420,7 @@
       "datasource": {"type": "prometheus", "uid": "${datasource_metrics}"},
       "description": "Time submitters spent waiting for a pool slot to free up. Sustained non-zero P95 = the pool is the bottleneck; raise pool.New(maxConcurrent), reduce concurrent callers, or make per-task work faster. Process-wide metric — no bucket/prefix filter.",
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "s"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 128},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 118},
       "id": 1002,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
       "targets": [

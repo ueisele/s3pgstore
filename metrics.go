@@ -43,8 +43,8 @@ const (
 )
 
 // Attribute keys for library-internal instrumentation
-// (method.*, write.*, fanout.*, lookup.*, iter.*). The s3client
-// package owns its own attribute keys for the s3.* surface.
+// (method.*, write.*, lookup.*, iter.*). The s3client package
+// owns its own attribute keys for the s3.* surface.
 const (
 	attrKeyMethod  = "method"
 	attrKeyOutcome = "outcome"
@@ -91,10 +91,6 @@ type metrics struct {
 	writeRecords          metric.Int64Histogram
 	writeEncodeBufDropped metric.Int64Counter
 	writeTokenRaceRetry   metric.Int64Counter
-
-	// Fan-out shape (Write multi-partition, PollRecords).
-	fanoutPartitions metric.Int64Histogram
-	fanoutItems      metric.Int64Histogram
 
 	// Catalog / locking.
 	occVersionConflict metric.Int64Counter
@@ -165,18 +161,6 @@ func newMetrics(cfg metricsConfig) (*metrics, error) {
 		1, 10, 25, 50, 100, 250, 500, 1000,
 		2500, 10000, 50000, 250000, 1000000,
 	}
-	// fanoutItemBuckets covers per-fan-out item counts: typical
-	// Write touches 1-50 partitions; PollRecords typically fans
-	// out to the page size (1-1000 entries).
-	fanoutItemBuckets := []float64{
-		1, 2, 5, 10, 25, 50, 100, 250, 1000, 5000,
-	}
-	// fanoutPartitionBuckets covers per-Write partition fan-out
-	// width (almost always 1-50; tail to 1000+ for bulk imports).
-	fanoutPartitionBuckets := []float64{
-		1, 2, 4, 8, 16, 32, 64, 128, 512, 4096,
-	}
-
 	mustHist := func(
 		name, desc, unit string,
 		buckets ...float64,
@@ -270,21 +254,6 @@ func newMetrics(cfg metricsConfig) (*metrics, error) {
 	// inside s3client.WithDefaults from the caller's Meter. The
 	// library metrics struct deliberately owns nothing under the
 	// s3.* namespace.
-
-	if m.fanoutPartitions, err = mustHistInt(
-		"s3pgstore.fanout.partitions",
-		"Partition count per fan-out call, labeled by method "+
-			"(currently Write).",
-		"{partition}", fanoutPartitionBuckets...); err != nil {
-		return nil, err
-	}
-	if m.fanoutItems, err = mustHistInt(
-		"s3pgstore.fanout.items",
-		"Items dispatched per fan-out call, labeled by method "+
-			"(Write — partitions; PollRecords — entries).",
-		"{item}", fanoutItemBuckets...); err != nil {
-		return nil, err
-	}
 
 	if m.occVersionConflict, err = mustCounter(
 		"s3pgstore.occ.version_conflict.count",
@@ -566,21 +535,6 @@ func (m *metrics) recordLookupByToken(
 	}
 	m.lookupByToken.Add(ctx, 1, metric.WithAttributes(
 		attribute.String(attrKeyResult, result)))
-}
-
-// fanOutObserverFor returns a fanOutObserver that records
-// fanout.partitions / fanout.items for the named method. Wired
-// at the call site (Write fan-out, PollRecords fan-out).
-func (m *metrics) fanOutObserverFor(method string) fanOutObserver {
-	if m == nil {
-		return nil
-	}
-	return func(ctx context.Context, items int) {
-		attrs := metric.WithAttributes(
-			attribute.String(attrKeyMethod, method))
-		m.fanoutItems.Record(ctx, int64(items), attrs)
-		m.fanoutPartitions.Record(ctx, int64(items), attrs)
-	}
 }
 
 // recordIterBodySlotWait reports one acquireBodySlot call that

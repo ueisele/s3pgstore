@@ -14,8 +14,7 @@ package s3pgstore
 //      OffsetAt)
 //   2. Per-call defaulters (pollIterDefaults, pollCollectDefaults,
 //      tailIntervals)
-//   3. Source adapters (bridgeBufferSize, sliceToChan, seq2ToChan,
-//      isCtxErr)
+//   3. Source adapters (bridgeBufferSize, sliceToChan, seq2ToChan)
 //   4. Emit callbacks (pollIterEmit, pollCollectEmit)
 //   5. Pipeline orchestration (pollFetchAndDecodeIter)
 //   6. State types (fileState, pollState, pollWorker) + state
@@ -754,28 +753,6 @@ func recoverInto(state *pollState, name string) {
 	if r := recover(); r != nil {
 		state.recordHardErr(fmt.Errorf("%s panic: %v\n%s", name, r, debug.Stack()))
 	}
-}
-
-// isCtxErr reports whether err is (or wraps) a context
-// cancellation or deadline. Used uniformly at every error-
-// surfacing decision in the poll pipeline:
-//
-//   - At recordHardErr call sites (decoder closure, fetcher pool
-//     task): skip the call when err is ctx-derived. recordHardErr
-//     is first-cancel-wins, so the call would be a no-op when ctx
-//     is already cancelled, but the explicit filter expresses
-//     intent ("ctx cancellation isn't a hard pipeline error").
-//   - At iter wrapper yield sites (bridge defer, pipeline call):
-//     suppress the yield. Ctx cancellation is the iter consumer's
-//     stop signal, not an error value worth surfacing through
-//     range-over-iter.
-//
-// PollRecords (collect mode) deliberately does NOT use this
-// filter on its pipeline-return path — it surfaces ctx errors
-// directly, matching Go's sync-API convention.
-func isCtxErr(err error) bool {
-	return errors.Is(err, context.Canceled) ||
-		errors.Is(err, context.DeadlineExceeded)
 }
 
 // pollIterEmit returns the per-batch emit callback that yields

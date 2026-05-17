@@ -52,20 +52,25 @@ package s3pgstore
 //     calls + in_flight; the iter saturation metrics
 //     (body_slot, byte_budget, decode_duration, stall.count)
 //     cover the operationally interesting iter signal.
+//   - The parquet-footer parse for byte-budget sizing. The
+//     catalog carries UncompressedSize and RecordCount on every
+//     FileRef (written at Write time as the column-chunk
+//     TotalUncompressedSize sum and the parquet row count); the
+//     read pipeline sums those via fileRefStats instead of
+//     re-opening every parquet footer. Identical values, no
+//     extra metadata I/O. Mirrors poll.go's catalog-only sizing.
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"iter"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/parquet-go/parquet-go"
 
 	"github.com/ueisele/s3pgstore/pool"
 )
@@ -571,7 +576,7 @@ func (s *Store[T]) validateFileRefs(entries []FileRef) error {
 	return nil
 }
 
-// recordEmit returns the per-batch emit callback that flattens
+// recordEmit returns the per-partition emit callback that flattens
 // each partition's already-dedup'd records into the consumer's
 // iter.Seq2[T, error] yield. Used by ReadIter / ReadRangeIter /
 // ReadFileRefsIter — paths that surface records one at a time.
@@ -582,14 +587,14 @@ func (s *Store[T]) validateFileRefs(entries []FileRef) error {
 // classification.
 func (s *Store[T]) recordEmit(
 	yield func(T, error) bool, iterErr *error,
-) func(decodedBatch[T]) bool {
-	return func(b decodedBatch[T]) bool {
-		if b.err != nil {
-			*iterErr = b.err
-			yield(*new(T), b.err)
+) func(PartitionResult[T], error) bool {
+	return func(part PartitionResult[T], err error) bool {
+		if err != nil {
+			*iterErr = err
+			yield(*new(T), err)
 			return false
 		}
-		for _, r := range b.records {
+		for _, r := range part.Records {
 			if !yield(r, nil) {
 				return false
 			}
@@ -598,8 +603,8 @@ func (s *Store[T]) recordEmit(
 	}
 }
 
-// partitionEmit returns the per-batch emit callback that yields
-// one PartitionResult[T] per partition. Used by
+// partitionEmit returns the per-partition emit callback that
+// yields one PartitionResult[T] per partition. Used by
 // ReadPartitionIter / ReadPartitionRangeIter /
 // ReadPartitionFileRefsIter — paths that surface records grouped
 // by partition.
@@ -609,59 +614,49 @@ func (s *Store[T]) recordEmit(
 // loop terminates.
 func (s *Store[T]) partitionEmit(
 	yield func(PartitionResult[T], error) bool, iterErr *error,
-) func(decodedBatch[T]) bool {
-	return func(b decodedBatch[T]) bool {
-		if b.err != nil {
-			*iterErr = b.err
-			yield(PartitionResult[T]{}, b.err)
+) func(PartitionResult[T], error) bool {
+	return func(part PartitionResult[T], err error) bool {
+		if err != nil {
+			*iterErr = err
+			yield(PartitionResult[T]{}, err)
 			return false
 		}
-		return yield(PartitionResult[T]{
-			PartitionKey: b.partitionKey,
-			Records:      b.records,
-			Version:      b.version,
-			FileRefs:     b.files,
-		}, nil)
+		return yield(part, nil)
 	}
 }
 
-// recordCollectEmit returns the per-batch emit callback that
+// recordCollectEmit returns the per-partition emit callback that
 // appends each partition's records into the *out slice. Used by
 // Read — collects every record across every partition into one
 // flat result. On a hard pipeline error: sets *iterErr and
 // returns false to terminate the emit loop.
 func recordCollectEmit[T any](
 	out *[]T, iterErr *error,
-) func(decodedBatch[T]) bool {
-	return func(b decodedBatch[T]) bool {
-		if b.err != nil {
-			*iterErr = b.err
+) func(PartitionResult[T], error) bool {
+	return func(part PartitionResult[T], err error) bool {
+		if err != nil {
+			*iterErr = err
 			return false
 		}
-		*out = append(*out, b.records...)
+		*out = append(*out, part.Records...)
 		return true
 	}
 }
 
-// partitionCollectEmit returns the per-batch emit callback that
+// partitionCollectEmit returns the per-partition emit callback that
 // appends each PartitionResult into the *out slice. Used by
 // ReadPartition — preserves per-partition Version and
 // FileRefs alongside records. On a hard pipeline error:
 // sets *iterErr and returns false.
 func partitionCollectEmit[T any](
 	out *[]PartitionResult[T], iterErr *error,
-) func(decodedBatch[T]) bool {
-	return func(b decodedBatch[T]) bool {
-		if b.err != nil {
-			*iterErr = b.err
+) func(PartitionResult[T], error) bool {
+	return func(part PartitionResult[T], err error) bool {
+		if err != nil {
+			*iterErr = err
 			return false
 		}
-		*out = append(*out, PartitionResult[T]{
-			PartitionKey: b.partitionKey,
-			Records:      b.records,
-			Version:      b.version,
-			FileRefs:     b.files,
-		})
+		*out = append(*out, part)
 		return true
 	}
 }
@@ -682,35 +677,49 @@ func partitionCollectEmit[T any](
 //     not partition-bound, so partition P+1's downloads can run
 //     in parallel with partition P being yielded.
 //
-//  2. Decoder goroutine: walks partitions in order; for each,
-//     waits until all its files are downloaded, parses each
-//     parquet footer to compute the partition's exact
-//     uncompressed total, gates on (DecodeAheadPartitions,
-//     DecodeAheadBytes), decodes records, sort+dedup's them
-//     in-place, and pushes a decodedBatch to the emitter.
+//  2. Decode workers (W goroutines): each handles partitions
+//     where pi % W == workerIdx; for each, waits until all its
+//     files are downloaded, gates on (DecodeAheadPartitions,
+//     DecodeAheadBytes) using the catalog's UncompressedSize
+//     and RecordCount (no parquet-footer parse), decodes records,
+//     sort+dedup's them in-place, and pushes a PartitionResult[T]
+//     to its queue.
 //
 //  3. Emit loop (this goroutine): pulls decoded partitions in
-//     order, hands each to emitOne (record-by-record yield or
-//     PartitionResult yield), and frees the partition's
-//     reserved bytes on completion so the decoder can proceed.
+//     lex order from workers[pi % W].queue, sums the partition's
+//     FileRefs to determine how many uncompressed bytes to
+//     release, hands the partition to emitOne (record-by-record
+//     yield or PartitionResult yield), then releases that
+//     worker's byte budget so it can claim its next partition.
 //
-// On a hard pipeline error, decoder sends decodedBatch{err:err}
-// and the emit callback receives a non-nil err — it should
-// yield the error to the consumer, set iterErr, and return
-// false. On success, emit returns true to keep going.
+// Success vs. error path: the queue payload is plain
+// PartitionResult[T] — success batches only. Hard errors do not
+// flow through the queue; they're recorded via
+// state.recordHardErr (which cancels state.ctx with the cause)
+// and surfaced to the consumer by the emit loop's ctx.Done
+// branch, which calls emitOne(zero, context.Cause(state.ctx)).
+// This keeps readFetchAndDecodeIter itself returnless and
+// matches the read-iter convention of routing all errors through
+// the callback.
 //
 // Pool-worker shape: the submitted task does only the S3 GET
 // and a markComplete / state.slots.release / recordHardErr
 // update. It never blocks on per-call coordination — body-slot
 // acquire is on the fetcher, decoder back-pressure is in the
-// (non-pool) decoder goroutine. This satisfies the shared-pool
+// (non-pool) decode workers. This satisfies the shared-pool
 // rule that pool tasks must always make progress, so a slow
 // consumer of one ReadIter cannot starve unrelated Stores
 // sharing the pool.
+//
+// Panic safety: decode workers wrap in recoverReadInto and the
+// per-file S3 GET task uses a named-return cleanup defer that
+// converts a panicking GET into a recorded hard error. Both
+// flows funnel into state.recordHardErr, so a panic is observed
+// by the emit loop the same way any other failure would be.
 func (s *Store[T]) readFetchAndDecodeIter(
 	ctx context.Context, method string, entries []FileRef,
 	opts *readOpts, applyDefaults func(*readOpts, int),
-	emitOne func(decodedBatch[T]) bool,
+	emitOne func(PartitionResult[T], error) bool,
 ) {
 	if len(entries) == 0 {
 		return
@@ -727,13 +736,19 @@ func (s *Store[T]) readFetchAndDecodeIter(
 	// only fills fields the user left unset.
 	applyDefaults(opts, len(parts))
 
-	// Universal clamp: surplus workers (W > len(parts)) would
-	// spawn only to exit immediately because their loop's
+	// Universal clamp: bound decodeWorkers to [1, len(parts)].
+	// Lower bound defends against a defaulter / user value of 0
+	// or negative (defaulters guarantee >= 1, but caller-supplied
+	// options can pass 0 even though WithDecodeWorkers floors at
+	// 1 — re-asserting here makes the contract local). Upper
+	// bound: surplus workers (W > len(parts)) would spawn only
+	// to exit immediately because their loop's
 	// `pi := workerIdx; pi < len(parts)` start is past the end.
-	// emit's `pi % W` over pi < len(parts) never indexes them, so
-	// this is purely allocation savings — same access pattern, no
-	// behavior change. Applied here (not in the defaulters) so it
-	// catches user-supplied W > len(parts) too.
+	// Applied after defaults so it catches user-supplied W >
+	// len(parts) too.
+	if opts.decodeWorkers < 1 {
+		opts.decodeWorkers = 1
+	}
 	if opts.decodeWorkers > len(parts) {
 		opts.decodeWorkers = len(parts)
 	}
@@ -787,17 +802,18 @@ func (s *Store[T]) readFetchAndDecodeIter(
 	// exiting so all in-flight pool tasks drain before
 	// readFetchAndDecodeIter returns.
 	//
-	// On any pool task error, the task fn calls recordHardErr
-	// (cancelling state.ctx with the wrapped err as cause)
-	// before markComplete. gctx is derived from state.ctx, so
-	// it auto-cancels too — fetcher sees gctx done in
-	// state.slots.acquire, sibling tasks observe gctx done in
+	// On any pool task error or panic, the task fn calls
+	// recordHardErr (cancelling state.ctx with the wrapped err
+	// as cause) before markComplete. gctx is derived from
+	// state.ctx, so it auto-cancels too — fetcher sees gctx done
+	// in state.slots.acquire, sibling tasks observe gctx done in
 	// s.target.get. Files past the fetcher's exit point are
 	// deliberately NOT markComplete'd; their partitions' done
 	// channels would block waitForPartition forever, except
 	// state.ctx is cancelled, so waitForPartition's ctx.Done
-	// branch fires and decode workers forward hardErr
-	// (= context.Cause(state.ctx)).
+	// branch fires and decode workers exit promptly (they pick
+	// up the cause via context.Cause and return; the emit loop
+	// observes the same cause via its ctx.Done branch).
 	//
 	// g.Wait's return is ignored — for any non-nil result
 	// state.ctx is already cancelled with the right cause (task
@@ -820,19 +836,24 @@ func (s *Store[T]) readFetchAndDecodeIter(
 	// to its own queue (cap = decodeAheadPartitions). Per-worker
 	// queues replace a shared decodedCh so workers don't compete
 	// on a single buffer; lex emit order is preserved by the
-	// emit loop reading queue[(pi mod W)] sequentially.
+	// emit loop reading queue[(pi mod W)] sequentially. Queue
+	// payload is PartitionResult[T] — success only; errors flow
+	// via state.recordHardErr + the emit loop's ctx.Done branch.
 	//
 	// applyDefaults + the clamp above guarantee
 	// decodeWorkers in [1, len(parts)] and
 	// decodeAheadPartitions != nil — no fallbacks needed here.
-	workers := make([]*workerState[decodedBatch[T]], opts.decodeWorkers)
+	workers := make([]*workerState[PartitionResult[T]], opts.decodeWorkers)
 	for w := range workers {
-		workers[w] = newWorkerState[decodedBatch[T]](*opts.decodeAheadPartitions, s.metrics)
+		workers[w] = newWorkerState[PartitionResult[T]](*opts.decodeAheadPartitions, s.metrics)
 	}
 	for w := range workers {
 		wg.Go(func() {
-			s.runDecodeWorker(state.ctx, state, workers[w],
-				w, opts.decodeWorkers, opts)
+			defer recoverReadInto(state, "read decoder")
+			if err := s.runDecodeWorker(state.ctx, state, workers[w],
+				w, opts.decodeWorkers, opts); err != nil && !isCtxErr(err) {
+				state.recordHardErr(err)
+			}
 		})
 	}
 
@@ -847,23 +868,33 @@ func (s *Store[T]) readFetchAndDecodeIter(
 	})
 
 	// Stage 3: emit loop. Walks partitions in lex order, reads
-	// each from its assigned worker's queue, hands the batch to
-	// the per-method emit callback, then releases that worker's
-	// byte budget so it can claim its next partition.
+	// each from its assigned worker's queue, computes the
+	// release amount from the partition's FileRefs BEFORE
+	// invoking emitOne (the callback exposes the result to user
+	// code, which could mutate part.FileRefs before returning;
+	// snapshotting the sum here keeps the byte-budget accounting
+	// honest), hands the partition to emitOne, then releases the
+	// worker's byte budget so it can claim its next partition.
+	//
+	// On state.ctx fire (parent cancel, fetcher hard error,
+	// decoder hard error, decoder panic) the ctx.Done branch
+	// hands the abort reason to emitOne(zero, cause) and returns.
+	// The queue payload itself never carries an error.
 	for pi := range state.parts {
 		// Surface emit position to the observer so a stalled
 		// pipeline's slog.Warn points at the right partition.
 		state.decoderPi.Store(int64(pi))
 		ws := workers[pi%opts.decodeWorkers]
-		var batch decodedBatch[T]
+		var part PartitionResult[T]
 		select {
-		case batch = <-ws.queue:
+		case part = <-ws.queue:
 		case <-state.ctx.Done():
-			emitOne(decodedBatch[T]{err: context.Cause(state.ctx)})
+			emitOne(PartitionResult[T]{}, context.Cause(state.ctx))
 			return
 		}
-		ok := emitOne(batch)
-		ws.releaseBytes(batch.uncompBytes)
+		uncomp, _ := fileRefStats(part.FileRefs)
+		ok := emitOne(part, nil)
+		ws.releaseBytes(uncomp)
 		if !ok {
 			return
 		}
@@ -1000,29 +1031,34 @@ type readState struct {
 
 // recordHardErr cancels state.ctx with cause = err. First call
 // sets the cause; subsequent calls are no-ops (cancel is
-// idempotent and only the first cause sticks). Called only
-// from the pool task error path with a non-nil wrapped err.
+// idempotent and only the first cause sticks). Called from the
+// pool task error/panic path and from the decode-worker wg.Go
+// wrapper on non-ctx returns, with a non-nil wrapped err.
 //
-// Cancel is immediate. Listeners on state.ctx (decoder,
-// watchdog, in-flight pool tasks via gctx, submitter via gctx)
-// observe ctx.Done as soon as the first hard err is recorded.
+// Cancel is immediate. Listeners on state.ctx (decoders, the
+// watchdog, in-flight pool tasks via gctx, the submitter via
+// gctx, and the emit loop) observe ctx.Done as soon as the
+// first hard err is recorded.
 //
 // This is load-bearing for partial-body protection: ordering
 // recordHardErr BEFORE markComplete in the pool task fn means
 // any observer that sees p.done close (markComplete's tail
 // effect) is guaranteed to subsequently observe state.ctx done
-// and read the cause via hardErr — no decoder can silently
-// emit a partition with mixed present/nil bodies.
+// and read the cause via context.Cause — no decoder can silently
+// emit a partition with mixed present/nil bodies. And because
+// errors flow exclusively through state.ctx (the per-worker
+// queue payload is PartitionResult[T], success-only), the emit
+// loop's ctx.Done branch is the single surface where consumers
+// see the abort reason.
 //
-// Trade-off: a decoder that's mid-decode of partition K-1
-// when recordHardErr fires for partition K may have its
-// sendBatch racing the cancel. If decodedCh is full (slow
-// consumer), K-1's batch may be dropped instead of emitted.
-// In practice decodedCh is usually drained promptly by the
-// emit loop, so K-1 lands. The trade is intentional —
-// surfacing the abort reason quickly and reliably is more
-// important than guaranteeing one extra batch on slow
-// consumers.
+// Trade-off: a decoder that's mid-decode of partition K-1 when
+// recordHardErr fires for partition K may have its sendBatch
+// racing the cancel. If the worker's queue is full (slow
+// consumer), K-1's batch may be dropped instead of emitted; in
+// practice the per-worker queue is drained promptly by the emit
+// loop so K-1 lands. The trade is intentional — surfacing the
+// abort reason quickly and reliably is more important than
+// guaranteeing one extra batch on slow consumers.
 func (s *readState) recordHardErr(err error) {
 	s.cancel(err)
 }
@@ -1109,6 +1145,28 @@ func (s *readState) waitForPartition(
 // pool's errgroup cancels gctx — sibling tasks observe ctx.Done
 // in s.target.get and bail.
 //
+// Panic safety: a panic inside s.target.get could leak the
+// body slot and leave the partition unmarked (waitForPartition
+// would block forever) and state.ctx uncancelled (consumer
+// would hang). The task uses a named-return cleanup defer that
+// converts panic + err into the same shape: release the slot,
+// record the cause on state.ctx (so the cleanup-cancel ordering
+// remains cause-before-done), then markComplete with a nil body
+// so the partition's done channel still closes. Mirrors
+// poll.go's runPollFetcher.
+//
+// Scope of the recover: the defer covers ONLY the body GET. It
+// assumes the post-GET library calls (state.markComplete) don't
+// themselves panic — markComplete is straight-line library code
+// with no allocation, no I/O, and a single guarded channel close.
+// If a future refactor relocates non-trivial logic into the post-
+// GET path of this task, that logic must either be panic-free or
+// the recover's cleanup needs to be made idempotent (the current
+// cleanup calls markComplete(pi, fi, nil), which would
+// double-write p.bodies[fi] and double-decrement the remaining
+// counter if markComplete had partially succeeded before
+// panicking).
+//
 // Body-slot leak on submit-skip is harmless. If gctx is
 // cancelled between state.slots.acquire and g.Submit, the task
 // fn never runs and the slot stays held — but state.slots is
@@ -1126,22 +1184,45 @@ func (s *Store[T]) runFetcher(
 				// task's recordHardErr — the failing task
 				// always cancels before returning to errgroup,
 				// so by the time gctx is done state.ctx is
-				// done too). The decoder will reach this
-				// partition's waitForPartition, observe ctx
-				// done, and forward hardErr — no need for us
-				// to markComplete or recordHardErr here.
+				// done too). Decode workers will observe ctx
+				// done in waitForPartition and exit; the emit
+				// loop surfaces the cause via its ctx.Done
+				// branch — no need for us to markComplete or
+				// recordHardErr here.
 				return
 			}
 			key := state.parts[pi].files[fi].S3Key
-			g.Submit(ctx, func(ctx context.Context) error {
+			g.Submit(ctx, func(ctx context.Context) (retErr error) {
+				// Unified cleanup for success, error, AND panic.
+				// recover() must be called directly in this
+				// deferred func — a helper can't substitute. On
+				// panic or err: release the slot, record the
+				// cause (skipping ctx-derived errors), then
+				// markComplete with a nil body so the partition's
+				// done channel still closes. Ordering matters:
+				// recordHardErr cancels state.ctx with the cause
+				// atomically with ctx.Done; markComplete's
+				// close(done) only happens after, so any decoder
+				// observing done close is guaranteed to see the
+				// cause on context.Cause(state.ctx). On success:
+				// no recover, no record; slot stays held (decoder
+				// releases after nil-out in decodePartition).
+				defer func() {
+					if r := recover(); r != nil {
+						retErr = fmt.Errorf("get %s panic: %v\n%s",
+							key, r, debug.Stack())
+					}
+					if retErr != nil {
+						state.slots.release()
+						if !isCtxErr(retErr) {
+							state.recordHardErr(retErr)
+						}
+						state.markComplete(pi, fi, nil)
+					}
+				}()
 				body, err := s.target.get(ctx, key)
 				if err != nil {
-					// No body materialised — return the slot.
-					state.slots.release()
-					wrapped := fmt.Errorf("get %s: %w", key, err)
-					state.recordHardErr(wrapped)
-					state.markComplete(pi, fi, nil)
-					return wrapped
+					return fmt.Errorf("get %s: %w", key, err)
 				}
 				// Slot stays held; decoder releases it when
 				// bodies are nil'd in decodePartition.
@@ -1154,15 +1235,30 @@ func (s *Store[T]) runFetcher(
 
 // runDecodeWorker handles partitions assigned to worker w via
 // round-robin: pi where pi % numWorkers == w. Each iteration
-// waits for downloads, parses the footer, reserves byte budget
-// against this worker's private cap, decodes, and publishes the
-// result to ws.queue. Emit drains ws.queue in lex pi order.
+// waits for downloads, reserves byte budget against this
+// worker's private cap (sized from the catalog's
+// UncompressedSize sum), decodes (with the decoded slice
+// pre-sized from the catalog's RecordCount sum), and publishes
+// the PartitionResult to ws.queue. Emit drains ws.queue in lex
+// pi order.
 //
-// On any error (download, footer, decode), the failing path
-// publishes a decodedBatch{err} to ws.queue so emit forwards the
-// cause to the consumer; the worker then exits without claiming
-// further partitions. ctx cancellation is observed at every
-// blocking site (waitForPartition, reserveBytes, queue send).
+// Returns:
+//   - nil on clean exit (all assigned partitions emitted, or
+//     ctx cancellation while emitting/sending).
+//   - A wrapped error on hard failure (reserve budget, decode).
+//     The wg.Go closure wrapping this function calls
+//     state.recordHardErr (filtered via isCtxErr) so the emit
+//     loop's ctx.Done branch surfaces the cause through
+//     emitOne(zero, cause). The queue itself only ever carries
+//     success batches.
+//
+// Why no error batches: readFetchAndDecodeIter never returns an
+// error — every error surfaces via the emit callback. Mixing
+// error batches into the queue would require both ctx.Done and
+// queue-side error checks at the emit loop, and would race
+// genuine success batches on multi-worker pipelines. Routing
+// errors exclusively through state.recordHardErr + ctx.Done
+// gives us one ordered source of truth.
 //
 // Error precedence: context.Cause(state.ctx) is the single
 // source of truth for hard download errors, and the
@@ -1172,36 +1268,32 @@ func (s *Store[T]) runFetcher(
 // extra pre/post checks around the wait.
 func (s *Store[T]) runDecodeWorker(
 	ctx context.Context, state *readState,
-	ws *workerState[decodedBatch[T]], workerIdx, numWorkers int, opts *readOpts,
-) {
+	ws *workerState[PartitionResult[T]],
+	workerIdx, numWorkers int, opts *readOpts,
+) error {
 	for pi := workerIdx; pi < len(state.parts); pi += numWorkers {
 		if err := state.waitForPartition(ctx, pi); err != nil {
-			sendBatch(ctx, ws.queue, decodedBatch[T]{err: err})
-			return
+			// Ctx-derived (parent cancel) or wrapped GET err
+			// already routed via state.ctx's cause — propagate.
+			return err
 		}
 		ps := state.parts[pi]
 
-		// Parse footers once: exact uncompressed total for the
-		// byte budget AND total row count for pre-allocating
-		// the decoded slice. Missing files (nil body) contribute
-		// zero — but in s3pgstore the strict-error policy means
-		// any nil body is paired with a non-nil hardErr, and
-		// waitForPartition would have returned non-nil above.
-		// Defensive nil-skip here is for the cancel path where
-		// the producer never reached some files.
-		uncomp, totalRows, err := footerStats(ps)
-		if err != nil {
-			sendBatch(ctx, ws.queue, decodedBatch[T]{err: err})
-			return
-		}
+		// Sum the catalog's per-file uncompressed bytes and
+		// record counts. UncompressedSize / RecordCount are
+		// stored at write time (sum of column-chunk
+		// TotalUncompressedSize / parquet row count) and are
+		// equal by spec to the corresponding row-group footer
+		// sums — same value the previous footer-parse used,
+		// without per-file parquet metadata I/O.
+		uncomp, totalRows := fileRefStats(ps.files)
 
 		// Gate on this worker's byte budget if configured. A
 		// single oversized partition still flows once the
 		// worker's buffer is empty — otherwise the worker would
 		// block on the cap with emit waiting for the result.
 		if err := ws.reserveBytes(ctx, uncomp, opts.decodeAheadBytes); err != nil {
-			sendBatch(ctx, ws.queue, decodedBatch[T]{err: err})
-			return
+			return err
 		}
 
 		decodeStart := time.Now()
@@ -1213,21 +1305,24 @@ func (s *Store[T]) runDecodeWorker(
 		// the partition level.
 		if err != nil {
 			ws.releaseBytes(uncomp)
-			sendBatch(ctx, ws.queue, decodedBatch[T]{err: err})
-			return
+			return err
 		}
 
-		if !sendBatch(ctx, ws.queue, decodedBatch[T]{
-			partitionKey: ps.partitionKey,
-			records:      recs,
-			version:      ps.version,
-			files:        ps.files,
-			uncompBytes:  uncomp,
+		if !sendBatch(ctx, ws.queue, PartitionResult[T]{
+			PartitionKey: ps.partitionKey,
+			Records:      recs,
+			Version:      ps.version,
+			FileRefs:     ps.files,
 		}) {
+			// Ctx cancelled mid-send; emit has already exited
+			// (or is about to). Release the reservation we just
+			// took and return without surfacing — the cancel
+			// cause flows through ctx, not through here.
 			ws.releaseBytes(uncomp)
-			return
+			return nil
 		}
 	}
+	return nil
 }
 
 // decodePartition parses every successfully-downloaded body in
@@ -1239,10 +1334,10 @@ func (s *Store[T]) runDecodeWorker(
 // compressed bytes for the full loop.
 //
 // The pre-dedup slice is pre-sized to totalRows (summed from
-// row-group metadata in footerStats) so growth-doubling doesn't
-// inflate the transient allocation peak. sortAndDedup compacts
-// in-place and returns out[:n] — same backing array, length
-// truncated to the survivor count.
+// the catalog's per-file RecordCount via fileRefStats) so
+// growth-doubling doesn't inflate the transient allocation peak.
+// sortAndDedup compacts in-place and returns out[:n] — same
+// backing array, length truncated to the survivor count.
 func (s *Store[T]) decodePartition(
 	state *readState, ps *partState, totalRows int64,
 	includeHistory bool,
@@ -1268,51 +1363,40 @@ func (s *Store[T]) decodePartition(
 		s.resolved.VersionOf, includeHistory), nil
 }
 
-// decodedBatch is one partition's decoded records (or a single
-// hard error) flowing from the decoder to the emit loop.
-//
-// partitionKey is the partition the records came from (carried
-// so partition-emitting public methods can surface it).
-// records is already sort+dedup'd by decodePartition.
-// version + files are populated at preparePartitions time
-// (catalog-derived, no parquet decode required).
-// uncompBytes is what the decoder reserved; the emit loop
-// returns it via releaseBytes after the records are forwarded.
-type decodedBatch[T any] struct {
-	partitionKey string
-	records      []T
-	version      int64
-	files        []FileRef
-	uncompBytes  int64
-	err          error
-}
-
-// footerStats opens each non-nil body via parquet-go's footer
-// parser and returns the partition's totals: uncompressed bytes
-// (per-row-group total_byte_size, which the parquet spec
-// defines as the total uncompressed size of all column data in
-// the row group) and total row count. Metadata is parsed once
-// per file (~10–100 KB of footer bytes); the body is already in
-// memory so this is essentially free.
+// fileRefStats sums the catalog's per-file uncompressed bytes
+// and record counts. Both columns are recorded at write time —
+// UncompressedSize is the sum of column-chunk
+// TotalUncompressedSize (equal by parquet spec to the row-group
+// TotalByteSize sum); RecordCount is the parquet row count. The
+// catalog gives us both for free at SELECT time, so the read
+// pipeline doesn't have to open every parquet footer to size
+// its byte budget and pre-allocation.
 //
 // The uncompressed total drives the byte-budget gate; the row
 // count drives pre-sizing of the decoded slice so its growth
-// doesn't double-allocate at decode time.
-func footerStats(p *partState) (uncomp, totalRows int64, err error) {
-	for fi, body := range p.bodies {
-		if body == nil {
-			continue
-		}
-		f, openErr := parquet.OpenFile(
-			bytes.NewReader(body), int64(len(body)))
-		if openErr != nil {
-			return 0, 0, fmt.Errorf(
-				"open %s: %w", p.files[fi].S3Key, openErr)
-		}
-		for _, rg := range f.Metadata().RowGroups {
-			uncomp += rg.TotalByteSize
-			totalRows += rg.NumRows
-		}
+// doesn't double-allocate at decode time. Both are also used by
+// the emit loop to compute the post-emit byte release.
+func fileRefStats(files []FileRef) (uncomp, totalRows int64) {
+	for _, f := range files {
+		uncomp += f.UncompressedSize
+		totalRows += f.RecordCount
 	}
-	return uncomp, totalRows, nil
+	return uncomp, totalRows
+}
+
+// recoverReadInto recovers a panic from the deferred read-side
+// goroutine and surfaces it as a hard pipeline error so shutdown
+// flows through the same path as any other error. Stack capture
+// aids post-mortem; first-cancel-wins on stateCtx keeps recurring
+// panics from clobbering the root cause. Mirrors poll.go's
+// recoverInto.
+//
+// MUST be used as `defer recoverReadInto(state, name)` —
+// recover() only works when called directly by a deferred
+// function, not from a function called by one.
+func recoverReadInto(state *readState, name string) {
+	if r := recover(); r != nil {
+		state.recordHardErr(fmt.Errorf("%s panic: %v\n%s",
+			name, r, debug.Stack()))
+	}
 }

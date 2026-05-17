@@ -108,10 +108,13 @@ func (o fetchAheadFilesOpt) applyPoll(opts *pollOpts) { opts.fetchAheadFiles = o
 // conservative for many small units but a larger value risks OOM
 // on a few large ones; a byte cap auto-tunes across both.
 //
-// The byte total is read from each parquet file's footer
-// (total_byte_size summed across row groups), so the cap is
-// exact, not a heuristic. Decoded Go memory typically runs 1-2x
-// the uncompressed size depending on data shape.
+// The byte total is sourced from the catalog's per-file
+// UncompressedSize (sum of column-chunk TotalUncompressedSize,
+// recorded at Write time and equal by parquet spec to the
+// row-group TotalByteSize sum). The cap is exact, not a
+// heuristic — no per-file parquet footer parse on the read or
+// poll path. Decoded Go memory typically runs 1-2x the
+// uncompressed size depending on data shape.
 //
 // Per-unit guarantee: if a single work unit's uncompressed size
 // exceeds the cap, that unit still decodes (the cap can't be

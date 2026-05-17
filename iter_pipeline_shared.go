@@ -21,6 +21,7 @@ package s3pgstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -115,6 +116,28 @@ func (b *bodySlots) lastProgress() int64 { return b.lastProgressNs.Load() }
 func (b *bodySlots) occupancy() int      { return len(b.slotCh) }
 func (b *bodySlots) capacity() int       { return cap(b.slotCh) }
 
+// isCtxErr reports whether err is (or wraps) a context
+// cancellation or deadline. Shared by both the read and poll iter
+// pipelines at every error-surfacing decision:
+//
+//   - At recordHardErr call sites (decoder closure, fetcher pool
+//     task): skip the call when err is ctx-derived. recordHardErr
+//     is first-cancel-wins, so the call would be a no-op when ctx
+//     is already cancelled, but the explicit filter expresses
+//     intent ("ctx cancellation isn't a hard pipeline error").
+//   - At iter wrapper yield sites (bridge defer, pipeline call):
+//     suppress the yield. Ctx cancellation is the iter consumer's
+//     stop signal, not an error value worth surfacing through
+//     range-over-iter.
+//
+// PollRecords (collect mode) deliberately does NOT use this
+// filter on its pipeline-return path — it surfaces ctx errors
+// directly, matching Go's sync-API convention.
+func isCtxErr(err error) bool {
+	return errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded)
+}
+
 // waitOrCancel blocks until done is closed or ctx is cancelled,
 // then returns context.Cause(ctx) — nil iff ctx is still alive
 // at return time. The post-condition (nil ⇒ ctx alive) folds in
@@ -133,8 +156,8 @@ func waitOrCancel(ctx context.Context, done <-chan struct{}) error {
 
 // workerState is the per-decode-worker queue + private byte
 // budget. Generic over the batch type B so read uses
-// workerState[decodedBatch[T]] and poll uses
-// workerState[decodedPollBatch[T]].
+// workerState[PartitionResult[T]] and poll uses
+// workerState[FileResult[T]].
 //
 // Workers self-assign work units round-robin (worker w handles
 // idx where idx % W == w); emit drains queues in idx order so

@@ -11,6 +11,9 @@ package s3pgstore
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -416,6 +419,151 @@ func TestWaitForPartition_BlocksUntilComplete(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("waitForPartition did not return after completion")
+	}
+}
+
+// TestRecoverReadInto_CapturesPanicAndRecordsCause exercises
+// the decoder-side panic funnel: recoverReadInto must capture
+// any panic from the deferred goroutine, wrap it (with stack)
+// into a hard pipeline error, and cancel state.ctx with that
+// error as the cause. This is the production path used by the
+// wg.Go closure wrapping runDecodeWorker — a panic inside
+// decodePartition or sortAndDedup surfaces to the consumer via
+// the emit loop's ctx.Done branch exactly because this helper
+// routes it through recordHardErr.
+func TestRecoverReadInto_CapturesPanicAndRecordsCause(t *testing.T) {
+	s := newTestReadState(t)
+	stateCtx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(context.Canceled)
+	s.ctx = stateCtx
+	s.cancel = cancel
+
+	func() {
+		defer recoverReadInto(s, "read decoder")
+		panic("decoder boom")
+	}()
+
+	select {
+	case <-s.ctx.Done():
+	default:
+		t.Fatal("state.ctx should be cancelled after panic recovery")
+	}
+	cause := context.Cause(s.ctx)
+	if cause == nil {
+		t.Fatal("context.Cause(state.ctx) = nil, want wrapped panic err")
+	}
+	msg := cause.Error()
+	if !strings.Contains(msg, "read decoder panic") {
+		t.Errorf("cause = %q, want it to contain 'read decoder panic'", msg)
+	}
+	if !strings.Contains(msg, "decoder boom") {
+		t.Errorf("cause = %q, want it to contain the original panic value", msg)
+	}
+}
+
+// TestRecoverReadInto_FirstCauseWins guards the
+// first-cancel-wins property: a later panic does not clobber
+// an earlier recordHardErr cause. The emit loop's single
+// abort-reason surface relies on the first error being the one
+// the consumer sees.
+func TestRecoverReadInto_FirstCauseWins(t *testing.T) {
+	s := newTestReadState(t)
+	stateCtx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(context.Canceled)
+	s.ctx = stateCtx
+	s.cancel = cancel
+
+	firstErr := errors.New("original hard err")
+	s.recordHardErr(firstErr)
+
+	func() {
+		defer recoverReadInto(s, "read decoder")
+		panic("late panic")
+	}()
+
+	cause := context.Cause(s.ctx)
+	if !errors.Is(cause, firstErr) {
+		t.Errorf("first cause should win: got %v, want %v", cause, firstErr)
+	}
+}
+
+// TestRunFetcher_GetTaskPanic_CleansUp pins the contract of
+// the inline named-return defer in runFetcher's submitted task:
+// when s.target.get panics, the cleanup must (1) release the
+// body slot, (2) record the wrapped panic via recordHardErr so
+// state.ctx carries it as the cause, and (3) markComplete with
+// a nil body so the partition's done channel closes — otherwise
+// waitForPartition would block forever.
+//
+// The test re-runs the production closure shape (verbatim
+// modulo the s.target.get substitution) against a real
+// readState so the contract is locked even though we don't go
+// through runFetcher itself. Driving the closure directly
+// avoids standing up an *s3.Client whose HTTP transport panics.
+func TestRunFetcher_GetTaskPanic_CleansUp(t *testing.T) {
+	s := newTestReadState(t).withSlotCap(2)
+	stateCtx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(context.Canceled)
+	s.ctx = stateCtx
+	s.cancel = cancel
+	s.parts = []*partState{
+		{
+			files:  make([]FileRef, 1),
+			bodies: make([][]byte, 1),
+			done:   make(chan struct{}),
+		},
+	}
+	s.parts[0].files[0] = FileRef{S3Key: "data/test-key.parquet"}
+
+	if err := s.slots.acquire(context.Background()); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if got := s.slots.occupancy(); got != 1 {
+		t.Fatalf("slot occupancy before task = %d, want 1", got)
+	}
+
+	pi, fi := 0, 0
+	key := s.parts[pi].files[fi].S3Key
+	// Production closure shape from runFetcher (read.go); the
+	// "fake GET" panic stands in for a panic inside s.target.get.
+	task := func(ctx context.Context) (retErr error) {
+		defer func() {
+			if r := recover(); r != nil {
+				retErr = fmt.Errorf("get %s panic: %v",
+					key, r)
+			}
+			if retErr != nil {
+				s.slots.release()
+				if !isCtxErr(retErr) {
+					s.recordHardErr(retErr)
+				}
+				s.markComplete(pi, fi, nil)
+			}
+		}()
+		panic("simulated target.get panic")
+	}
+	_ = task(context.Background())
+
+	if got := s.slots.occupancy(); got != 0 {
+		t.Errorf("slot occupancy after task = %d, want 0 (slot released)",
+			got)
+	}
+	cause := context.Cause(s.ctx)
+	if cause == nil {
+		t.Fatal("state.ctx.Cause = nil; recordHardErr was not called")
+	}
+	if !strings.Contains(cause.Error(), "get data/test-key.parquet panic") {
+		t.Errorf("cause = %q, want it to wrap the panicking key",
+			cause.Error())
+	}
+	select {
+	case <-s.parts[0].done:
+	default:
+		t.Error("partition done channel did not close; markComplete was skipped")
+	}
+	if s.parts[0].bodies[0] != nil {
+		t.Errorf("bodies[0] = %v, want nil (markComplete should have nilled it)",
+			s.parts[0].bodies[0])
 	}
 }
 

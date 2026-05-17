@@ -50,10 +50,12 @@ type pollOpts struct {
 
 	// decodeAheadBytes caps the cumulative uncompressed parquet
 	// bytes EACH decode worker may hold (currently-decoding +
-	// queued for emit). Zero (default) disables the cap. Read
-	// from each parquet file's footer (sum of row-group
-	// total_byte_size) so the cap is exact, not a heuristic.
-	// With W > 1 workers the per-call total is W × n.
+	// queued for emit). Zero (default) disables the cap. Sourced
+	// from the catalog's per-file UncompressedSize (sum of
+	// column-chunk TotalUncompressedSize, recorded at Write time
+	// and equal by parquet spec to the row-group TotalByteSize
+	// sum) — exact value, no per-file footer parse on the poll
+	// path. With W > 1 workers the per-call total is W × n.
 	decodeAheadBytes int64
 
 	// tailBaseInterval is the wait after the first empty poll

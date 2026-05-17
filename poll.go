@@ -875,6 +875,18 @@ func (s *Store[T]) pollFetchAndDecodeIter(
 	// the defaulter only fills fields the user left unset.
 	applyDefaults(opts)
 
+	// Universal lower-bound clamp on decodeWorkers. Defends
+	// against a defaulter / internal caller leaving a zero or
+	// negative value: WithDecodeWorkers floors at 1 publicly,
+	// but the defaulter only fills the == 0 case, and downstream
+	// code (make([]*pollWorker, n), counter%n) panics on either
+	// extreme. Mirrors the same defensive clamp in read.go's
+	// readFetchAndDecodeIter. No upper-bound clamp here — poll
+	// iter mode doesn't know lenFiles up front.
+	if opts.decodeWorkers < 1 {
+		opts.decodeWorkers = 1
+	}
+
 	// bodyCap bounds resident compressed bodies. Default to
 	// pool.MaxConcurrent so a single call saturates the pool's
 	// S3-op budget. No floor needed: each file is independent,

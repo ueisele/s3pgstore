@@ -746,13 +746,9 @@ func (s *Store[T]) readFetchAndDecodeIter(
 	// to exit immediately because their loop's
 	// `pi := workerIdx; pi < len(parts)` start is past the end.
 	// Applied after defaults so it catches user-supplied W >
-	// len(parts) too.
-	if opts.decodeWorkers < 1 {
-		opts.decodeWorkers = 1
-	}
-	if opts.decodeWorkers > len(parts) {
-		opts.decodeWorkers = len(parts)
-	}
+	// len(parts) too. len(parts) >= 1 is guaranteed by the early
+	// return above, so max-of-min is safe.
+	opts.decodeWorkers = max(1, min(opts.decodeWorkers, len(parts)))
 
 	// bodyCap bounds the per-call resident compressed bodies:
 	// fetcher acquires a slot per file; decoder releases on

@@ -70,50 +70,7 @@ decoder (after `fs.body = nil`).
 
 ## Bugs
 
-### 1. Latent yield-after-false panic in iter-wrapper defer
-
-**Severity:** Low (race-dependent), but failure mode is loud
-(panic propagates out of for-range).
-
-**Where:** `PollRecordsIter` / `TailRecordsIter` wrapper defer.
-
-The wrapper deferred func calls `yield(FileResult[T]{}, err)`
-whenever `bridgeWait()` returns a non-ctx error — but doesn't
-track whether the consumer already broke the for-range. Go's
-range-over-func contract panics on yield-after-false (also panics
-when called from a defer after the body returned false).
-
-Hot-path race:
-
-1. `PollIter` / `TailIter` hits a DB error, bridge captures
-   `err = pollErr`, closes `out`.
-2. Pipeline's emit drains buffered files; the consumer breaks on
-   one of them.
-3. `pollFetchAndDecodeIter` returns nil (clean break).
-4. Wrapper skips its first yield (no pipeline error).
-5. Defer fires; `bridgeWait()` returns `pollErr`;
-   `yield(zero, pollErr)` → **runtime panic**.
-
-A second variant of the same bug: pipeline returns a non-ctx
-error AND bridge also has a non-ctx error AND the consumer
-breaks on the first yield.
-
-**Cheapest fix:** thread a `broken bool` out of the emit loop so
-the wrapper's defer can skip the yield. Either via an additional
-return on `pollFetchAndDecodeIter`, or by wrapping the emit
-callback in the wrapper:
-
-```go
-broken := false
-emitWrap := func(fr FileResult[T]) bool {
-    if !yield(fr, nil) { broken = true; return false }
-    return true
-}
-```
-
-then `if !broken { ... yield(zero, err) }` in the defer.
-
-### 2. `decodeWorkers` defaulter accepts negative values
+### 1. `decodeWorkers` defaulter accepts negative values
 
 **Severity:** Low (not user-reachable today).
 
@@ -124,7 +81,7 @@ A negative value would survive and panic at
 options API today; harden defensively with `max(1, ...)` at the
 make site if/when new internal callers appear.
 
-### 3. Asymmetric panic safety vs read.go
+### 2. Asymmetric panic safety vs read.go
 
 **Severity:** Design observation, not a bug.
 
@@ -171,5 +128,5 @@ explicit that fetcher/watchdog panics are fatal, since the
 
 The pipeline is structurally sound; the recent panic-safety +
 error-flow refactors hold up under tracing. CLAUDE.md invariants
-are preserved. The one real bug (#1) is a latent panic in a rare
-race; the other two items are defensive nits. None block landing.
+are preserved. Remaining items are defensive nits; none block
+landing.

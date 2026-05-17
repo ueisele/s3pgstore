@@ -14,7 +14,7 @@ package s3pgstore
 //      OffsetAt)
 //   2. Per-call defaulters (pollIterDefaults, pollCollectDefaults,
 //      tailIntervals)
-//   3. Source adapters (bridgeBufferSize, sliceToChan, seq2ToChan)
+//   3. Source adapter (sliceToSeq2)
 //   4. Emit callbacks (pollIterEmit, pollCollectEmit)
 //   5. Pipeline orchestration (pollFetchAndDecodeIter)
 //   6. State types (fileState, pollState, pollWorker) + state
@@ -35,17 +35,19 @@ package s3pgstore
 //     work is the synchronous Poll call).
 //
 //   - PollRecords / PollRecordsIter / TailRecordsIter are the
-//     decode-and-emit-records wrappers. They share one channel-
-//     based pipeline (pollFetchAndDecodeIter). PollRecords feeds
-//     it via sliceToChan (pre-filled channel from its resolved
-//     entries slice; no goroutine). PollRecordsIter and
-//     TailRecordsIter feed it via seq2ToChan (bridge goroutine
-//     consuming PollIter / TailIter into a bounded channel; the
-//     helper's wait func surfaces non-ctx source errors). Each
-//     iter-mode wrapper derives innerCtx via WithCancelCause —
-//     cancelled on pipeline error so the pipeline's stateCtx
-//     observes the cause, and again in a defer so the bridge
-//     unblocks before drain.
+//     decode-and-emit-records wrappers; they share the
+//     pollFetchAndDecodeIter pipeline. Each wrapper hands the
+//     pipeline a `buildSource func(context.Context) iter.Seq2[
+//     FileRef, error]` closure that the pipeline invokes with
+//     its own state.ctx — source iter and pipeline cancellation
+//     share a single point by construction. PollRecords (collect
+//     mode) wraps its pre-resolved entries with sliceToSeq2.
+//
+// Error funnel: all errors flow through context.Cause(state.ctx)
+// and surface to the consumer through a single emitOne call site.
+// See pollFetchAndDecodeIter for the full contract; emitOne
+// signature parallels read.go's `func(T, error) bool` so the
+// callback decides whether to surface ctx-derived errors.
 //
 // The load-bearing primitives (body-slot semaphore, per-worker
 // byte budget, stall observer, race-free batch send) live in
@@ -213,9 +215,13 @@ func (s *Store[T]) Poll(
 // yields each FileRef as it arrives. Internally paged — each
 // iteration runs Poll over a window of WithPollPageSize rows,
 // so connection-hold is short per page and PgBouncer transaction-
-// mode + statement_timeout stay safe. Subsequent pages are
-// fetched serially (no prefetch); the consumer drains the
-// current page before the next SELECT.
+// mode + statement_timeout stay safe.
+//
+// Each page's Poll runs concurrently in a background goroutine
+// with yielding the previous page's rows. The pagination is
+// invisible at the consumer end — iteration looks like one
+// continuous stream, with no inter-page Poll latency under busy
+// ranges.
 //
 // Compared to Poll (which materialises the entire range upfront),
 // PollIter:
@@ -233,8 +239,8 @@ func (s *Store[T]) Poll(
 // past the end of the available offsets, with exponential backoff
 // between empty cycles. PollIter terminates as soon as the range
 // is exhausted or an empty page is returned (no rows in
-// [cursor, cursor+pageSize) means we've reached the catalog tip
-// within [since, until)).
+// [cursor, pageEnd) means we've reached the catalog tip within
+// [since, until)).
 //
 // Resume idiom: track `since = fr.Offset + 1` after each yield;
 // restart with the new since on the next call.
@@ -247,29 +253,66 @@ func (s *Store[T]) PollIter(
 		if pageSize <= 0 {
 			pageSize = defaultPollPageSize
 		}
+		if since >= until {
+			return
+		}
 
-		cursor := since
-		for cursor < until {
-			pageEnd := cursor + Offset(pageSize)
-			if pageEnd > until {
-				pageEnd = until
-			}
-			page, next, err := s.Poll(ctx, cursor, pageEnd)
-			if err != nil {
-				yield(FileRef{}, err)
+		type pollResult struct {
+			page []FileRef
+			next Offset
+			err  error
+		}
+		// asyncPoll spawns a goroutine whose only job is one Poll
+		// call over [c, min(c+pageSize, until)). Same shape as
+		// TailIter's asyncPoll — buffer-1 channel, no recover
+		// (Poll is library code; panics surface loud).
+		asyncPoll := func(c Offset) <-chan pollResult {
+			pageEnd := min(c+Offset(pageSize), until)
+			ch := make(chan pollResult, 1)
+			go func() {
+				p, n, e := s.Poll(ctx, c, pageEnd)
+				ch <- pollResult{p, n, e}
+			}()
+			return ch
+		}
+
+		prefetch := asyncPoll(since)
+
+		for {
+			var r pollResult
+			select {
+			case r = <-prefetch:
+			case <-ctx.Done():
 				return
 			}
-			if len(page) == 0 {
-				// No rows in [cursor, pageEnd) — we've reached
-				// the tip within the bounded range. Exit.
+			if r.err != nil {
+				yield(FileRef{}, r.err)
 				return
 			}
-			for _, e := range page {
+			if len(r.page) == 0 {
+				// No rows in this page — we've reached the tip
+				// within the bounded range. Exit.
+				return
+			}
+
+			// Start the next page's Poll concurrently with
+			// yielding, unless we've consumed up to `until`
+			// already (no more pages to fetch — leave prefetch
+			// nil so we return after the yield loop).
+			prefetch = nil
+			if r.next < until {
+				prefetch = asyncPoll(r.next)
+			}
+
+			for _, e := range r.page {
 				if !yield(e, nil) {
 					return
 				}
 			}
-			cursor = next
+
+			if prefetch == nil {
+				return
+			}
 		}
 	}
 }
@@ -288,16 +331,23 @@ func (s *Store[T]) PollIter(
 // iterator yields them and then sleeps before polling again
 // (steady-state tail mode).
 //
+// Each cycle's Poll runs concurrently in a background goroutine
+// with yielding the previous cycle's rows — by the time the
+// consumer exhausts page N, page N+1's Poll typically has
+// results ready, eliminating inter-page Poll latency under busy
+// streams. No prefetch runs during backoff, so the DB isn't
+// hammered during quiet periods.
+//
 // Termination conditions:
-//   - ctx cancellation: the iterator returns silently. Caller-
-//     driven shutdown matches range-over-channel semantics; no
-//     error is yielded.
+//   - ctx cancellation: the iterator returns silently. Matches
+//     range-over-channel semantics.
 //   - Poll DB error: yielded as a (zero FileRef, err) pair, then
 //     the iterator returns. Caller can retry from `since`.
-//   - Caller breaks the range: iterator returns cleanly.
+//   - Caller breaks the range: iterator returns cleanly. Any
+//     in-flight prefetch goroutine exits on its own once its
+//     Poll completes.
 //
 // Resume idiom: track `since = fr.Offset + 1` after each yield.
-// On any exit, restart with the new since on the next call.
 //
 // Suitable for stream consumers, change-data-capture, monitoring,
 // and any "watch the feed forever" use case. For bounded replay
@@ -313,18 +363,52 @@ func (s *Store[T]) TailIter(
 		}
 		base, maxInterval := tailIntervals(&o)
 
+		type pollResult struct {
+			page []FileRef
+			next Offset
+			err  error
+		}
+		// asyncPoll spawns a goroutine whose only job is one Poll
+		// call. The result lands in the returned buffer-1 channel,
+		// so the goroutine can always send-and-exit even when the
+		// consumer breaks mid-page and main returns without
+		// receiving. Poll observes ctx itself, so no extra Done
+		// select is needed inside the goroutine. No recover here
+		// — Poll is library code; a panic indicates a bug we want
+		// loud (Go's runtime crashes with a stack trace) rather
+		// than swallowed, per the project's recover-only-around-
+		// third-party-code convention.
+		asyncPoll := func(c Offset) <-chan pollResult {
+			ch := make(chan pollResult, 1)
+			go func() {
+				p, n, e := s.Poll(ctx, c, c+Offset(pageSize))
+				ch <- pollResult{p, n, e}
+			}()
+			return ch
+		}
+
 		cursor := since
 		consecEmpty := 0
+		// Initial Poll kicks off the prefetch chain; main hits
+		// `<-prefetch` immediately on the first iteration, so the
+		// observable behaviour for the first page matches a
+		// synchronous Poll.
+		prefetch := asyncPoll(cursor)
+
 		for {
-			page, _, err := s.Poll(ctx, cursor, cursor+Offset(pageSize))
-			if err != nil {
-				if !errors.Is(err, context.Canceled) &&
-					!errors.Is(err, context.DeadlineExceeded) {
-					yield(FileRef{}, err)
+			var r pollResult
+			select {
+			case r = <-prefetch:
+			case <-ctx.Done():
+				return
+			}
+			if r.err != nil {
+				if !isCtxErr(r.err) {
+					yield(FileRef{}, r.err)
 				}
 				return
 			}
-			if len(page) == 0 {
+			if len(r.page) == 0 {
 				consecEmpty++
 				wait := nextTailBackoff(consecEmpty, base, maxInterval)
 				select {
@@ -332,18 +416,26 @@ func (s *Store[T]) TailIter(
 					return
 				case <-time.After(wait):
 				}
+				// Re-poll the same range to check for new commits.
+				// No prefetch overlap during backoff — we don't
+				// hammer the DB while the stream is known quiet.
+				prefetch = asyncPoll(cursor)
 				continue
 			}
 			consecEmpty = 0
-			for _, e := range page {
+
+			// Start the next page's Poll concurrently with
+			// yielding the current page. By the time the consumer
+			// finishes draining r.page, prefetch typically has
+			// the next page in its buffer already.
+			prefetch = asyncPoll(r.next)
+
+			for _, e := range r.page {
 				if !yield(e, nil) {
 					return
 				}
 				cursor = e.Offset + 1
 			}
-			// If we got a full page, loop immediately (likely more
-			// rows available). If partial, the next iteration will
-			// observe an empty page and sleep.
 		}
 	}
 }
@@ -384,11 +476,15 @@ func (s *Store[T]) PollRecords(
 	}
 
 	o := resolvePollOpts(opts)
-	if perr := s.pollFetchAndDecodeIter(ctx, "PollRecords", &o,
+	var iterErr error
+	s.pollFetchAndDecodeIter(ctx, "PollRecords", &o,
 		s.pollCollectDefaults(len(entries)),
-		sliceToChan(entries),
-		pollCollectEmit(&out)); perr != nil {
-		return nil, since, perr
+		func(_ context.Context) iter.Seq2[FileRef, error] {
+			return sliceToSeq2(entries)
+		},
+		pollCollectEmit(&out, &iterErr))
+	if iterErr != nil {
+		return nil, since, iterErr
 	}
 	return out, next, nil
 }
@@ -432,24 +528,12 @@ func (s *Store[T]) PollRecordsIter(
 		defer s.metrics.methodScope(ctx, "PollRecordsIter", &iterErr).end()
 
 		o := resolvePollOpts(opts)
-		innerCtx, cancel := context.WithCancelCause(ctx)
-		fileRefCh, bridgeWait := seq2ToChan(innerCtx,
-			s.PollIter(innerCtx, since, until, opts...),
-			bridgeBufferSize(&o))
-		defer func() {
-			cancel(context.Canceled) // unblock bridge regardless of how we exit
-			if err := bridgeWait(); err != nil && !isCtxErr(err) {
-				iterErr = err
-				yield(FileResult[T]{}, err)
-			}
-		}()
-
-		if err := s.pollFetchAndDecodeIter(innerCtx, "PollRecordsIter", &o,
-			pollIterDefaults, fileRefCh,
-			pollIterEmit(yield)); err != nil && !isCtxErr(err) {
-			iterErr = err
-			yield(FileResult[T]{}, err)
-		}
+		s.pollFetchAndDecodeIter(ctx, "PollRecordsIter", &o,
+			pollIterDefaults,
+			func(ictx context.Context) iter.Seq2[FileRef, error] {
+				return s.PollIter(ictx, since, until, opts...)
+			},
+			pollIterEmit(yield, &iterErr))
 	}
 }
 
@@ -489,24 +573,12 @@ func (s *Store[T]) TailRecordsIter(
 		defer s.metrics.methodScope(ctx, "TailRecordsIter", &iterErr).end()
 
 		o := resolvePollOpts(opts)
-		innerCtx, cancel := context.WithCancelCause(ctx)
-		fileRefCh, bridgeWait := seq2ToChan(innerCtx,
-			s.TailIter(innerCtx, since, opts...),
-			bridgeBufferSize(&o))
-		defer func() {
-			cancel(context.Canceled) // unblock bridge regardless of how we exit
-			if err := bridgeWait(); err != nil && !isCtxErr(err) {
-				iterErr = err
-				yield(FileResult[T]{}, err)
-			}
-		}()
-
-		if err := s.pollFetchAndDecodeIter(innerCtx, "TailRecordsIter", &o,
-			pollIterDefaults, fileRefCh,
-			pollIterEmit(yield)); err != nil && !isCtxErr(err) {
-			iterErr = err
-			yield(FileResult[T]{}, err)
-		}
+		s.pollFetchAndDecodeIter(ctx, "TailRecordsIter", &o,
+			pollIterDefaults,
+			func(ictx context.Context) iter.Seq2[FileRef, error] {
+				return s.TailIter(ictx, since, opts...)
+			},
+			pollIterEmit(yield, &iterErr))
 	}
 }
 
@@ -589,8 +661,9 @@ func (s *Store[T]) OffsetAt(
 // by both PollRecordsIter (bounded) and TailRecordsIter
 // (unbounded); both have the same "stream consumer drives the
 // pace" shape and don't know lenFiles at pipeline-start time
-// (the file set is a stream from the bridge goroutine, not a
-// slice), so defaults are file-count-independent.
+// (the file set is a stream produced by the source iter the
+// fetcher drives, not a slice), so defaults are file-count-
+// independent.
 func pollIterDefaults(o *pollOpts) {
 	if o.decodeWorkers == 0 {
 		o.decodeWorkers = 1
@@ -645,142 +718,76 @@ func tailIntervals(o *pollOpts) (base, maxInterval time.Duration) {
 	return base, maxInterval
 }
 
-// bridgeBufferSize returns the channel buffer between seq2ToChan's
-// bridge goroutine and the pipeline's fetcher. Default: 2 ×
-// fetchAheadFiles — enough rows queued for the fetcher to saturate
-// every body slot without waiting on the bridge, plus a small slack.
-//
-// Memory cost is trivial: 2 × 64 × ~120 bytes ≈ 15 KB of channel
-// storage at defaults. FileRef values flow by value here but the
-// dominant memory cost (compressed bodies) is bounded separately
-// via the body-slot semaphore.
-func bridgeBufferSize(o *pollOpts) int {
-	bufCap := 2 * o.fetchAheadFiles
-	if bufCap <= 0 {
-		bufCap = 2 * defaultWorkerPoolSize
-	}
-	if bufCap < 1 {
-		bufCap = 1
-	}
-	return bufCap
-}
-
-// sliceToChan returns a buffered channel pre-filled with items
-// then closed. No goroutine — the channel buffer holds the entire
-// slice. Use for finite, already-materialised sources like
-// PollRecords' resolved entries; for stream-shaped sources use
-// seq2ToChan instead.
-//
-// Memory: cap(ch) == len(items), so the channel buffer doubles
-// the FileRef footprint until the receiver drains. Acceptable
-// for collect-mode callers that have already committed to
-// len(items) of resident memory.
-func sliceToChan[T any](items []T) <-chan T {
-	ch := make(chan T, len(items))
-	for _, item := range items {
-		ch <- item
-	}
-	close(ch)
-	return ch
-}
-
-// seq2ToChan spawns a bridge goroutine that consumes seq and
-// pushes values into a buffered channel. Returns:
-//
-//   - ch: the buffered channel the bridge writes to. Closed when
-//     the bridge exits (clean exhaustion, ctx cancel, or source
-//     error).
-//   - bridgeWait: blocks until the bridge goroutine has exited,
-//     then returns whatever error the source iter yielded (if
-//     any), or nil.
-//
-// No internal filtering — the helper is a pure adapter from
-// iter.Seq2[T, error] to (<-chan T, errFn). Callers filter
-// ctx-derived errors via isCtxErr at the yield site, keeping
-// error policy in one place (the wrapper) rather than split
-// across helpers.
-//
-// IMPORTANT: bridgeWait only blocks; it does NOT cancel ctx.
-// Callers MUST cancel ctx (or otherwise ensure seq exhausts
-// naturally) before calling bridgeWait — otherwise the bridge
-// can deadlock on a buffer-full send if the consumer has stopped
-// reading. The typical pattern is one deferred func doing
-// cancel-then-wait-then-yield:
-//
-//	defer func() {
-//	    cancel(context.Canceled)
-//	    if err := bridgeWait(); err != nil && !isCtxErr(err) {
-//	        yield(zero, err)
-//	    }
-//	}()
-func seq2ToChan[T any](
-	ctx context.Context, seq iter.Seq2[T, error], bufSize int,
-) (ch <-chan T, bridgeWait func() error) {
-	out := make(chan T, bufSize)
-	done := make(chan struct{})
-	var err error
-	go func() {
-		defer close(done)
-		defer close(out)
-		for v, itErr := range seq {
-			if itErr != nil {
-				err = itErr
-				return
-			}
-			select {
-			case out <- v:
-			case <-ctx.Done():
+// sliceToSeq2 wraps a slice as an iter.Seq2 with a nil error
+// channel — no goroutine, just an inline range closure. Used by
+// PollRecords to feed its pre-resolved entries through the same
+// source-factory shape that PollRecordsIter / TailRecordsIter use
+// for their streaming sources. The ctx argument the factory
+// receives is ignored; slice iteration has no cancellation point
+// to observe.
+func sliceToSeq2[T any](items []T) iter.Seq2[T, error] {
+	return func(yield func(T, error) bool) {
+		for _, item := range items {
+			if !yield(item, nil) {
 				return
 			}
 		}
-	}()
-	return out, func() error {
-		<-done
-		return err
 	}
 }
 
-// recoverInto recovers a panic from the deferred goroutine and
-// surfaces it as a hard pipeline error so shutdown flows through
-// the same path as any other error. Stack capture aids
-// post-mortem; first-cancel-wins on stateCtx keeps recurring
-// panics from clobbering the root cause.
+// pollIterEmit returns the per-file emit callback used by
+// PollRecordsIter and TailRecordsIter — both surface results via
+// iter.Seq2 yield. The pipeline calls this exactly once per
+// successful FileResult (err == nil) and at most once with
+// (zero, cause) when state.ctx fires or a queue closes after a
+// recorded error.
 //
-// MUST be used as `defer recoverInto(state, name)` — recover()
-// only works when called directly by a deferred function, not
-// from a function called by one.
-func recoverInto(state *pollState, name string) {
-	if r := recover(); r != nil {
-		state.recordHardErr(fmt.Errorf("%s panic: %v\n%s", name, r, debug.Stack()))
-	}
-}
-
-// pollIterEmit returns the per-batch emit callback that yields
-// one FileResult[T] per file. Used by PollRecordsIter and
-// TailRecordsIter — both surface results via iter.Seq2 yield.
+// Ctx-derived errors are filtered here: per the iter-wrapper
+// contract ("ctx cancellation: the iterator returns silently"),
+// we set neither iterErr nor call yield in that case — we just
+// return false to terminate the emit loop. Non-ctx errors are
+// captured in *iterErr (for the methodScope outcome
+// classification) and surfaced via a single yield call.
 //
-// Success-only: errors flow via pollFetchAndDecodeIter's return
-// value, not through this callback. The wrapper handles error
-// surfacing (yield + iterErr) explicitly. Returning false from
-// yield (consumer broke the for-range) propagates back as false
-// here, terminating the emit loop cleanly.
+// Single yield site: this closure is the only place yield is
+// invoked across the wrapper + pipeline. Once the closure returns
+// false, the emit loop returns; the pipeline's deferred cleanup
+// runs without further yield calls. That makes yield-after-false
+// (the Go range-over-func panic class) mechanically impossible
+// — the wrapper has no defer that can call yield, and emit's
+// one call site is gated on prior emit results.
 func pollIterEmit[T any](
-	yield func(FileResult[T], error) bool,
-) func(FileResult[T]) bool {
-	return func(fr FileResult[T]) bool {
+	yield func(FileResult[T], error) bool, iterErr *error,
+) func(FileResult[T], error) bool {
+	return func(fr FileResult[T], err error) bool {
+		if err != nil {
+			if !isCtxErr(err) {
+				*iterErr = err
+				yield(FileResult[T]{}, err)
+			}
+			return false
+		}
 		return yield(fr, nil)
 	}
 }
 
-// pollCollectEmit returns the per-batch emit callback that
+// pollCollectEmit returns the per-file emit callback that
 // appends each FileResult into the *out slice. Used by
-// PollRecords (collect). Always returns true — collect mode
-// has no early-exit signal; errors flow via the pipeline's
-// return value.
+// PollRecords (collect).
+//
+// Unlike pollIterEmit, this callback does NOT filter ctx-derived
+// errors — collect mode surfaces them directly via *iterErr,
+// matching Go's sync-API convention (a cancelled ctx surfaces as
+// context.Canceled, not as a silent nil-result). See the isCtxErr
+// comment in iter_pipeline_shared.go.
 func pollCollectEmit[T any](
-	out *[]FileResult[T],
-) func(FileResult[T]) bool {
-	return func(fr FileResult[T]) bool {
+	out *[]FileResult[T], iterErr *error,
+) func(FileResult[T], error) bool {
+	return func(fr FileResult[T], err error) bool {
+		if err != nil {
+			*iterErr = err
+			return false
+		}
 		*out = append(*out, fr)
 		return true
 	}
@@ -792,13 +799,16 @@ func pollCollectEmit[T any](
 // stream via callback). Three concurrent stages plus the caller's
 // emit loop:
 //
-//  1. Fetcher goroutine: reads FileRefs from fileRefCh in input
-//     order, acquires one body-pool slot per file, submits one
-//     download task per file to the Store's shared *pool.Pool,
-//     then fans the *fileState out to the assigned worker's
+//  1. Fetcher goroutine: calls buildSource(state.ctx) to
+//     construct the source iter (PollIter / TailIter /
+//     sliceToSeq2), then ranges over it directly — no separate
+//     bridge goroutine. For each FileRef: acquires one body-pool
+//     slot, submits a GET task to the Store's shared *pool.Pool,
+//     and fans the *fileState out to the assigned worker's
 //     input channel (workers[fi%W].input). Same-pool reentrancy
-//     isn't an issue here — pool tasks do GET + close(done) only.
-//     The wg.Go closure wrapping the fetcher owns close(w.input)
+//     isn't an issue — pool tasks do GET + close(done) only. On
+//     non-ctx source error, calls state.recordHardErr. The
+//     wg.Go closure wrapping the fetcher owns close(w.input)
 //     for every worker (deferred so it runs after g.Wait drains
 //     in-flight downloads).
 //
@@ -810,55 +820,54 @@ func pollCollectEmit[T any](
 //     success FileResult to its queue. On hard decode error the
 //     worker returns the error; the wg.Go closure wrapping the
 //     worker calls state.recordHardErr (so stateCtx's cause is
-//     set BEFORE the deferred close(queue) — pollFetchAndDecodeIter's
-//     defer reads context.Cause and surfaces it via the return).
+//     set BEFORE the deferred close(queue) — the emit loop's
+//     ctx.Done / queue-closed branches read context.Cause and
+//     surface it via emitOne).
 //
 //  3. Emit loop (this goroutine): walks a running counter,
 //     reads from workers[counter%W].queue, hands each success
 //     batch to emitOne (slice append for collect; yield for
 //     iter), and frees the worker's reserved bytes on completion.
-//     Exits when emitOne returns false (consumer broke), when
-//     the assigned worker's queue closes (EOS), or when
-//     state.ctx fires (cancel/hard error).
+//     Exits when emitOne returns false (consumer broke or
+//     callback saw an error), when the assigned worker's queue
+//     closes, or when state.ctx fires. The ctx.Done branch and
+//     the queue-closed-with-cause branch both call
+//     emitOne(zero, cause) so the callback sees the abort reason.
 //
-// Input shape: <-chan FileRef. The caller (PollRecords /
-// PollRecordsIter / TailRecordsIter) is responsible for
-// producing FileRefs into the channel and closing it on EOS or
-// ctx cancellation. Each wrapper has its own bridge (sliceToChan
-// for the slice case, seq2ToChan for the iter cases) for this;
-// the pipeline doesn't know which source it has.
+// Source contract: buildSource is called exactly once during
+// pipeline setup with state.ctx as its argument. The source
+// iter MUST use that ctx as its own cancellation observation
+// point — PollIter / TailIter pass it through to their internal
+// Poll calls and to time.After selects. This is load-bearing:
+// when a hard pipeline error cancels state.ctx, the source
+// iter wakes immediately from any backoff sleep so the fetcher's
+// range loop terminates without blocking shutdown. Constructing
+// the source inside the pipeline (rather than receiving a
+// pre-constructed iter from the caller) makes this wiring
+// impossible to get wrong.
 //
-// Error reporting: single error path via the return value.
-// emitOne is success-only — never called with errors. The
-// returned error is one of:
-//
-//   - nil: clean shutdown (EOS reached, consumer broke).
-//   - real err: a hard pipeline failure recorded via
-//     recordHardErr.
-//   - context.Canceled / context.DeadlineExceeded: parent ctx
-//     cancellation propagated via context.Cause.
-//
-// The wrapper decides what to do with the err — PollRecords
-// returns it directly; iter wrappers filter ctx-derived errors
-// before yielding (consumer's stop signal isn't a yield-worthy
-// error).
-//
-// Internal coordination: derives stateCtx from ctx via
-// WithCancelCause. recordHardErr (called by the fetcher's pool
-// task on GET failure, and by the decoder's wg.Go wrapper on
-// any decode failure) cancels stateCtx with the wrapped err as
-// cause. The defer reads context.Cause BEFORE its own cleanup
-// cancel (otherwise the cleanup cancel would set cause to
-// context.Canceled and shadow real errors). wg.Wait drains all
-// internal goroutines before returning. Errors that fire
-// strictly during wg.Wait drain (after the cause snapshot) are
-// not surfaced — acceptable trade-off for the simpler defer.
+// Error funnel: single channel via context.Cause(state.ctx).
+// recordHardErr (called by the fetcher on non-ctx source error,
+// the pool task on GET failure, and the decoder wrapper on any
+// decode failure) cancels state.ctx with the wrapped err as
+// cause. The emit loop's ctx.Done and queue-closed branches
+// read context.Cause and surface it via emitOne. emitOne is
+// `func(FileResult[T], error) bool` — called once per success
+// batch (err == nil) and at most once with (zero, cause) on the
+// terminal shutdown branch. The callback decides whether to
+// surface ctx-derived errors: iter wrappers (pollIterEmit)
+// filter per the "ctx cancellation: iter returns silently"
+// contract; collect mode (pollCollectEmit) surfaces directly,
+// matching Go's sync-API convention. pollIterEmit's returned
+// closure is the only place yield is invoked across the wrapper
+// + pipeline, making yield-after-false (the Go range-over-func
+// panic class) mechanically impossible.
 func (s *Store[T]) pollFetchAndDecodeIter(
 	ctx context.Context, method string,
 	opts *pollOpts, applyDefaults func(*pollOpts),
-	fileRefCh <-chan FileRef,
-	emitOne func(FileResult[T]) bool,
-) (retErr error) {
+	buildSource func(context.Context) iter.Seq2[FileRef, error],
+	emitOne func(FileResult[T], error) bool,
+) {
 	// Apply per-call defaults — pollIterDefaults for stream
 	// consumers (PollRecordsIter, TailRecordsIter; W=1, K=1) or
 	// pollCollectDefaults for PollRecords (auto-tuned from
@@ -897,45 +906,59 @@ func (s *Store[T]) pollFetchAndDecodeIter(
 
 	var wg sync.WaitGroup
 	defer func() {
-		// Snapshot the cause BEFORE our cleanup cancel — otherwise
-		// cancel(context.Canceled) sets cause=context.Canceled on
-		// clean shutdown and shadows real errors. Errors that fire
-		// strictly during wg.Wait drain are not surfaced (the
-		// snapshot has already been taken); accepted as a trade-off
-		// for the simpler defer.
-		retErr = context.Cause(state.ctx)
 		cancel(context.Canceled)
 		wg.Wait()
 	}()
 
-	// Stage 1: fetcher. Reads from fileRefCh, acquires body
-	// slots, submits per-file downloads to the shared pool, and
-	// fans *fileState out to workers[fi%W].input. The closure
-	// owns close(w.input) for every worker (deferred after
-	// g.Wait so in-flight pool tasks complete first).
+	// Stage 1: fetcher. Constructs the source iter bound to
+	// state.ctx and ranges over it directly — no intermediate
+	// bridge goroutine, no channel between source and fetcher.
+	// For each FileRef: acquires a body slot, submits a GET to
+	// the shared pool, fans the *fileState to its assigned
+	// worker. On non-ctx source error, records via
+	// state.recordHardErr so context.Cause(state.ctx) becomes
+	// the single source of truth for the emit loop's error
+	// surfacing.
+	//
+	// Cleanup is one ordered defer: recover (so a panicking
+	// fetcher / source iter cancels state.ctx via recordHardErr
+	// → gctx, telling in-flight pool tasks to exit) → g.Wait
+	// drains those tasks → close worker inputs so decoders see
+	// EOS only after every GET has either populated fs.body /
+	// closed fs.done, or been recorded as an error.
 	g, gctx := s.resolved.WorkerPool.WithContext(state.ctx)
+	source := buildSource(state.ctx)
 	wg.Go(func() {
 		defer func() {
+			if r := recover(); r != nil {
+				state.recordHardErr(fmt.Errorf("fetcher panic: %v\n%s", r, debug.Stack()))
+			}
+			_ = g.Wait()
 			for _, w := range workers {
 				close(w.input)
 			}
 		}()
-		s.runPollFetcher(gctx, g, state, workers, fileRefCh)
-		_ = g.Wait()
+		s.runPollFetcher(gctx, g, state, workers, source)
 	})
 
 	// Stage 2: decode workers. Each drains its own input,
-	// decodes, sends success batches to its queue. On error the
-	// worker returns the error; the closure calls recordHardErr
-	// (filtered via isCtxErr) BEFORE the deferred close on the
-	// queue — so the defer's context.Cause snapshot sees the
-	// cause if a real error occurred. recoverInto guards against
-	// decodeParquet panicking on malformed parquet bytes — a
-	// single bad file shouldn't crash the process.
+	// decodes, sends success batches to its queue. Cleanup is
+	// one ordered defer: recover any panic (decodeParquet over
+	// malformed bytes is the realistic case) → recordHardErr so
+	// state.ctx carries the panic err as cause → close the queue
+	// LAST, so the emit loop's context.Cause read on a closed
+	// queue always sees the cause. The err-returned-from-
+	// runPollDecodeWorker path records its cause inline (before
+	// the defer fires), so close-after-record holds for both
+	// panic and err exits.
 	for w := range workers {
 		wg.Go(func() {
-			defer recoverInto(state, "decoder")
-			defer close(workers[w].queue)
+			defer func() {
+				if r := recover(); r != nil {
+					state.recordHardErr(fmt.Errorf("decoder panic: %v\n%s", r, debug.Stack()))
+				}
+				close(workers[w].queue)
+			}()
 			if err := s.runPollDecodeWorker(state.ctx, state, workers[w], opts); err != nil && !isCtxErr(err) {
 				state.recordHardErr(err)
 			}
@@ -952,26 +975,46 @@ func (s *Store[T]) pollFetchAndDecodeIter(
 	})
 
 	// Stage 3: emit loop. Walks a running counter; for each
-	// counter value, reads from workers[counter%W].queue. Exits
-	// when emitOne returns false (consumer broke), the assigned
-	// worker's queue closes (clean EOS or hard error), or
-	// state.ctx fires (cancel/error). Errors are not passed to
-	// emitOne — they flow back to the caller via the deferred
-	// context.Cause read on the return value.
+	// counter value, reads from workers[counter%W].queue. The
+	// single yield call site (inside emitOne) is invoked on a
+	// success batch (err == nil) or once on the final shutdown
+	// branch (err == context.Cause(state.ctx)). After emitOne
+	// returns false, no further emitOne call is made.
+	//
+	// Three exit paths, all funnel error through emitOne:
+	//
+	//   - state.ctx.Done: hard pipeline error (fetcher source
+	//     error, fetcher pool task error, decoder error) or
+	//     parent ctx cancel. context.Cause is always non-nil
+	//     here.
+	//   - assigned-worker queue close with non-nil cause: a
+	//     hard error was recorded; the decoder's deferred
+	//     close(queue) then ran. Race-free either way — every
+	//     recordHardErr call site sets the cause BEFORE the
+	//     channel-state mutation a sibling observes, and Go's
+	//     channel close establishes happens-before with the
+	//     receive, so context.Cause is visible here.
+	//   - assigned-worker queue close with nil cause: clean EOS
+	//     (source iter exhausted, fetcher drained, decoders
+	//     drained). No emitOne call.
 	for counter := 0; ; counter++ {
 		state.decoderFi.Store(int64(counter))
 		ws := workers[counter%opts.decodeWorkers]
 		select {
 		case batch, ok := <-ws.queue:
 			if !ok {
+				if c := context.Cause(state.ctx); c != nil {
+					emitOne(FileResult[T]{}, c)
+				}
 				return
 			}
-			cont := emitOne(batch)
+			cont := emitOne(batch, nil)
 			ws.releaseBytes(batch.File.UncompressedSize)
 			if !cont {
 				return
 			}
 		case <-state.ctx.Done():
+			emitOne(FileResult[T]{}, context.Cause(state.ctx))
 			return
 		}
 	}
@@ -1057,17 +1100,25 @@ func waitForFile(ctx context.Context, fs *fileState) error {
 	return waitOrCancel(ctx, fs.done)
 }
 
-// runPollFetcher reads FileRefs from fileRefCh in fi order,
-// acquires a body slot per file, submits one download task per
-// file to the shared pool, then hands the *fileState to its
-// assigned worker via workers[fi%W].input. Body-slot acquire
-// happens on the fetcher (not the pool worker) — see CLAUDE.md
+// runPollFetcher ranges over source in fi order; for each
+// FileRef it acquires a body slot, submits one download task to
+// the shared pool, and hands the *fileState to its assigned
+// worker via workers[fi%W].input. Body-slot acquire happens on
+// the fetcher (not the pool worker) — see CLAUDE.md
 // "Shared-pool workers must never block on per-call coordination."
 //
-// Returns on clean EOS (fileRefCh closed) or ctx cancel. Channel
-// cleanup (close(w.input) for every worker) is owned by the
-// wg.Go closure wrapping this function so the fetcher itself
-// stays a pure router.
+// On non-ctx source error, calls state.recordHardErr — same
+// funnel as a pool-task GET failure or a decoder error.
+// ctx-derived source errors are filtered (state.ctx is already
+// cancelled in that case; the explicit filter expresses intent).
+//
+// Returns on clean EOS (source iter exhausted), source error
+// (recordHardErr already called), or ctx cancel (observed via
+// source iter's own ctx, or via body operations like
+// slots.acquire returning).
+//
+// Channel cleanup (close(w.input) for every worker) is owned
+// by the wg.Go closure wrapping this function.
 //
 // Download task: GET → set fs.body, close(fs.done), bump
 // progress. On GET failure: release slot, recordHardErr (cancels
@@ -1079,18 +1130,14 @@ func waitForFile(ctx context.Context, fs *fileState) error {
 // GETs to finish.
 func (s *Store[T]) runPollFetcher(
 	ctx context.Context, g *pool.Group, state *pollState,
-	workers []*pollWorker[T], fileRefCh <-chan FileRef,
+	workers []*pollWorker[T], source iter.Seq2[FileRef, error],
 ) {
 	fi := 0
-	for {
-		var fr FileRef
-		select {
-		case f, ok := <-fileRefCh:
-			if !ok {
-				return
+	for fr, err := range source {
+		if err != nil {
+			if !isCtxErr(err) {
+				state.recordHardErr(err)
 			}
-			fr = f
-		case <-ctx.Done():
 			return
 		}
 		if state.slots.acquire(ctx) != nil {

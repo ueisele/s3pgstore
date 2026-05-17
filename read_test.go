@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
@@ -422,24 +423,31 @@ func TestWaitForPartition_BlocksUntilComplete(t *testing.T) {
 	}
 }
 
-// TestRecoverReadInto_CapturesPanicAndRecordsCause exercises
-// the decoder-side panic funnel: recoverReadInto must capture
-// any panic from the deferred goroutine, wrap it (with stack)
+// TestReadDecoderPanic_CapturesAndRecordsCause exercises the
+// decoder-side panic funnel: the inline `defer func() { if r :=
+// recover(); ... }()` in the wg.Go closure wrapping
+// runDecodeWorker must capture any panic, wrap it (with stack)
 // into a hard pipeline error, and cancel state.ctx with that
-// error as the cause. This is the production path used by the
-// wg.Go closure wrapping runDecodeWorker — a panic inside
-// decodePartition or sortAndDedup surfaces to the consumer via
-// the emit loop's ctx.Done branch exactly because this helper
-// routes it through recordHardErr.
-func TestRecoverReadInto_CapturesPanicAndRecordsCause(t *testing.T) {
+// error as the cause. This is the production path — a panic
+// inside decodePartition or sortAndDedup surfaces to the
+// consumer via the emit loop's ctx.Done branch exactly because
+// this defer routes it through recordHardErr.
+func TestReadDecoderPanic_CapturesAndRecordsCause(t *testing.T) {
 	s := newTestReadState(t)
 	stateCtx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(context.Canceled)
 	s.ctx = stateCtx
 	s.cancel = cancel
 
+	// Reproduces the inline defer in readFetchAndDecodeIter's
+	// decoder closure verbatim; if the pattern there changes,
+	// this test should change in lockstep.
 	func() {
-		defer recoverReadInto(s, "read decoder")
+		defer func() {
+			if r := recover(); r != nil {
+				s.recordHardErr(fmt.Errorf("read decoder panic: %v\n%s", r, debug.Stack()))
+			}
+		}()
 		panic("decoder boom")
 	}()
 
@@ -461,12 +469,12 @@ func TestRecoverReadInto_CapturesPanicAndRecordsCause(t *testing.T) {
 	}
 }
 
-// TestRecoverReadInto_FirstCauseWins guards the
-// first-cancel-wins property: a later panic does not clobber
-// an earlier recordHardErr cause. The emit loop's single
-// abort-reason surface relies on the first error being the one
-// the consumer sees.
-func TestRecoverReadInto_FirstCauseWins(t *testing.T) {
+// TestRecordHardErr_FirstCauseWins guards the first-cancel-wins
+// property of state.recordHardErr: a later record does not
+// clobber an earlier cause. The emit loop's single abort-reason
+// surface relies on the first error being the one the consumer
+// sees.
+func TestRecordHardErr_FirstCauseWins(t *testing.T) {
 	s := newTestReadState(t)
 	stateCtx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(context.Canceled)
@@ -475,11 +483,7 @@ func TestRecoverReadInto_FirstCauseWins(t *testing.T) {
 
 	firstErr := errors.New("original hard err")
 	s.recordHardErr(firstErr)
-
-	func() {
-		defer recoverReadInto(s, "read decoder")
-		panic("late panic")
-	}()
+	s.recordHardErr(errors.New("later err"))
 
 	cause := context.Cause(s.ctx)
 	if !errors.Is(cause, firstErr) {

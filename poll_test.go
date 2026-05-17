@@ -131,29 +131,6 @@ func TestWithPollPageSize_NonPositiveStoredAsIs(t *testing.T) {
 	}
 }
 
-// TestBridgeBufferSize_DefaultFromFetchAhead verifies the buffer
-// sizing logic: when WithFetchAheadFiles isn't supplied, the
-// buffer falls back to 2 × defaultWorkerPoolSize.
-func TestBridgeBufferSize_DefaultFromFetchAhead(t *testing.T) {
-	o := pollOpts{}
-	got := bridgeBufferSize(&o)
-	if got != 2*defaultWorkerPoolSize {
-		t.Errorf("bridgeBufferSize default: got %d, want %d",
-			got, 2*defaultWorkerPoolSize)
-	}
-}
-
-// TestBridgeBufferSize_HonorsExplicitFetchAhead verifies that an
-// explicit WithFetchAheadFiles value drives the buffer size.
-func TestBridgeBufferSize_HonorsExplicitFetchAhead(t *testing.T) {
-	o := pollOpts{fetchAheadFiles: 16}
-	got := bridgeBufferSize(&o)
-	if got != 32 {
-		t.Errorf("bridgeBufferSize with fetchAheadFiles=16: "+
-			"got %d, want 32", got)
-	}
-}
-
 // TestDeadlockObserver_OccupancyZeroSuppresses verifies the
 // watchdog stays quiet during idle periods even when
 // lastProgressNs is older than the threshold — required so

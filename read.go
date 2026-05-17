@@ -711,11 +711,12 @@ func partitionCollectEmit[T any](
 // consumer of one ReadIter cannot starve unrelated Stores
 // sharing the pool.
 //
-// Panic safety: decode workers wrap in recoverReadInto and the
-// per-file S3 GET task uses a named-return cleanup defer that
-// converts a panicking GET into a recorded hard error. Both
-// flows funnel into state.recordHardErr, so a panic is observed
-// by the emit loop the same way any other failure would be.
+// Panic safety: decode workers and the fetcher closure both
+// wrap their body in a deferred recover that funnels the panic
+// through state.recordHardErr; the per-file S3 GET task uses a
+// named-return cleanup defer that does the same. All three
+// surface a panic to the emit loop the same way any other
+// failure would.
 func (s *Store[T]) readFetchAndDecodeIter(
 	ctx context.Context, method string, entries []FileRef,
 	opts *readOpts, applyDefaults func(*readOpts, int),
@@ -798,9 +799,7 @@ func (s *Store[T]) readFetchAndDecodeIter(
 	}()
 
 	// Stage 1: fetcher. Acquires body slots and submits per-file
-	// download tasks to the shared pool. Calls g.Wait() before
-	// exiting so all in-flight pool tasks drain before
-	// readFetchAndDecodeIter returns.
+	// download tasks to the shared pool.
 	//
 	// On any pool task error or panic, the task fn calls
 	// recordHardErr (cancelling state.ctx with the wrapped err
@@ -815,16 +814,23 @@ func (s *Store[T]) readFetchAndDecodeIter(
 	// up the cause via context.Cause and return; the emit loop
 	// observes the same cause via its ctx.Done branch).
 	//
-	// g.Wait's return is ignored — for any non-nil result
-	// state.ctx is already cancelled with the right cause (task
-	// error path or parent propagation). The g.Wait call exists
-	// only to drain in-flight tasks before this goroutine exits
-	// so wg.Wait sees all pool work complete before
-	// readFetchAndDecodeIter returns and the readState is dropped.
+	// Cleanup is one ordered defer: recover (so a panicking
+	// fetcher cancels state.ctx via recordHardErr → gctx, telling
+	// in-flight pool tasks to exit) → g.Wait drains those tasks
+	// before wg.Wait sees this goroutine done. g.Wait's return is
+	// ignored: any non-nil result means state.ctx is already
+	// cancelled with the right cause (task error path, parent
+	// propagation, or our recover above), so emit surfaces the
+	// cause through its ctx.Done branch.
 	g, gctx := s.resolved.WorkerPool.WithContext(state.ctx)
 	wg.Go(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				state.recordHardErr(fmt.Errorf("fetcher panic: %v\n%s", r, debug.Stack()))
+			}
+			_ = g.Wait()
+		}()
 		s.runFetcher(gctx, g, state)
-		_ = g.Wait()
 	})
 	// No cancel-broadcast helper goroutine: every blocking
 	// primitive (bodySlots.acquire, partState.done wait,
@@ -849,7 +855,11 @@ func (s *Store[T]) readFetchAndDecodeIter(
 	}
 	for w := range workers {
 		wg.Go(func() {
-			defer recoverReadInto(state, "read decoder")
+			defer func() {
+				if r := recover(); r != nil {
+					state.recordHardErr(fmt.Errorf("read decoder panic: %v\n%s", r, debug.Stack()))
+				}
+			}()
 			if err := s.runDecodeWorker(state.ctx, state, workers[w],
 				w, opts.decodeWorkers, opts); err != nil && !isCtxErr(err) {
 				state.recordHardErr(err)
@@ -1382,21 +1392,4 @@ func fileRefStats(files []FileRef) (uncomp, totalRows int64) {
 		totalRows += f.RecordCount
 	}
 	return uncomp, totalRows
-}
-
-// recoverReadInto recovers a panic from the deferred read-side
-// goroutine and surfaces it as a hard pipeline error so shutdown
-// flows through the same path as any other error. Stack capture
-// aids post-mortem; first-cancel-wins on stateCtx keeps recurring
-// panics from clobbering the root cause. Mirrors poll.go's
-// recoverInto.
-//
-// MUST be used as `defer recoverReadInto(state, name)` —
-// recover() only works when called directly by a deferred
-// function, not from a function called by one.
-func recoverReadInto(state *readState, name string) {
-	if r := recover(); r != nil {
-		state.recordHardErr(fmt.Errorf("%s panic: %v\n%s",
-			name, r, debug.Stack()))
-	}
 }

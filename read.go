@@ -185,30 +185,15 @@ func (s *Store[T]) ResolveFileRefsInRange(
 // per-partition file order is deterministic (lex by S3 key —
 // required for the dedup tie-break per CLAUDE.md).
 //
-// Projection covers every FileRef field the catalog stores:
-//
-//	file_id, partition_key, s3_key, written_at_version,
-//	written_at, file_size, uncompressed_size, record_count,
-//	feed_seq, ext_<col1>, ext_<col2>, ...
-//
-// feed_seq is nullable (NULL until the sequencer assigns) and
-// scanned into FileRef.Offset as OffsetNone on NULL.
+// The SELECT template (projection + ORDER BY) is pre-rendered
+// in New() and lives on s.sql.filesQuery; only the WHERE clause
+// is spliced in per call via SelectQuery.Render. See
+// catalog.Names.FilesQuerySQL for the projection's column list
+// and feed_seq handling.
 func (s *Store[T]) queryFileRows(
 	ctx context.Context, where string, args []any,
 ) ([]FileRef, error) {
-	cols := []string{
-		"file_id", "partition_key", "s3_key", "written_at_version",
-		"written_at", "file_size", "uncompressed_size",
-		"record_count", "feed_seq",
-	}
-	for _, c := range s.resolved.ExtensionColumns {
-		cols = append(cols, "ext_"+c.Name)
-	}
-	q := fmt.Sprintf(
-		`SELECT %s FROM %s
-		WHERE %s
-		ORDER BY partition_key, s3_key`,
-		strings.Join(cols, ", "), s.names.Files(), where)
+	q := s.sql.filesQuery.Render(where)
 
 	var out []FileRef
 	err := s.cfg.Executor.Run(ctx, func(d DBTX) error {

@@ -62,7 +62,6 @@ import (
 	"iter"
 	"runtime"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -154,24 +153,9 @@ func (s *Store[T]) Poll(
 		return nil, since, nil
 	}
 
-	cols := []string{
-		"file_id", "feed_seq", "partition_key", "s3_key",
-		"written_at_version", "written_at", "file_size",
-		"uncompressed_size", "record_count",
-	}
-	for _, c := range s.resolved.ExtensionColumns {
-		cols = append(cols, "ext_"+c.Name)
-	}
-	q := fmt.Sprintf(
-		`SELECT %s FROM %s
-		WHERE feed_seq IS NOT NULL
-		  AND feed_seq >= $1 AND feed_seq < $2
-		ORDER BY feed_seq`,
-		strings.Join(cols, ", "), s.names.Files())
-
 	next = since
 	err = s.cfg.Executor.Run(ctx, func(d DBTX) error {
-		rows, err := d.Query(ctx, q, since, until)
+		rows, err := d.Query(ctx, s.sql.pollFiles, since, until)
 		if err != nil {
 			return err
 		}
@@ -606,13 +590,9 @@ func (s *Store[T]) OffsetLatest(
 	ctx context.Context,
 ) (out Offset, err error) {
 	defer s.metrics.methodScope(ctx, "OffsetLatest", &err).end()
-	q := fmt.Sprintf(
-		`SELECT COALESCE(MAX(feed_seq), 0) FROM %s
-		WHERE feed_seq IS NOT NULL`,
-		s.names.Files())
 	var maxSeq int64
 	err = s.cfg.Executor.Run(ctx, func(d DBTX) error {
-		return d.QueryRow(ctx, q).Scan(&maxSeq)
+		return d.QueryRow(ctx, s.sql.offsetLatest).Scan(&maxSeq)
 	})
 	if err != nil {
 		return OffsetEarliest, fmt.Errorf("OffsetLatest: %w", err)
@@ -634,13 +614,9 @@ func (s *Store[T]) OffsetAt(
 	ctx context.Context, t time.Time,
 ) (out Offset, err error) {
 	defer s.metrics.methodScope(ctx, "OffsetAt", &err).end()
-	q := fmt.Sprintf(
-		`SELECT MIN(feed_seq) FROM %s
-		WHERE feed_seq IS NOT NULL AND feed_seq_at >= $1`,
-		s.names.Files())
 	var off *int64
 	err = s.cfg.Executor.Run(ctx, func(d DBTX) error {
-		row := d.QueryRow(ctx, q, t.UTC())
+		row := d.QueryRow(ctx, s.sql.offsetAt, t.UTC())
 		return row.Scan(&off)
 	})
 	if err != nil {

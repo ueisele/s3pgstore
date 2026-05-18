@@ -142,14 +142,14 @@ func RunOnce(ctx context.Context, cfg Config) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("register sequencer metrics: %w", err)
 	}
-	return runOnceWithMetrics(ctx, r, m)
+	assignSQL := buildAssignSQL(
+		catalog.NewNames(r.SchemaName, r.TablePrefix))
+	return runOnceWithMetrics(ctx, r, m, assignSQL)
 }
 
 func runOnceWithMetrics(
-	ctx context.Context, r Config, m *metrics,
+	ctx context.Context, r Config, m *metrics, assignSQL string,
 ) (int, error) {
-	names := catalog.NewNames(r.SchemaName, r.TablePrefix)
-
 	var rowsAssigned int
 	err := pgx.BeginFunc(ctx, r.Pool, func(tx pgx.Tx) error {
 		// Sequencer advisory lock. Two-key form to namespace
@@ -166,7 +166,7 @@ func runOnceWithMetrics(
 			return fmt.Errorf("acquire sequencer lock: %w", err)
 		}
 		m.recordLockWait(ctx, time.Since(lockStart).Seconds())
-		ct, err := tx.Exec(ctx, assignSQL(names), r.BatchSize)
+		ct, err := tx.Exec(ctx, assignSQL, r.BatchSize)
 		if err != nil {
 			return fmt.Errorf("assign feed_seq: %w", err)
 		}
@@ -203,10 +203,18 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("register sequencer.unsequenced gauge: %w", err)
 	}
 
+	// Pre-render the gap-free assignment SQL once for the
+	// lifetime of this Run. Names / table identifiers are
+	// immutable after Config validation, so each drain
+	// iteration's tx.Exec gets the same string — avoids a
+	// fmt.Sprintf + three substitutions per drain pass.
+	assignSQL := buildAssignSQL(
+		catalog.NewNames(r.SchemaName, r.TablePrefix))
+
 	// Initial drain: catch up any rows that landed between
 	// last shutdown and now. Failure here aborts startup —
 	// operator should see the error early.
-	if err := drainAll(ctx, r, m); err != nil {
+	if err := drainAll(ctx, r, m, assignSQL); err != nil {
 		return fmt.Errorf("initial drain: %w", err)
 	}
 
@@ -237,7 +245,7 @@ func Run(ctx context.Context, cfg Config) error {
 		case <-notify:
 		case <-ticker.C:
 		}
-		if err := drainAll(ctx, r, m); err != nil {
+		if err := drainAll(ctx, r, m, assignSQL); err != nil {
 			if errors.Is(err, context.Canceled) {
 				return err
 			}
@@ -251,11 +259,14 @@ func Run(ctx context.Context, cfg Config) error {
 // BatchSize rows. Returns the first error encountered (which
 // short-circuits the drain). Reuses one *metrics across calls
 // so the assigned counter and lock_wait histogram aggregate
-// across the whole drain.
-func drainAll(ctx context.Context, cfg Config, m *metrics) error {
+// across the whole drain. assignSQL is the pre-rendered
+// gap-free assignment statement built once by the caller.
+func drainAll(
+	ctx context.Context, cfg Config, m *metrics, assignSQL string,
+) error {
 	r := cfg.resolved()
 	for {
-		n, err := runOnceWithMetrics(ctx, r, m)
+		n, err := runOnceWithMetrics(ctx, r, m, assignSQL)
 		if err != nil {
 			return err
 		}
@@ -320,8 +331,10 @@ func listenOnce(ctx context.Context, cfg Config, notify chan<- struct{}) error {
 	}
 }
 
-// assignSQL renders the gap-free assignment query for the
-// given table names. The CTE structure:
+// buildAssignSQL renders the gap-free assignment query for the
+// given table names. Called once per Run / RunOnce — the result
+// is cached for the lifetime of the sequencer loop because
+// table identifiers are immutable. The CTE structure:
 //
 //   - `base` reads the current MAX(feed_seq) once, treating
 //     missing-rows as 0 via COALESCE.
@@ -336,7 +349,7 @@ func listenOnce(ctx context.Context, cfg Config, notify chan<- struct{}) error {
 // so MAX is read after every previous sequencer's commit; the
 // "writers commit ahead of MAX" race the sequencer is built
 // to prevent cannot occur within the locked window.
-func assignSQL(n catalog.Names) string {
+func buildAssignSQL(n catalog.Names) string {
 	files := n.Files()
 	return fmt.Sprintf(`
 WITH base AS (

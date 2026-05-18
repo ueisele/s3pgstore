@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/ueisele/s3pgstore/internal/catalog"
 )
 
 // MaterializedViewLookupDef binds a typed lookup against an MV
@@ -27,12 +27,17 @@ type MaterializedViewLookupDef[K any] struct {
 // MaterializedView is a typed lookup handle bound to a single
 // MV declared on the Store. Construct via NewMaterializedView.
 // Safe for concurrent use.
+//
+// lookupSQL is the pre-rendered SELECT template (projection +
+// table + ORDER BY) populated once by NewMaterializedView via
+// catalog.Names.MVLookupSQL; Lookup composes the final SQL via
+// lookupSQL.Render(where) so the hot path skips per-call
+// fmt.Sprintf + strings.Join over the column list.
 type MaterializedView[K any] struct {
-	def      MaterializedViewLookupDef[K]
-	executor Executor
-	tableSQL string
-	cols     []string // quoted SQL identifiers in select order
-	metrics  *metrics
+	def       MaterializedViewLookupDef[K]
+	executor  Executor
+	lookupSQL catalog.SelectQuery
+	metrics   *metrics
 }
 
 // NewMaterializedView returns a typed lookup handle for the MV
@@ -70,17 +75,11 @@ func NewMaterializedView[T, K any](
 			"NewMaterializedView %q: From is required", def.Name)
 	}
 
-	cols := make([]string, len(def.Columns))
-	for i, c := range def.Columns {
-		cols[i] = pgx.Identifier{c}.Sanitize()
-	}
-
 	return &MaterializedView[K]{
-		def:      def,
-		executor: store.cfg.Executor,
-		tableSQL: store.names.MV(def.Name),
-		cols:     cols,
-		metrics:  store.metrics,
+		def:       def,
+		executor:  store.cfg.Executor,
+		lookupSQL: store.names.MVLookupSQL(def.Name, def.Columns),
+		metrics:   store.metrics,
 	}, nil
 }
 
@@ -112,14 +111,7 @@ func (m *MaterializedView[K]) Lookup(
 		return nil, err
 	}
 
-	q := fmt.Sprintf("SELECT %s FROM %s",
-		strings.Join(m.cols, ", "), m.tableSQL)
-	if where != "" {
-		q += " WHERE " + where
-	}
-	if len(m.cols) > 0 {
-		q += " ORDER BY " + strings.Join(m.cols, ", ")
-	}
+	q := m.lookupSQL.Render(where)
 
 	err = m.executor.Run(ctx, func(d DBTX) error {
 		rows, err := d.Query(ctx, q, args...)

@@ -144,25 +144,44 @@ type Store[T any] struct {
 	sql      sqlCache
 }
 
-// sqlCache holds the SQL strings the hot write path renders on
-// every call. Built once in New() because PartitionKeyParts,
-// ExtensionColumns, and MaterializedViews are immutable after
-// Store construction; the underlying catalog.Names methods
-// fmt.Sprintf fresh every call, which would burn ~one alloc per
-// render per Write at hundreds-of-writes/sec.
+// sqlCache holds the pre-rendered statements (and SelectQuery
+// templates) the read / write / poll / MV-lookup paths would
+// otherwise re-render on every call. Built once in New() —
+// PartitionKeyParts, ExtensionColumns, and MaterializedViews are
+// immutable after Store construction, so every catalog.Names
+// helper returns the same value across the Store's lifetime;
+// caching avoids a fmt.Sprintf + strings.Join allocation per
+// hot-path invocation.
+//
+// Field types:
+//   - string for fully-rendered statements (most entries);
+//   - catalog.SelectQuery for SELECTs with a per-call WHERE
+//     clause — the head + tail are pre-rendered here, the
+//     caller composes the final SQL via .Render(where).
 //
 // Read-only after New() returns.
 type sqlCache struct {
-	pendingWriteInsert      string
-	pendingWriteDelete      string
-	partitionUpdateOCC      string
+	// s3pgstore_files
+	filesInsert       string
+	filesQuery        catalog.SelectQuery // composed at call time via .Render(where)
+	idempotencyLookup string
+	pollFiles         string
+	offsetLatest      string
+	offsetAt          string
+	pollLag           string // observable-gauge query
+
+	// s3pgstore_partitions
 	partitionUpsertExpect   string // ExpectedVersionSet=true variant
 	partitionUpsertNoExpect string // ExpectedVersionSet=false variant
-	filesInsert             string
-	idempotencyLookup       string
-	pollLag                 string            // observable-gauge query
-	pendingWritesDepth      string            // observable-gauge query
-	mvInserts               map[string]string // MV.Name → INSERT SQL
+	partitionUpdateOCC      string
+
+	// s3pgstore_pending_writes
+	pendingWriteInsert string
+	pendingWritesDepth string // observable-gauge query
+	pendingWriteDelete string
+
+	// s3pgstore_mv_<name>
+	mvInserts map[string]string // MV.Name → INSERT SQL
 }
 
 // New constructs a Store[T] for cfg. Validates cfg, resolves
@@ -199,16 +218,27 @@ func New[T any](ctx context.Context, cfg Config[T]) (*Store[T], error) {
 		extNames[i] = e.Name
 	}
 	sql := sqlCache{
-		pendingWriteInsert:      names.PendingWriteInsertSQL(),
-		pendingWriteDelete:      names.PendingWriteDeleteSQL(),
-		partitionUpdateOCC:      names.PartitionUpdateOCCSQL(),
+		// s3pgstore_files
+		filesInsert:       names.FilesInsertSQL(r.PartitionKeyParts, extNames),
+		filesQuery:        names.FilesQuerySQL(extNames),
+		idempotencyLookup: names.IdempotencyLookupSQL(extNames),
+		pollFiles:         names.PollFilesSQL(extNames),
+		offsetLatest:      names.OffsetLatestSQL(),
+		offsetAt:          names.OffsetAtSQL(),
+		pollLag:           names.PollLagSQL(),
+
+		// s3pgstore_partitions
 		partitionUpsertExpect:   names.PartitionUpsertSQL(r.PartitionKeyParts, true),
 		partitionUpsertNoExpect: names.PartitionUpsertSQL(r.PartitionKeyParts, false),
-		filesInsert:             names.FilesInsertSQL(r.PartitionKeyParts, extNames),
-		idempotencyLookup:       names.IdempotencyLookupSQL(extNames),
-		pollLag:                 names.PollLagSQL(),
-		pendingWritesDepth:      names.PendingWritesDepthSQL(),
-		mvInserts:               make(map[string]string, len(cfg.MaterializedViews)),
+		partitionUpdateOCC:      names.PartitionUpdateOCCSQL(),
+
+		// s3pgstore_pending_writes
+		pendingWriteInsert: names.PendingWriteInsertSQL(),
+		pendingWritesDepth: names.PendingWritesDepthSQL(),
+		pendingWriteDelete: names.PendingWriteDeleteSQL(),
+
+		// s3pgstore_mv_<name>
+		mvInserts: make(map[string]string, len(cfg.MaterializedViews)),
 	}
 	for _, mv := range cfg.MaterializedViews {
 		sql.mvInserts[mv.Name] = names.MVInsertSQL(mv.Name, mv.Columns)

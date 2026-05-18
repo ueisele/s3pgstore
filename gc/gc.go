@@ -127,17 +127,15 @@ func RunOnce(ctx context.Context, cfg Config) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("register gc metrics: %w", err)
 	}
-	return runOnceWithMetrics(ctx, r, m)
+	return runOnceWithMetrics(ctx, r, m, buildSQL(r))
 }
 
 func runOnceWithMetrics(
-	ctx context.Context, r Config, m *metrics,
+	ctx context.Context, r Config, m *metrics, sql gcSQL,
 ) (int, error) {
-	names := catalog.NewNames(r.SchemaName, r.TablePrefix)
-
 	cutoff := time.Now().Add(-r.Grace).UTC()
 
-	rows, err := scanPending(ctx, r.Pool, names, cutoff, r.BatchSize)
+	rows, err := scanPending(ctx, r.Pool, sql.scanSQL, cutoff, r.BatchSize)
 	if err != nil {
 		return 0, err
 	}
@@ -147,7 +145,7 @@ func runOnceWithMetrics(
 			m.recordReclaimed(ctx, reclaimed)
 			return reclaimed, err
 		}
-		if err := reclaimOne(ctx, r, names, key); err != nil {
+		if err := reclaimOne(ctx, r, sql.deleteSQL, key); err != nil {
 			// Log and continue — one bad object shouldn't
 			// stall the rest of the batch. The row stays in
 			// pending_writes for the next sweep.
@@ -177,8 +175,9 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("register gc metrics: %w", err)
 	}
 
+	sql := buildSQL(r)
 	for {
-		n, err := runOnceWithMetrics(ctx, r, m)
+		n, err := runOnceWithMetrics(ctx, r, m, sql)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return err
@@ -201,17 +200,13 @@ func Run(ctx context.Context, cfg Config) error {
 // scanPending returns up to limit s3_key values whose
 // intended_at is older than cutoff. Read-only — no DELETEs
 // happen here; the per-row reclaim path takes care of those.
+//
+// scanSQL is the pre-rendered SELECT (catalog.Names.PendingWritesScanSQL).
 func scanPending(
 	ctx context.Context, pool *pgxpool.Pool,
-	names catalog.Names, cutoff time.Time, limit int,
+	scanSQL string, cutoff time.Time, limit int,
 ) ([]string, error) {
-	q := fmt.Sprintf(
-		`SELECT s3_key FROM %s
-		WHERE intended_at < $1
-		ORDER BY intended_at
-		LIMIT $2`,
-		names.PendingWrites())
-	rows, err := pool.Query(ctx, q, cutoff, limit)
+	rows, err := pool.Query(ctx, scanSQL, cutoff, limit)
 	if err != nil {
 		return nil, fmt.Errorf("scan pending_writes: %w", err)
 	}
@@ -242,7 +237,7 @@ func scanPending(
 // step 2 again. No leak.
 func reclaimOne(
 	ctx context.Context, cfg Config,
-	names catalog.Names, s3Key string,
+	deleteSQL, s3Key string,
 ) error {
 	if _, err := cfg.S3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(cfg.S3Bucket),
@@ -250,15 +245,29 @@ func reclaimOne(
 	}); err != nil {
 		return fmt.Errorf("S3 DELETE %s: %w", s3Key, err)
 	}
-	q := fmt.Sprintf(
-		`DELETE FROM %s WHERE s3_key = $1`,
-		names.PendingWrites())
 	if err := pgx.BeginFunc(ctx, cfg.Pool, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, q, s3Key)
+		_, err := tx.Exec(ctx, deleteSQL, s3Key)
 		return err
 	}); err != nil {
 		return fmt.Errorf("delete pending_writes %s: %w",
 			s3Key, err)
 	}
 	return nil
+}
+
+// gcSQL bundles the two pre-rendered statements GC's per-row
+// reclaim loop needs. Built once per RunOnce / Run entry by
+// buildSQL; threaded through runOnceWithMetrics → reclaimOne so
+// the orphan-batch loop never re-renders these strings.
+type gcSQL struct {
+	scanSQL   string
+	deleteSQL string
+}
+
+func buildSQL(r Config) gcSQL {
+	names := catalog.NewNames(r.SchemaName, r.TablePrefix)
+	return gcSQL{
+		scanSQL:   names.PendingWritesScanSQL(),
+		deleteSQL: names.PendingWriteDeleteSQL(),
+	}
 }

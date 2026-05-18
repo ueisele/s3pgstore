@@ -1,17 +1,16 @@
 # golangci-lint v2 configuration.
 # https://golangci-lint.run/usage/configuration/
+#
+# Intentionally NO `run.build-tags: [integration]` entry. Excluding
+# `//go:build integration` files lets `unused` flag production code
+# that is only kept alive by an integration test — that pattern is
+# dead code we want surfaced, not hidden. Helpers defined inside
+# the integration files themselves (fixtures, integration-test-only
+# helpers) are also excluded from view, so the rule does not
+# false-positive on them. Syntax/semantics coverage on integration
+# test bodies is provided by `go vet -tags=integration` in the
+# verification gates.
 version: "2"
-
-run:
-  # Intentionally NO integration build tag. Excluding `//go:build
-  # integration` files lets `unused` flag production code that is
-  # only kept alive by an integration test — that pattern is dead
-  # code we want surfaced, not hidden. Helpers defined inside the
-  # integration files themselves (fixtures, integration-test-only
-  # helpers) are also excluded from view, so the rule does not
-  # false-positive on them. Syntax/semantics coverage on
-  # integration test bodies is provided by `go vet -tags=integration`
-  # in the verification gates.
 
 linters:
   # Start from zero, enable only what we've decided to use — more

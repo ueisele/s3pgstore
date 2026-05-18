@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/parquet-go/parquet-go/compress"
 
 	"github.com/ueisele/s3pgstore/internal/catalog"
 	"github.com/ueisele/s3pgstore/pool"
@@ -315,15 +314,6 @@ func (s *Store[T]) dataPath() string {
 // partitionKey + uuid: "<Prefix>/data/<partitionKey>/<uuid>.parquet".
 func (s *Store[T]) dataKey(partitionKey, uuid string) string {
 	return s.dataPath() + "/" + partitionKey + "/" + uuid + ".parquet"
-}
-
-// codecForRead returns the compression codec we'd resolve given
-// resolved.Compression. Used internally for the lifetime test
-// path; kept private.
-//
-//nolint:unused // kept for future Phase 6 use
-func (s *Store[T]) codecForRead() (compress.Codec, error) {
-	return resolveCompression(s.resolved.Compression)
 }
 
 // validatePartitionKey runs the user's PartitionKeyOf and

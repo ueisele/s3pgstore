@@ -143,29 +143,6 @@ func TestS3Target_GetMissing(t *testing.T) {
 	}
 }
 
-func TestS3Target_DeleteIdempotent(t *testing.T) {
-	cli, err := itShareMinio(t.Context())
-	if err != nil {
-		t.Fatalf("MinIO: %v", err)
-	}
-	bucket := itNewBucket(t, cli)
-	tgt, err := newS3Target(s3TargetConfig{S3Client: cli, S3Bucket: bucket})
-	if err != nil {
-		t.Fatalf("newS3Target: %v", err)
-	}
-
-	if err := tgt.put(t.Context(), "k", []byte("x"), "", nil); err != nil {
-		t.Fatalf("put: %v", err)
-	}
-	if err := tgt.delete(t.Context(), "k"); err != nil {
-		t.Fatalf("delete: %v", err)
-	}
-	// Second delete on missing key is a no-op (DELETE is idempotent on S3).
-	if err := tgt.delete(t.Context(), "k"); err != nil {
-		t.Fatalf("delete on missing: %v", err)
-	}
-}
-
 // TestS3Target_ConcurrentPutsSmokeTest exercises put/get under
 // load to verify the typed wrapper behaves under concurrent
 // goroutines. After the middleware refactor s3target itself no

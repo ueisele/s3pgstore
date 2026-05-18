@@ -61,13 +61,9 @@ func RenderAll(in DDLInput) (string, error) {
 	}
 
 	var sb strings.Builder
-	if err := renderFiles(&sb, in); err != nil {
-		return "", err
-	}
+	renderFiles(&sb, in)
 	sb.WriteString("\n")
-	if err := renderPartitions(&sb, in); err != nil {
-		return "", err
-	}
+	renderPartitions(&sb, in)
 	sb.WriteString("\n")
 	renderPendingWrites(&sb, in)
 	for _, mv := range in.MVs {
@@ -90,7 +86,7 @@ func validateDDLInput(in DDLInput) error {
 	return nil
 }
 
-func renderFiles(sb *strings.Builder, in DDLInput) error {
+func renderFiles(sb *strings.Builder, in DDLInput) {
 	files := in.Names.Files()
 	fmt.Fprintf(sb, "CREATE TABLE IF NOT EXISTS %s (\n", files)
 	// Identity
@@ -165,11 +161,9 @@ func renderFiles(sb *strings.Builder, in DDLInput) error {
 			"ON %s (partition_key, idempotency_token) "+
 			"WHERE idempotency_token IS NOT NULL;\n",
 		bare, files)
-
-	return nil
 }
 
-func renderPartitions(sb *strings.Builder, in DDLInput) error {
+func renderPartitions(sb *strings.Builder, in DDLInput) {
 	parts := in.Names.Partitions()
 	fmt.Fprintf(sb, "CREATE TABLE IF NOT EXISTS %s (\n", parts)
 	sb.WriteString("    partition_key   TEXT PRIMARY KEY,\n")
@@ -192,7 +186,6 @@ func renderPartitions(sb *strings.Builder, in DDLInput) error {
 			"CREATE INDEX IF NOT EXISTS %s_part_idx ON %s (%s);\n",
 			bare, parts, strings.Join(cols, ", "))
 	}
-	return nil
 }
 
 func renderPendingWrites(sb *strings.Builder, in DDLInput) {

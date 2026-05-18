@@ -243,7 +243,7 @@ func TestSubmit_GroupsSharePool(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	var inFlight, peak atomic.Int64
-	work := func(ctx context.Context) error {
+	work := func(_ context.Context) error {
 		n := inFlight.Add(1)
 		defer inFlight.Add(-1)
 		for {

@@ -161,7 +161,7 @@ func newMetrics(cfg metricsConfig) (*metrics, error) {
 		1, 10, 25, 50, 100, 250, 500, 1000,
 		2500, 10000, 50000, 250000, 1000000,
 	}
-	mustHist := func(
+	mustHist := func( //nolint:unparam // unit kept explicit per call site for clarity
 		name, desc, unit string,
 		buckets ...float64,
 	) (metric.Float64Histogram, error) {

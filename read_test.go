@@ -530,7 +530,7 @@ func TestRunFetcher_GetTaskPanic_CleansUp(t *testing.T) {
 	key := s.parts[pi].files[fi].S3Key
 	// Production closure shape from runFetcher (read.go); the
 	// "fake GET" panic stands in for a panic inside s.target.get.
-	task := func(ctx context.Context) (retErr error) {
+	task := func(_ context.Context) (retErr error) {
 		defer func() {
 			if r := recover(); r != nil {
 				retErr = fmt.Errorf("get %s panic: %v",

@@ -1,15 +1,15 @@
 package s3pgstore
 
 // target.go is the thin typed wrapper around an *s3.Client that
-// the read/write/stream paths call into for PUT/GET/DELETE. The
+// the read/write/stream paths call into for PUT/GET. The
 // load-bearing behavior — adaptive retry + rate limiting +
 // per-op metrics (request.duration/count, attempt.error.count,
 // body_size) — lives in the middleware stack the caller
 // installed on the *s3.Client via s3client.WithDefaults. This
 // wrapper exists for two things only:
 //
-//  1. ergonomic typed signatures (put/get/delete take primitive
-//     args, not s3.PutObjectInput-shaped structs);
+//  1. ergonomic typed signatures (put/get take primitive args,
+//     not s3.PutObjectInput-shaped structs);
 //  2. inline ETag verification on PUT to defend against the
 //     (now structurally impossible but still cheap to verify)
 //     "PUT reported success but the body that landed is not the
@@ -138,19 +138,6 @@ func (t *s3target) put(
 		return err
 	}
 	return verifyPutObjectETag(out, expectedETagHex)
-}
-
-// delete removes a single object. Used only by cmd/s3pgstore-gc
-// — runtime read/write paths never DELETE. Idempotent on S3
-// (DELETE on a missing key returns 204, not 404), so the SDK's
-// retry layer can retry safely.
-func (t *s3target) delete(ctx context.Context, key string) error {
-	ctx = t.withLabels(ctx)
-	_, err := t.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(t.bucket),
-		Key:    aws.String(key),
-	})
-	return err
 }
 
 // verifyPutObjectETag compares the PutObject response's ETag to

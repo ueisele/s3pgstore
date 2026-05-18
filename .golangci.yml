@@ -3,10 +3,15 @@
 version: "2"
 
 run:
-  # Include integration-tagged test files in lint scope so bugs
-  # there surface alongside unit tests.
-  build-tags:
-    - integration
+  # Intentionally NO integration build tag. Excluding `//go:build
+  # integration` files lets `unused` flag production code that is
+  # only kept alive by an integration test — that pattern is dead
+  # code we want surfaced, not hidden. Helpers defined inside the
+  # integration files themselves (fixtures, integration-test-only
+  # helpers) are also excluded from view, so the rule does not
+  # false-positive on them. Syntax/semantics coverage on
+  # integration test bodies is provided by `go vet -tags=integration`
+  # in the verification gates.
 
 linters:
   # Start from zero, enable only what we've decided to use — more
@@ -23,6 +28,7 @@ linters:
     - nilerr        # `if err != nil { return nil }` anti-pattern
     - nolintlint    # //nolint directives must be well-formed
     - staticcheck   # absorbs gosimple + stylecheck in v2
+    - unparam       # unused function params + always-same/always-nil returns
     - unused        # dead code, unused fields/consts
 
   settings:

@@ -206,7 +206,7 @@ func Run(ctx context.Context, cfg Config) error {
 	// Initial drain: catch up any rows that landed between
 	// last shutdown and now. Failure here aborts startup —
 	// operator should see the error early.
-	if _, err := drainAll(ctx, r, m); err != nil {
+	if err := drainAll(ctx, r, m); err != nil {
 		return fmt.Errorf("initial drain: %w", err)
 	}
 
@@ -237,7 +237,7 @@ func Run(ctx context.Context, cfg Config) error {
 		case <-notify:
 		case <-ticker.C:
 		}
-		if _, err := drainAll(ctx, r, m); err != nil {
+		if err := drainAll(ctx, r, m); err != nil {
 			if errors.Is(err, context.Canceled) {
 				return err
 			}
@@ -248,21 +248,19 @@ func Run(ctx context.Context, cfg Config) error {
 }
 
 // drainAll repeats RunOnce until a call assigns fewer than
-// BatchSize rows. Returns the total assigned and the first
-// error encountered (which short-circuits the drain). Reuses
-// one *metrics across calls so the assigned counter and
-// lock_wait histogram aggregate across the whole drain.
-func drainAll(ctx context.Context, cfg Config, m *metrics) (int, error) {
-	total := 0
+// BatchSize rows. Returns the first error encountered (which
+// short-circuits the drain). Reuses one *metrics across calls
+// so the assigned counter and lock_wait histogram aggregate
+// across the whole drain.
+func drainAll(ctx context.Context, cfg Config, m *metrics) error {
 	r := cfg.resolved()
 	for {
 		n, err := runOnceWithMetrics(ctx, r, m)
-		total += n
 		if err != nil {
-			return total, err
+			return err
 		}
 		if n < r.BatchSize {
-			return total, nil
+			return nil
 		}
 	}
 }
